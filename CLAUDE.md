@@ -15,6 +15,7 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 - `apps/web` — app.jivvy.org (not started; Stage 1)
 - `apps/daemon` — church-computer app (not started; Stage 0 spike first)
 - `packages/protocol` — versioned command protocol (TypeScript, zero runtime deps)
+- `packages/sim-daemon` — in-memory fake daemon (demo + chaos tests); must honor the same reliability contract as the real one
 
 ## Commands
 `npm install`, `npm test`, `npm run typecheck`, `npm run build`, `npm run dev:site`

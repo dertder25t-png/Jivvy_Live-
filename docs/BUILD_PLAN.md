@@ -7,7 +7,7 @@ Oct 4, 2026 · @caleb
 The product wins on one thing: a service never stops because of Jivvy Live. Every design choice below serves that.
 
 1. **Nothing during a service depends on the cloud.** Video, slides, recording and booth control all run on the church computer and local Wi-Fi. The cloud handles planning, sync and remote access, so a cloud outage never touches a live service.
-2. **Video never touches our servers.** Streams go straight from the church to YouTube, Facebook and others. This keeps hosting at roughly $50–100/month total and margins near 100%.
+2. **Video never touches our servers by default.** Streams go straight from the church to YouTube, Facebook and others. This keeps hosting at roughly $50–100/month total. The one exception is the optional Pro relay (see Streaming design), which runs on Cloudflare Stream, not servers we operate, and always falls back to streaming direct.
 3. **The UI is separate from the video engine.** A frozen phone, tab or editor can't stop the stream.
 4. **Everything recovers by itself.** Crashes restart in seconds and resume on the same slide; dropped streams reconnect; recordings survive crashes.
 5. **Volunteer-proof by default.** Locked-down views, plain-English errors, and a pre-flight check before every service.
@@ -36,6 +36,7 @@ Use proven, mostly free building blocks and write only the parts that make Jivvy
 | Video engine | Rust + GStreamer | Live pipelines with hardware encoders, bitrate changes on the fly, one encode sent to both stream and file |
 | Hardware encoding | Intel Quick Sync, NVIDIA NVENC, AMD AMF, Apple VideoToolbox; x264 fallback | Low CPU on cheap laptops, software fallback when no chip is usable |
 | Streaming out | RTMP/RTMPS with auto-reconnect; SRT where a platform accepts it | What YouTube and Facebook take, no server in between |
+| Cloud relay (Pro only) | Cloudflare Stream live inputs with simulcast outputs | Upload once, fan out to up to 50 platforms; about $1 per 1,000 minutes sent, nothing for us to run |
 | Recording | Matroska or fragmented MP4, converted to MP4 after service | A crash never corrupts the file |
 | Lobby TVs | Local HLS from the daemon | Live video over Wi-Fi with no internet use |
 | Web app | SvelteKit or Next.js as an installable PWA, hosted on Cloudflare Pages at app.jivvy.org | One UI for browser, phones and output windows; works offline from cache |
@@ -114,7 +115,17 @@ Streaming runs entirely from the church computer, aiming for 80–90% of Resi's 
 - Pre-flight shows what the connection supports, e.g. "YouTube 1080p + Facebook 720p."
 - The tech lead gets an alert whenever a platform is lowered or paused.
 
-**Not building now:** a cloud relay. Revisit only when there's paying demand and someone besides the founder can cover Sunday support.
+**Cloud relay (Pro tier, Stage 3)**
+
+For churches with weak upload or many platforms: the church computer sends one stream (SRT for lossy connections, or RTMPS) to a Cloudflare Stream live input, and Stream copies it to every platform.
+
+- **Never a single point of failure.** If the relay is unreachable or a platform's health check fails, the daemon streams straight to the platforms as it would without Pro, with the bandwidth manager deciding what fits. The relay can only make a stream better, never stop it.
+- **Pass-through only.** Every platform gets the same quality; no transcoding on our side.
+- **Recording off** on the live input; the church computer already records locally, so Stream storage costs nothing.
+- **Cost:** Stream bills $1 per 1,000 minutes sent to platforms; ingest is free. A 90-minute service to 3 platforms is about $0.27, so roughly $1–4 per church per month. Stream needs a paid subscription for the account (shared by all churches).
+- **Stream keys** are stored as Stream outputs through the API and never logged.
+- **Prove these in a 1–2 day spike first:** (1) RTMPS output to Facebook works; (2) what Stream does when a platform drops the connection mid-stream; (3) there's no published uptime guarantee, so measure fallback time with the relay blocked.
+- **Build when** Stage 1 has shipped, pilot churches ask for it, and Sunday mornings are covered.
 
 ## Stage 0: Validate (2–4 weeks)
 
@@ -165,7 +176,8 @@ The smallest product a pilot church can run a whole service on, with every relia
 - [ ] Lyric layer composited over camera, hardware encode, one encode sent to stream and recording
 - [ ] Streaming per the Streaming design section: YouTube segment upload with retries, RTMPS for other platforms, bandwidth manager with Auto and Advanced modes, two-connection support
 - [ ] Crash-safe local recording
-- [ ] Local secure command channel (per-church hostname + certificate)
+- [ ] Local secure command channel (per-church hostname + certificate); certificate renewal stays free forever for every church
+- [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all
 - [ ] Keyboard and clicker control on the computer itself
 - [ ] Blocks sleep during services; no updates during service windows; signed auto-updates with rollback
 
@@ -179,15 +191,19 @@ The smallest product a pilot church can run a whole service on, with every relia
 - [ ] Pre-flight check
 - [ ] No-audio and stream-down alerts (web push + email)
 - [ ] Church account, Stripe checkout, license key, 30-day trial
+- [ ] Feature gating by release date: every gated feature has a `releasedAt`; a license unlocks local features released before its updates window ends and cloud features while Plus is active. Checked offline, never during a service window, never shown to volunteers or on screen
+- [ ] Export of songs, run sheets, themes and settings in open formats, available on every license
 
 **Done when:** 3 pilot churches run 4 Sundays each with zero service-stopping failures, and a first-time volunteer runs a service after a 5-minute walkthrough.
 
 ## Stage 2: Team features (6–8 weeks)
 
-Add what makes Jivvy Live the place the whole team coordinates, not just the booth.
+Add what makes Jivvy Live the place the whole team coordinates, not just the booth. Items tagged **(Plus)** or **(Pro)** use the cloud and always need that subscription; untagged items run on the church computer and follow the 3-year updates rule. See "Licensing and updates."
 
-- [ ] Collaborator links (no account): worship leader arrangements, guest speaker uploads, announcement submissions
-- [ ] Link builder for tech leads: choose what the link shows, add instructions or a voice note, preview as receiver, save templates
+- [ ] Collaborator links (no account): worship leader arrangements, guest speaker uploads, announcement submissions **(Plus)**
+- [ ] Link builder for tech leads: choose what the link shows, add instructions or a voice note, preview as receiver, save templates **(Plus)**
+- [ ] Sermon archive and podcast: audio trimmed from the local recording, published to a sermon page and podcast feed (audio on R2; video links to the platform's replay, never hosted by us) **(Plus)**
+- [ ] "Watch live" page and website embed that switches on when the church goes live, using the platform's player **(Plus)**
 - [ ] Lock time with approval for late changes; band read-only view
 - [ ] Guest files: PDF/images rendered in browser, PowerPoint converted on the church computer, auto-delete after 30 days
 - [ ] Pastor phone remote
@@ -204,12 +220,20 @@ Make it safe for bigger teams and connect it to the rest of the church's softwar
 - [ ] Roles: Owner, Admin, Tech Lead, Operator, Contributor, Viewer; stream keys hidden below Tech Lead
 - [ ] Admin PIN unlock at the booth; password + 2-step verification for remote admin
 - [ ] Activity log with one-tap undo
-- [ ] Simple scheduling: positions, assignments, accept/decline, swap requests, day-before reminders, calendar feed
-- [ ] Sign in with MinistryBase ID; MinistryBase events and calendar sync
-- [ ] Planning Center import (plans, songs, schedules)
-- [ ] Public REST API + webhooks (service started, slide changed, stream down)
-- [ ] Zapier integration; Stream Deck plugin; MIDI/OSC and Bitfocus Companion control
-- [ ] Practice mode, built-in help, "flag a problem" button, post-service report email
+- [ ] Simple scheduling: positions, assignments, accept/decline, swap requests, day-before reminders, calendar feed **(Plus)**
+- [ ] Sign in with MinistryBase ID; MinistryBase events and calendar sync **(Plus)**
+- [ ] Planning Center import (plans, songs, schedules) **(Plus)**
+- [ ] Public REST API + webhooks (service started, slide changed, stream down) **(Plus)**
+- [ ] Zapier integration **(Plus)**; Stream Deck plugin; MIDI/OSC and Bitfocus Companion control
+- [ ] Practice mode, built-in help, "flag a problem" button with logs attached
+- [ ] Post-service report email with viewers across all platforms combined **(Plus)**
+- [ ] Cloud backup of library, themes and settings with restore to a new computer; off-site recording backup for 90 days **(Plus)**
+- [ ] Remote booth view and health dashboard for the tech lead at home **(Plus)**
+- [ ] Support chatbot answering from the help docs, handing off to email or a booked call when unsure; points to pre-flight fixes during service hours **(Plus)**
+- [ ] Licensed Bible translations (NIV, ESV and others), only after a publisher quote fits the Plus budget **(Plus)**
+- [ ] Relay spike: the three checks in Streaming design → Cloud relay
+- [ ] Cloud relay via Cloudflare Stream with automatic fallback to direct streaming; passes the Internet-drops and Cloud-down chaos tests with the relay blocked **(Pro)**
+- [ ] Pro direct support line for Sunday mornings (text or phone) **(Pro)**
 
 **Done when:** a church with 15+ volunteers runs a month of services with schedules and roles, and at least one MinistryBase church uses the integration.
 
@@ -220,7 +244,7 @@ The features that wow in demos. They all run on the church computer, so they add
 - [ ] Lyric follow: listens to the vocal mic, matches the known lyrics, and pulses the Next button when it's time
 - [ ] Beat countdown: tempo detection showing "next slide in 4… 3… 2…" plus last-line highlight
 - [ ] Scripture auto-detect: the pastor says a reference and the verse is queued for one-tap display
-- [ ] Live captions and translation on screen and stream
+- [ ] Live captions on screen and stream (captions are accessibility, so free on every license forever); translation
 - [ ] Auto sermon clips (30–60 seconds) cut from the local recording
 - [ ] 4K recording where hardware allows
 
@@ -316,12 +340,55 @@ Running costs stay around $50–100 a month until you have hundreds of churches,
 | Windows code-signing certificate | roughly $200–400/year |
 | Email, crash reporting, domain | $0–30/month on starter tiers |
 | Stripe fees | about 2.9% + 30¢ per payment |
+| Cloudflare Stream (Pro relay only) | $1 per 1,000 minutes sent to platforms, about $1–4 per Pro church per month, plus the account's base subscription |
 
 **Pricing**
 
-- $200 one time per church, unlimited users and devices, includes the first year of Plus
+- $200 one time per church, unlimited users and devices, includes the first year of Plus and 3 years of updates
 - Plus after year one: $60/year, or $80/year billed monthly (about $6.67/month; Stripe's flat 30¢ takes roughly 7% of those small charges)
+- Pro (when the relay ships): about $15–20/month; everything in Plus, the cloud relay, and a direct Sunday support line. Kept off the public site until it can be bought
 - 30-day free trial
+
+**Licensing and updates**
+
+Goal: be fair to churches. Nothing a church has used in a service ever stops working, and we never charge to keep Sunday running.
+
+| | Included with the $200 | Forever, without Plus | Plus | Pro |
+| --- | --- | --- | --- | --- |
+| Critical fixes (security, platform changes, anything that breaks a service) | ✅ | ✅ | ✅ | ✅ |
+| Certificate renewal for local phone control | ✅ | ✅ | ✅ | ✅ |
+| New local features and updates | ✅ first 3 years | Keeps everything released in those 3 years | ✅ ongoing | ✅ ongoing |
+| Cloud features (sync, share links, scheduling, backups, alerts, sermon podcast, integrations) | ✅ first year | ❌ | ✅ | ✅ |
+| Cloud relay and Sunday support line | ❌ | ❌ | ❌ | ✅ |
+
+- **Everyone runs the same build.** Critical fixes reach every church because nobody is stuck on an old version; the license only decides which features are switched on, by each feature's release date. No backporting.
+- **Updates are counted in years, not "major versions,"** so there's never a reason to hold features back.
+- **Always free on every license:** everything that runs a service, the local web UI, live captions, the public-domain hymn library and Bible translations, and export of everything.
+- **When Plus ends, nothing is lost.** The booth computer keeps a full copy of the library; editing moves to the local UI; share links show "this church's links are paused" instead of breaking.
+- **Rejoining Plus** costs $60 with no back-payment, and unlocks everything released in the gap.
+- **Reminders** go to the account owner by email and the admin screen, never to volunteers or the screen, and never during a service window.
+- **Shutdown promise:** if Jivvy Live ever shuts down, we ship a final update that removes license checks and cloud dependencies so every church keeps working software.
+- **Hardship licenses:** free or pay-what-you-can for church plants, very small congregations and overseas missions; larger churches can sponsor one at checkout.
+
+**Cost per Plus church (estimates)**
+
+| Item | Per year |
+| --- | --- |
+| Recording backup (90 days, 720p, about 20 GB on R2) | ~$4 |
+| Sermon podcast audio (about 40 MB per sermon, kept forever) | ~$0.50, growing slowly |
+| Database, sync and realtime (Supabase, spread across ~1,000 churches) | ~$1–3 |
+| Email, push and alerts | ~$1 |
+| Stripe fees | ~$2 (about $6 billed monthly) |
+| **Total** | **~$8–10 of $60** |
+
+Servers are cheap; people's time is the real cost. Target margin is 40–50% after support time. That's a deliberate choice to give more back to churches, not a ceiling to push past.
+
+**Support plan**
+
+- The founder handles support and calls at first; hire help (paid) once it outgrows that and revenue supports it.
+- Plus support is self-serve first: help center, the support chatbot, email, and booked calls. One-on-one time is saved for Sundays when something is actually wrong.
+- Library migration from ProPresenter or EasyWorship is a perk for founding churches; after that the Stage 2 importers do it.
+- Sales calls can be handed to someone at about $18/hour; track calls per sale from day one (break-even is about one $200 sale per 10 hours).
 
 **What the money looks like**
 
@@ -335,7 +402,10 @@ Growth depends mostly on new sales, since renewals are small. That's the tradeof
 
 **Decisions to make**
 
-- [ ] Critical streaming and security fixes for churches without Plus: free for 1–2 years, so a platform change never feels like ransom
+- [x] Critical streaming and security fixes for churches without Plus: free forever, delivered to everyone on the same build (see Licensing and updates)
+- [x] What a license includes without Plus: every local feature released in its first 3 years, kept forever; no cloud features
+- [x] Cloud relay: Cloudflare Stream, Pro tier, Stage 3, with automatic fallback to direct streaming
+- [ ] Get a publisher quote for licensed Bible translations before promising them
 - [ ] Whether to offer a founding-church discount during Stage 0
 - [ ] Revenue split, if any, with MinistryBase for customers who come through their integration
 
@@ -353,6 +423,8 @@ The biggest risk is a bad Sunday; the second is building for months before anyon
 | Solo Sunday support | Clear status page, in-app troubleshooting, and a limited number of pilot churches until support scales |
 | Platform changes (YouTube, Facebook, Windows, macOS) | Watch their developer announcements; keep the Plus renewal funding maintenance |
 | Scope creep | Ship Stage 1 before starting anything in Stages 3–5 |
+| Pro relay goes down on a Sunday | Automatic fallback to direct streaming, tested with the relay blocked; Pro only launches once Sunday mornings are covered |
+| Free-forever fixes outgrow the revenue that pays for them | New sales fund maintenance, with Plus renewals on top; the shutdown promise protects churches if that ever fails |
 
 **Stop rules** — decide these now, before sunk cost decides for you:
 

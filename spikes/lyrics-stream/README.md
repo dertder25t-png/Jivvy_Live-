@@ -4,38 +4,72 @@ Throwaway prototype for the Stage 0 tech spike in `docs/BUILD_PLAN.md`. Shell de
 
 ## What it does
 
-`source → lyric overlay → Quick Sync H.264 (encode once) → tee → crash-safe MKV recording` and, when a stream key is set, `→ FLV → RTMPS to YouTube`. Silent AAC audio is muxed in so platforms accept the stream. Sample slides are a public-domain hymn. The lyric layer is rendered only when the slide changes (about 1 ms per slide), never per frame.
+`source → GPU upload → lyric layer composited on the GPU → H.264 hardware encode (once) → tee → crash-safe MKV recording` and, when a stream key is set, `→ FLV → RTMPS to YouTube`. Silent AAC audio is muxed in so platforms accept the stream. Sample slides are a public-domain hymn.
+
+The lyric layer is drawn on the CPU **only when the slide changes** (about 1 ms per slide). `overlaycomposition` attaches it to each frame as metadata, and `d3d12overlaycompositor` blends it on the GPU, so the CPU never touches a full video frame.
 
 ## Run it (Windows)
 
 Needs Rust (MSVC) and GStreamer 1.28 (`winget install gstreamerproject.gstreamer`; it installs per-user with development files). `run.ps1` sets the GStreamer paths for its own process only.
 
 ```powershell
-.\run.ps1 test                                   # unit tests
-.\run.ps1 run -- --seconds 60                    # test pattern, record to recording.mkv
-.\run.ps1 run -- --source webcam --seconds 30    # laptop camera (see known issues)
-.\run.ps1 run -Cores 2 -- --seconds 60           # pin to 2 cores to simulate a cheap laptop
+.\run.ps1 test                                                # unit tests
+.\run.ps1 run -- --seconds 60                                 # test pattern, record to recording.mkv
+.\run.ps1 run -- --source webcam --encoder mf --seconds 30    # laptop camera, Media Foundation encoder
+.\run.ps1 run -Cores 2 -- --source webcam --encoder mf        # pin to 2 cores to simulate a cheap laptop
 ```
+
+`--encoder qsv` (default) uses GStreamer's Quick Sync plugin; `--encoder mf` uses Windows Media Foundation's Intel H.264 encoder. See known issues before choosing.
 
 To stream to YouTube, put the stream key in `spikes/lyrics-stream/.stream-key` (git-ignored) or set `JIVVY_YT_STREAM_KEY`. The key is never printed; errors are scrubbed of it.
 
-## Results so far (Framework 13, Core Ultra X7 358, Arc B390, GStreamer 1.28.6)
+## Results (Framework 13, Core Ultra X7 358, Arc B390, Intel driver 32.0.101.8860, GStreamer 1.28.6)
 
-| Run | CPU (whole machine) | Frames | Notes |
+All at 1080p30, lyrics on, 6 Mbps H.264, MKV with AAC.
+
+| Run | CPU | Frames | Stability |
 | --- | --- | --- | --- |
-| Test pattern, 1080p30, lyrics, QSV 6 Mbps, MKV + AAC, 60 s | **avg 2.5%, max 7.2%** | 1,802 / 1,800, worst second 28.2 fps | Lyrics verified in the recording |
-| Laptop webcam, same pipeline, 30 s | ~0.7% | **~10 fps** | Throttled; see below |
+| Test pattern, QSV, 60 s | avg 2.5%, max 7.2% of machine | 1,802 / 1,800 | |
+| Webcam, CPU lyric blending (first version) | ~0.7% | **~10 fps** | Fixed by GPU compositing |
+| **Webcam, GPU lyrics, Media Foundation encoder, 30 s** | **avg 0.8%, max 1.7% of machine** | ~878 / 900 (first second is camera warm-up), worst second 28 fps | **13 / 13 runs clean** |
+| Webcam, GPU lyrics, MF, pinned to 2 cores | ~6% of those 2 cores | 878 / 900 | clean |
+| Webcam, GPU lyrics, QSV | ~0.7% | 880 / 900 when it runs | crashed 2 of 3 |
 
-Budget we set for this machine: under ~10% CPU at 1080p30 (the plan's 40% target is for a $300 laptop).
+Recording checked: 21.5 MB for 30 s (matches 6 Mbps), lyrics correctly placed over the camera image.
 
-## Known issues (webcam path)
+Budgets: under ~10% CPU on this machine; the plan's target is under 40% on a $300 laptop.
 
-1. **Intermittent crash (heap corruption, `0xC0000374`) when camera capture feeds the Intel encoder.** Camera alone: 6/6 clean. Encoder alone: 6/6 clean. Camera → encoder: about half of runs crash, at startup or at shutdown; when a run starts, it holds 30 fps. Seen with both `mfvideosrc` and the deprecated `ksvideosrc` + `qsvjpegdec`. Handing frames over via `d3d11upload` reduced it (8/8 clean in one batch) but did not eliminate it. Looks like a GStreamer 1.28.6 Windows bug, not our code: it reproduces with `gst-launch-1.0` alone.
-2. **10 fps with lyrics on camera frames.** `gst-launch` with the same pipeline and no drawing records all 300 of 300 frames, so the throttle is CPU blending into camera buffers (likely slow-to-map Media Foundation memory).
+## Known issues
+
+### 1. GStreamer's Quick Sync plugin crashes on this machine (not our code)
+
+`STATUS_HEAP_CORRUPTION` (`0xC0000374`, reported in `ntdll.dll`) in roughly 20–40% of process launches whenever the `qsv` plugin loads. Narrowed down with `gst-launch-1.0` / `gst-inspect-1.0` only:
+
+| Repro (10 runs each) | 1.28.6 | 1.26.11 |
+| --- | --- | --- |
+| `gst-inspect-1.0 qsvh264enc` (just loads the plugin) | 4 crashes | |
+| `videotestsrc ! qsvh264enc ! fakesink` (no camera) | 2 crashes | 2 crashes |
+| `mfvideosrc ! qsvh264enc ! fakesink` | 3 crashes | 3 crashes |
+| `gst-inspect-1.0` of `d3d12h264enc`, `mfh264enc`, `d3d11upload` | 0 | |
+| `mfvideosrc ! d3d12upload ! d3d12h264enc` | 0 | |
+| Media Foundation encoder (`mfh264enc`), 25 runs incl. full spike | 0 | |
+
+So it is the Quick Sync plugin's start-up (where it enumerates Intel's oneVPL runtimes), not the camera and not a 1.28 regression. The process loads the current driver's `libmfx64-gen.dll` (26.05) plus Intel's MFX Loader `System32\libmfxhw64.dll` (23.06), which the same driver installs. Next step for an upstream report: a crash dump with symbols (WinDbg or ProcDump) and a page-heap run to catch the code that corrupts the heap. It may belong to GStreamer's `qsv` plugin or to Intel's runtime for this new GPU.
+
+### 2. Direct3D 12 encoder output is wrong on this GPU
+
+`d3d12h264enc` never crashes but encodes only one frame in four (the others are 6-byte empty frames) and ignores the CBR bitrate, even with moving test video. Not usable here; worth retesting on newer drivers.
+
+### Design takeaways for the daemon
+
+- **Composite lyrics on the GPU** and draw the lyric layer only on slide change.
+- **Treat the encoder as something that can fail on a church's PC.** Run a quick encoder self-test in pre-flight, keep a fallback order (here: Media Foundation → Quick Sync → x264), and run the encoder where the watchdog can restart it without losing the recording.
+- Camera capture already decodes to NV12 through Media Foundation, so a USB camera (or an ATEM Mini, which appears to Windows as a webcam) needs no CPU conversion.
 
 ## Next steps
 
-- Composite the lyric layer on the GPU (`d3d11compositor`: camera pad + lyric pad that only updates on slide change). That fixes issue 2 and is the right production design anyway.
-- Pin down issue 1: try GStreamer 1.26, the D3D12 elements, and a crash dump with symbols; report upstream if it holds. Retest with a USB HDMI capture card, which is what most churches will actually use.
 - Stream to a private YouTube event once live streaming is enabled on the channel (needs phone verification, then up to 24 h).
-- Repeat the measurements pinned to 2 cores, then on a cheap laptop before Stage 1 ships.
+- Crash dump and page-heap run for issue 1 (needs Microsoft debugging tools installed), then file reports with GStreamer and Intel.
+- Retest Quick Sync and D3D12 encode after the next Intel driver update.
+- Measure the x264 software fallback's CPU cost.
+- Repeat on a cheap laptop before Stage 1 ships.

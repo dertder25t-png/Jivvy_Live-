@@ -33,6 +33,7 @@ struct Args {
     bitrate: u32,
     out: String,
     font: Option<String>,
+    encoder: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -43,6 +44,7 @@ fn parse_args() -> Result<Args> {
         bitrate: 6000,
         out: "recording.mkv".into(),
         font: None,
+        encoder: "qsv".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -54,8 +56,9 @@ fn parse_args() -> Result<Args> {
             "--bitrate" => a.bitrate = val()?.parse()?,
             "--out" => a.out = val()?,
             "--font" => a.font = Some(val()?),
+            "--encoder" => a.encoder = val()?,
             "-h" | "--help" => {
-                println!("lyrics-stream [--source test|webcam] [--seconds N] [--slide-seconds N] [--bitrate KBPS] [--out FILE] [--font TTF]");
+                println!("lyrics-stream [--source test|webcam] [--seconds N] [--slide-seconds N] [--bitrate KBPS] [--out FILE] [--font TTF] [--encoder qsv|mf]");
                 println!("Set JIVVY_YT_STREAM_KEY to also stream to YouTube.");
                 std::process::exit(0);
             }
@@ -64,6 +67,9 @@ fn parse_args() -> Result<Args> {
     }
     if a.source != "test" && a.source != "webcam" {
         bail!("--source must be test or webcam");
+    }
+    if a.encoder != "qsv" && a.encoder != "mf" {
+        bail!("--encoder must be qsv or mf");
     }
     Ok(a)
 }
@@ -104,20 +110,27 @@ fn pipeline_description(a: &Args, streaming: bool) -> String {
         "webcam" => format!("mfvideosrc ! video/x-raw,format=NV12,width={WIDTH},height={HEIGHT},framerate={FPS}/1"),
         _ => format!("videotestsrc is-live=true pattern=ball ! video/x-raw,format=NV12,width={WIDTH},height={HEIGHT},framerate={FPS}/1"),
     };
+    let (br, gop) = (a.bitrate, FPS * 2);
+    let enc = match a.encoder.as_str() {
+        // Media Foundation's Intel encoder takes system or D3D11 memory, not D3D12.
+        "mf" => format!(
+            "d3d12download ! video/x-raw,format=NV12 ! mfh264enc name=enc rc-mode=cbr bitrate={br} gop-size={gop} bframes=0 low-latency=true"
+        ),
+        _ => format!("qsvh264enc name=enc bitrate={br} max-bitrate={br} rate-control=cbr gop-size={gop} b-frames=0 target-usage=7"),
+    };
     let out = a.out.replace('\\', "/");
     let mut d = format!(
-        // d3d11upload hands frames to the encoder in GPU memory. Feeding mfvideosrc
-        // buffers straight into qsvh264enc crashes ~50% of runs (heap corruption,
-        // GStreamer 1.28.6); with the upload it was stable in 8 of 8.
-        "{src} ! overlaycomposition name=lyrics ! queue max-size-buffers=3 leaky=downstream ! d3d11upload \
-         ! qsvh264enc name=enc bitrate={br} max-bitrate={br} rate-control=cbr gop-size={gop} b-frames=0 target-usage=7 \
+        // Frames go to GPU memory first. overlaycomposition then only attaches the
+        // lyric layer as metadata and d3d12overlaycompositor blends it on the GPU,
+        // so the CPU never touches a full frame (CPU blending into camera buffers
+        // throttled the webcam to ~10 fps).
+        "{src} ! d3d12upload ! overlaycomposition name=lyrics ! d3d12overlaycompositor \
+         ! queue max-size-buffers=3 leaky=downstream ! {enc} \
          ! h264parse name=parse config-interval=-1 ! tee name=vt \
          audiotestsrc is-live=true wave=silence ! audio/x-raw,rate=48000,channels=2 ! audioconvert \
          ! avenc_aac bitrate=128000 ! aacparse ! tee name=at \
          matroskamux name=mkv streamable=true ! filesink location=\"{out}\" \
          vt. ! queue ! mkv. at. ! queue ! mkv.",
-        br = a.bitrate,
-        gop = FPS * 2,
     );
     if streaming {
         d.push_str(" flvmux name=fmux streamable=true ! rtmp2sink name=yt vt. ! queue ! fmux. at. ! queue ! fmux.");
@@ -183,7 +196,7 @@ fn main() -> Result<()> {
     let (mut cpu_samples, mut last_frames, mut last_tick, mut eos_sent) = (Vec::new(), 0u64, Instant::now(), false);
     let mut worst_fps = f64::MAX;
 
-    println!("source={} {WIDTH}x{HEIGHT}@{FPS} bitrate={}kbps seconds={} cores={cores}", args.source, args.bitrate, args.seconds);
+    println!("source={} encoder={} {WIDTH}x{HEIGHT}@{FPS} bitrate={}kbps seconds={} cores={cores}", args.source, args.encoder, args.bitrate, args.seconds);
     loop {
         if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) {
             match msg.view() {
@@ -263,9 +276,20 @@ mod tests {
 
     #[test]
     fn pipeline_only_streams_when_a_key_is_set() {
-        let a = Args { source: "test".into(), seconds: 1, slide_seconds: 4, bitrate: 6000, out: "x.mkv".into(), font: None };
+        let a = Args { source: "test".into(), seconds: 1, slide_seconds: 4, bitrate: 6000, out: "x.mkv".into(), font: None, encoder: "qsv".into() };
         assert!(!pipeline_description(&a, false).contains("rtmp2sink"));
         let d = pipeline_description(&a, true);
         assert!(d.contains("rtmp2sink name=yt") && !d.contains("location=rtmp"));
+    }
+
+    #[test]
+    fn lyrics_are_composited_on_the_gpu_for_both_encoders() {
+        let mut a = Args { source: "webcam".into(), seconds: 1, slide_seconds: 4, bitrate: 6000, out: "x.mkv".into(), font: None, encoder: "qsv".into() };
+        let qsv = pipeline_description(&a, false);
+        assert!(qsv.contains("d3d12upload ! overlaycomposition name=lyrics ! d3d12overlaycompositor"));
+        assert!(qsv.contains("qsvh264enc") && !qsv.contains("mfh264enc"));
+        a.encoder = "mf".into();
+        let mf = pipeline_description(&a, false);
+        assert!(mf.contains("d3d12overlaycompositor") && mf.contains("d3d12download ! video/x-raw,format=NV12 ! mfh264enc"));
     }
 }

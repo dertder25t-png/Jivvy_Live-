@@ -2,10 +2,8 @@ name = "jivvy-live-site"
 compatibility_date = "2025-09-01"
 pages_build_output_dir = "./dist"
 
-# Waitlist storage. Create the database, then paste its id here:
-#   npx wrangler d1 create jivvy-live
-#   npx wrangler d1 execute jivvy-live --remote --file=./schema.sql
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "jivvy-live"
-# database_id = "<paste id>"
+# Waitlist storage (schema.sql is already applied to this database).
+[[d1_databases]]
+binding = "DB"
+database_name = "jivvy-live"
+database_id = "17a75d42-dbf2-4532-932c-950b92696acb"

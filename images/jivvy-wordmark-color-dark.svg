@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="383" height="206" viewBox="0 14 383 206">
+  <title>Jivvy wordmark, color for dark backgrounds</title>
+  <g id="wordmark">
+    <g id="letters" fill="#F4F1EA">
+      <rect id="j-dot" x="20" y="14" width="30" height="30"/>
+      <path id="j" d="M20 60H50V138C50 158 38 170 18 170H0V142H10C17 142 20 138 20 130Z"/>
+      <path id="v1" d="M83 60H113L131 115L149 60H179L143 170H119Z"/>
+      <path id="v2" d="M185 60H215L233 115L251 60H281L245 170H221Z"/>
+      <path id="y" d="M287 60H317L335 115L353 60H383L330.7 220H300.7L320 160.9Z"/>
+    </g>
+  <g id="i" fill="#FF7A1A">
+    <path id="i-dot" d="M62 14H92V37A7 7 0 0 1 85 44H62Z"/>
+    <path id="i-stem-sliced" d="M62 60H74L92 115V163A7 7 0 0 1 85 170H62Z"/>
+  </g>
+  </g>
+</svg>

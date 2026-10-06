@@ -1,0 +1,132 @@
+---
+const faqs = [
+  ["What happens if the internet goes down during service?", "Nothing visible. Slides, recording and booth control run on the church computer and local Wi-Fi. The stream reconnects on its own when the internet returns, and the recording keeps going the whole time."],
+  ["Does my video go through your servers?", "No. Video goes straight from your church to YouTube, Facebook and other platforms. We never touch it, so there is no relay to go down on a Sunday."],
+  ["Can a volunteer run it?", "That is the design goal: a locked volunteer view, plain-English messages, and a 30-second pre-flight check before every service."],
+  ["How much will it cost?", "Planned founding pricing is a one-time $200 per church with unlimited users and devices, including the first year of updates. After that, $60 a year. There is a 30-day free trial."],
+  ["Is it ready today?", "Not yet. We are building it with a small group of pilot churches first, because a service must never stop because of our software. Join the list and we will tell you when it is ready to try."],
+];
+const promises = [
+  ["Works without the cloud", "Slides, stream, recording and control all run on your computer and your Wi-Fi."],
+  ["Recovers by itself", "If anything crashes it restarts in seconds on the same slide. Dropped streams reconnect. Recordings survive crashes."],
+  ["Built for volunteers", "Locked-down views, plain-English errors, and a pre-flight check before every service."],
+];
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Jivvy Live: church slides and streaming that never stops</title>
+    <meta name="description" content="Lyrics, slides, streaming and recording for churches. Runs on your own computer so a service never stops because of the internet. Join the founding church list." />
+    <meta name="theme-color" content="#10224F" />
+    <link rel="icon" href="/brand/jivvy-app-icon.svg" type="image/svg+xml" />
+    <meta property="og:title" content="Jivvy Live" />
+    <meta property="og:description" content="Church slides and streaming that never stops." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://live.jivvy.org/" />
+  </head>
+  <body>
+    <header class="wrap top">
+      <img src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="220" height="64" />
+      <a class="btn small" href="#join">Join the list</a>
+    </header>
+
+    <main>
+      <section class="wrap hero">
+        <p class="eyebrow">For church tech teams</p>
+        <h1>Sunday never stops <span class="spark">because of us.</span></h1>
+        <p class="lead">Lyrics, slides, streaming and recording that run on your own computer. If the internet drops, your service keeps going.</p>
+        <a class="btn" href="#join">Join the founding church list</a>
+        <p class="note">In development with pilot churches. Not yet released.</p>
+      </section>
+
+      <section class="wrap cards" aria-label="What makes it different">
+        {promises.map(([t, d]) => (
+          <article class="card"><h2>{t}</h2><p>{d}</p></article>
+        ))}
+      </section>
+
+      <section class="wrap" id="faq">
+        <h2 class="section">Questions</h2>
+        {faqs.map(([q, a]) => (
+          <details><summary>{q}</summary><p>{a}</p></details>
+        ))}
+      </section>
+
+      <section class="wrap join" id="join">
+        <h2 class="section">Founding church list</h2>
+        <p>Tell us a little about your church. We will reach out as pilots open up.</p>
+        <form id="wl" method="post" action="/api/waitlist">
+          <label>Email <input name="email" type="email" required autocomplete="email" /></label>
+          <label>Church name <input name="church" type="text" autocomplete="organization" /></label>
+          <label>Weekly attendance
+            <select name="size">
+              <option value="">Choose</option><option>Under 100</option><option>100-250</option><option>250-500</option><option>500+</option>
+            </select>
+          </label>
+          <label>Software you use today <input name="software" type="text" placeholder="ProPresenter, EasyWorship, ..." /></label>
+          <input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true" />
+          <button class="btn" type="submit">Join the list</button>
+          <p id="msg" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+    </main>
+
+    <footer class="wrap foot">
+      <span>&copy; Jivvy. Part of the <a href="https://jivvy.org">Jivvy</a> ministry.</span>
+    </footer>
+
+    <script is:inline>
+      const f = document.getElementById("wl"), m = document.getElementById("msg");
+      f.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        m.textContent = "Sending...";
+        try {
+          const r = await fetch(f.action, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(f))) });
+          const j = await r.json().catch(() => ({}));
+          if (r.ok && j.ok) { f.reset(); m.textContent = "Thank you. You are on the list."; }
+          else m.textContent = j.error || "Something went wrong. Please try again.";
+        } catch { m.textContent = "Could not reach us. Check your connection and try again."; }
+      });
+    </script>
+
+    <style is:global>
+      :root { --navy:#10224F; --paper:#F4F1EA; --blue:#2E6BFF; --orange:#FF7A1A; --cut: polygon(0 0, 100% 0, 100% calc(100% - 14px), calc(100% - 4.5px) 100%, 0 100%); }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body { margin:0; background:var(--navy); color:var(--paper); font:17px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+      .wrap { max-width:960px; margin:0 auto; padding:0 20px; }
+      .top { display:flex; align-items:center; justify-content:space-between; padding-top:24px; padding-bottom:24px; }
+      .eyebrow { font:500 13px/1 ui-monospace,"DM Mono",Consolas,monospace; letter-spacing:.2em; text-transform:uppercase; color:var(--blue); margin:0 0 16px; }
+      .hero { padding-top:56px; padding-bottom:64px; }
+      h1 { font-size:clamp(2.2rem,6vw,4rem); line-height:1.05; margin:0 0 20px; font-weight:800; letter-spacing:-.02em; }
+      .spark { color:var(--blue); }
+      .lead { font-size:1.25rem; max-width:34em; margin:0 0 28px; opacity:.92; }
+      .note { font-size:.9rem; opacity:.7; margin-top:16px; }
+      .btn { display:inline-block; background:var(--blue); color:#fff; font-weight:700; padding:14px 26px; text-decoration:none; border:0; cursor:pointer; font-size:1rem; clip-path:var(--cut); }
+      .btn:hover, .btn:focus-visible { background:#4c80ff; }
+      .btn.small { padding:10px 18px; font-size:.9rem; }
+      a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline:3px solid var(--orange); outline-offset:2px; }
+      .cards { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); padding-bottom:56px; }
+      .card { background:rgba(244,241,234,.07); padding:24px; clip-path:var(--cut); border-top:3px solid var(--blue); }
+      .card h2 { margin:0 0 8px; font-size:1.15rem; }
+      .card p { margin:0; opacity:.88; }
+      .section { font-size:1.6rem; margin:0 0 16px; }
+      .section::before { content:"/ "; color:var(--orange); }
+      details { border-bottom:1px solid rgba(244,241,234,.2); padding:14px 0; }
+      summary { cursor:pointer; font-weight:600; }
+      details p { margin:10px 0 0; opacity:.88; }
+      #faq { padding-bottom:56px; }
+      .join { padding-bottom:72px; }
+      form { display:grid; gap:14px; max-width:520px; }
+      label { display:grid; gap:6px; font-weight:600; font-size:.95rem; }
+      input, select { font:inherit; padding:12px; border:2px solid transparent; background:var(--paper); color:var(--navy); border-radius:0; }
+      .hp { position:absolute; left:-9999px; }
+      #msg { min-height:1.5em; margin:0; }
+      .foot { padding-top:24px; padding-bottom:40px; font-size:.9rem; opacity:.75; }
+      .foot a { color:inherit; }
+      @media (prefers-reduced-motion: reduce) { html { scroll-behavior:auto; } }
+    </style>
+  </body>
+</html>

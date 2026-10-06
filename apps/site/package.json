@@ -1,0 +1,20 @@
+{
+  "name": "@jivvy/site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "typecheck": "astro check",
+    "test": "vitest run"
+  },
+  "dependencies": { "astro": "^5.14.0" },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.4",
+    "@cloudflare/workers-types": "^4.20250900.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

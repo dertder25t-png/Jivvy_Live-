@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Jivvy app icon</title>
+  <rect id="background" x="0" y="0" width="1024" height="1024" fill="#10224F"/>
+  <g id="j-mark" transform="translate(427 199.2) scale(3.4)">
+    <rect id="j-dot-on-air" x="20" y="14" width="30" height="30" fill="#FF7A1A"/>
+    <path id="j" fill="#F4F1EA" d="M20 60H50V138C50 158 38 170 18 170H0V142H10C17 142 20 138 20 130Z"/>
+  </g>
+</svg>

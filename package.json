@@ -1,0 +1,13 @@
+{
+  "name": "jivvy-live",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "npm run build -w @jivvy/protocol && npm run build -w @jivvy/site",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:site": "npm run dev -w @jivvy/site"
+  }
+}

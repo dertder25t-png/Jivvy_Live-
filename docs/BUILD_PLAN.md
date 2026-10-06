@@ -121,7 +121,7 @@ Streaming runs entirely from the church computer, aiming for 80–90% of Resi's 
 Prove churches want it before writing the daemon.
 
 - [ ] Send the church overview doc to 10–15 church tech leads and collect answers
-- [ ] Website at live.jivvy.org (Astro on Cloudflare Pages) with features, pricing, FAQ, waitlist and Calendly booking
+- [x] Website at live.jivvy.org (Astro on Cloudflare Pages) with features, pricing, FAQ, waitlist and Calendly booking
 - [ ] Optional "founding church" preorder to test real willingness to pay
 - [ ] Line up 3–5 pilot churches you can visit in person
 - [ ] Tech spike: web lyrics composited over a camera feed, hardware-encoded, streamed to YouTube, on a $300 laptop

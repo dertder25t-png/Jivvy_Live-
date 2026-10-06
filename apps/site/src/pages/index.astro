@@ -2,9 +2,9 @@
 import { bookingUrl, CONTACT_EMAIL } from "../lib/booking";
 import { PRICING, plusMonthly } from "../lib/pricing";
 
-// Set PUBLIC_CALENDLY_URL in the Cloudflare Pages build settings; without it the
-// booking section falls back to email.
-const booking = bookingUrl(import.meta.env.PUBLIC_CALENDLY_URL);
+// Set PUBLIC_BOOKING_URL (a Google Calendar booking page) in the Cloudflare build
+// settings; without it the booking section falls back to email.
+const booking = bookingUrl(import.meta.env.PUBLIC_BOOKING_URL);
 const features = [
   ["Run sheet", "Songs, scripture, images, PDF slides, countdowns and a pre-service loop, all in order for Sunday."],
   ["Song editor", "Arrangement blocks, paste-to-slides with verse and chorus detection, and a public-domain hymn library."],
@@ -135,7 +135,7 @@ const promises = [
           <>
             <p>Book a call with the founder at a time that suits you.</p>
             <a class="btn" href={booking} target="_blank" rel="noopener noreferrer">Book a call</a>
-            <p class="note">Opens Calendly in a new tab. Rather not call? Email <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.</p>
+            <p class="note">Opens Google Calendar in a new tab. Rather not call? Email <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.</p>
           </>
         ) : (
           <p>Email <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a> and we will get back to you.</p>

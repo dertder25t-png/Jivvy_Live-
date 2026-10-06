@@ -3,21 +3,25 @@ import { bookingUrl } from "../src/lib/booking";
 import { PRICING, plusMonthly } from "../src/lib/pricing";
 
 describe("bookingUrl", () => {
-  it("accepts https Calendly links", () => {
-    expect(bookingUrl("https://calendly.com/jivvy/intro")).toBe("https://calendly.com/jivvy/intro");
-    expect(bookingUrl("  https://calendly.com/jivvy  ")).toBe("https://calendly.com/jivvy");
+  it("accepts Google Calendar booking pages", () => {
+    expect(bookingUrl("https://calendar.app.google/AbC123xyz")).toBe("https://calendar.app.google/AbC123xyz");
+    expect(bookingUrl("  https://calendar.google.com/calendar/appointments/schedules/AcZssZ1  ")).toBe(
+      "https://calendar.google.com/calendar/appointments/schedules/AcZssZ1",
+    );
   });
   it("returns null when unset", () => {
     for (const x of [undefined, "", "   "]) expect(bookingUrl(x)).toBeNull();
   });
-  it("rejects other hosts, http and malformed values", () => {
+  it("rejects other hosts, other Google pages, http and malformed values", () => {
     for (const x of [
-      "http://calendly.com/jivvy",
-      "https://calendly.com.evil.example/jivvy",
-      "https://evilcalendly.com/jivvy",
+      "http://calendar.app.google/AbC123xyz",
+      "https://calendar.app.google/",
+      "https://calendar.google.com/calendar/u/0/r",
+      "https://calendar.google.com.evil.example/calendar/appointments/x",
+      "https://calendly.com/jivvy",
       "javascript:alert(1)",
-      "https://user:pw@calendly.com/jivvy",
-      "calendly.com/jivvy",
+      "https://user:pw@calendar.app.google/AbC123xyz",
+      "calendar.app.google/AbC123xyz",
     ])
       expect(bookingUrl(x)).toBeNull();
   });

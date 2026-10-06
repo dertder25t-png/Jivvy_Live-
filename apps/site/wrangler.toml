@@ -7,3 +7,10 @@ pages_build_output_dir = "./dist"
 binding = "DB"
 database_name = "jivvy-live"
 database_id = "17a75d42-dbf2-4532-932c-950b92696acb"
+
+# Preview deployments (every non-main branch) use a separate database so test
+# signups never reach the real waitlist. Same schema.sql applied.
+[[env.preview.d1_databases]]
+binding = "DB"
+database_name = "jivvy-live-preview"
+database_id = "7f2acde0-f774-47dd-88f0-5fd7e969c008"

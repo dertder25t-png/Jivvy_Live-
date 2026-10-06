@@ -6,3 +6,6 @@ dist/
 .env
 .env.*
 *.log
+target/
+*.mkv
+.stream-key

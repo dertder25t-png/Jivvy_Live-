@@ -119,6 +119,9 @@ pub struct MediaConfig {
     pub camera: Selection,
     #[serde(default)]
     pub microphone: Selection,
+    /// Program feed settings (resolution, frame rate, bitrate, encoder).
+    #[serde(default)]
+    pub program: crate::program::ProgramConfig,
 }
 
 /// Reads `media.json`; missing means defaults. Invalid is an error and the caller keeps
@@ -272,6 +275,7 @@ pub struct Status {
     pub peak_db: Vec<f64>,
     /// The engine acknowledged the latest level report or check (at least once a second).
     pub connected: bool,
+    pub program: crate::program::ProgramStatus,
     pub problems: Vec<String>,
 }
 

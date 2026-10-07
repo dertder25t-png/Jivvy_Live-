@@ -8,8 +8,11 @@
 //! when it returns. Audio levels go to the engine about ten times a second
 //! (`media.levels`), which relays them to every screen for live meters.
 //!
-//! This item only captures; compositing the lyric layer, encoding, recording and streaming
-//! attach to these pipelines in the next Stage 1 items.
+//! Captured frames and audio feed the program pipeline (`program.rs`), which never stops
+//! because an input does: a missing camera becomes a slate, a missing microphone silence.
+//! It draws the lyric layer, encodes once, and is where recording and streaming attach.
+
+mod program;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,10 +21,13 @@ use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
 
-use jivvy_daemon::client::LevelsSender;
+use jivvy_daemon::client::{self, LevelsSender, Update};
 use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, RawDevice, Status};
+use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, ProgramConfig};
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
+use program::{Feed, Program};
 
 const TICK: Duration = Duration::from_millis(250);
 /// Devices and config are re-checked, and failed inputs retried, every this many ticks.
@@ -131,8 +137,9 @@ fn make(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory).build().map_err(|_| format!("GStreamer element {factory} is missing"))
 }
 
-/// Builds and starts the pipeline for an input's current choice.
-fn start(input: &mut Input, monitor: &gst::DeviceMonitor) -> Result<(), String> {
+/// Builds and starts the pipeline for an input's current choice. Its output goes into
+/// `feed`: camera frames scaled to the program size, microphone audio as 48 kHz stereo.
+fn start(input: &mut Input, monitor: &gst::DeviceMonitor, feed: &Arc<Feed>, cfg: &ProgramConfig) -> Result<(), String> {
     let source = match &input.choice {
         Choice::None => return Ok(()),
         Choice::Missing { name } => return Err(format!("{name} is not connected")),
@@ -154,27 +161,70 @@ fn start(input: &mut Input, monitor: &gst::DeviceMonitor) -> Result<(), String> 
             .map_err(|e| format!("can't open {name}: {e}"))?,
     };
     let pipeline = gst::Pipeline::new();
-    let sink = make("fakesink")?;
-    sink.set_property("sync", false);
     let mut chain = vec![source];
-    if input.kind == Kind::Camera {
-        let q = make("queue")?;
-        q.set_property_from_str("leaky", "downstream");
-        q.set_property("max-size-buffers", 2u32);
-        chain.push(q);
-        let count = input.count.clone();
-        sink.static_pad("sink").ok_or("fakesink has no pad")?.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            count.fetch_add(1, Ordering::Relaxed);
-            gst::PadProbeReturn::Ok
-        });
+    let (count, feed) = (input.count.clone(), feed.clone());
+    let sink = if input.kind == Kind::Camera {
+        // Media Foundation cameras already deliver NV12 at 1080p, so these pass through;
+        // other sizes and formats are converted here, off the program's path.
+        chain.push(make("videoconvert")?);
+        chain.push(make("videoscale")?);
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .field("width", cfg.width as i32)
+            .field("height", cfg.height as i32)
+            .build();
+        gst_app::AppSink::builder()
+            .caps(&caps)
+            .max_buffers(1)
+            .drop(true)
+            .sync(false)
+            .callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        if let Some(b) = sample.buffer_owned() {
+                            *feed.frame.lock().unwrap() = Some((Instant::now(), b));
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            )
+            .build()
     } else {
         chain.push(make("audioconvert")?);
+        chain.push(make("audioresample")?);
+        let caps = gst::Caps::builder("audio/x-raw")
+            .field("format", "S16LE")
+            .field("rate", AUDIO_RATE as i32)
+            .field("channels", AUDIO_CHANNELS as i32)
+            .field("layout", "interleaved")
+            .build();
+        let filter = make("capsfilter")?;
+        filter.set_property("caps", &caps);
+        chain.push(filter);
         let level = make("level")?;
         level.set_property("interval", 100_000_000u64); // 100 ms
         level.set_property("post-messages", true);
         chain.push(level);
-    }
-    chain.push(sink);
+        gst_app::AppSink::builder()
+            .sync(false)
+            .callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
+                            let samples: Vec<i16> =
+                                map.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+                            feed.audio.lock().unwrap().push(&samples);
+                        }
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            )
+            .build()
+    };
+    chain.push(sink.upcast());
     pipeline.add_many(&chain).map_err(|e| e.to_string())?;
     gst::Element::link_many(&chain).map_err(|e| format!("can't link the {} pipeline: {e}", input.name()))?;
     pipeline.set_state(gst::State::Playing).map_err(|_| format!("{} would not start", input.name()))?;
@@ -212,6 +262,23 @@ fn main() {
         log("video", "device monitor did not start; only test sources will work");
     }
     let levels = LevelsSender::start(args.connect.clone());
+    let font: &'static [u8] = match jivvy_daemon::lyrics::load_font(None) {
+        Ok(f) => Box::leak(f.into_boxed_slice()),
+        Err(e) => fail(&format!("lyric layer: {e}")),
+    };
+    let feed: Arc<Feed> = Arc::default();
+    {
+        // The lyric layer follows the engine like any screen does.
+        let (feed, connect) = (feed.clone(), args.connect.clone());
+        std::thread::spawn(move || {
+            client::follow(&connect, move |u| {
+                if let Update::State(s) = u {
+                    *feed.live.lock().unwrap() = Some(s);
+                }
+            })
+        });
+    }
+    let mut program: Option<Program> = None;
     let mut inputs = [Input::new(Kind::Camera), Input::new(Kind::Microphone)];
     let mut devices: Vec<DeviceInfo> = Vec::new();
     let mut config = media::MediaConfig::default();
@@ -253,6 +320,9 @@ fn main() {
                     }
                 }
             }
+            if let Some(p) = program.as_mut() {
+                p.tick();
+            }
             if !handled {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -269,6 +339,22 @@ fn main() {
             match media::load_config(&args.data_dir) {
                 Ok(c) => config = c,
                 Err(e) => problems.push(format!("{e}; keeping the last good setup")),
+            }
+            // A new program size or encoder rebuilds the program, and the camera with it
+            // (it captures at the program size).
+            let program_cfg = config.program.sanitized();
+            let resized = program
+                .as_ref()
+                .is_some_and(|p| (p.config().width, p.config().height) != (program_cfg.width, program_cfg.height));
+            if program.as_ref().map(|p| p.config()) != Some(&program_cfg) {
+                drop(program.take()); // stops the old one first
+                program = Some(Program::new(program_cfg.clone(), feed.clone(), font));
+                if resized {
+                    inputs[0].stop();
+                }
+            }
+            if let (Some(p), Some(e)) = (program.as_mut(), elapsed) {
+                p.measure(e);
             }
             let raw: Vec<RawDevice> = monitor.devices().iter().map(raw_device).collect();
             devices = media::devices(&raw);
@@ -292,7 +378,7 @@ fn main() {
                         (input.state, input.detail) = ("off", String::new());
                     } else {
                         input.state = "starting";
-                        if let Err(e) = start(input, &monitor) {
+                        if let Err(e) = start(input, &monitor, &feed, &program_cfg) {
                             input.wait(e);
                         }
                     }
@@ -307,6 +393,9 @@ fn main() {
             }
             last_rescan = Some(now);
         }
+        if inputs[0].pipeline.is_none() {
+            *feed.frame.lock().unwrap() = None; // slate right away, not after the stale timeout
+        }
 
         let status = Status {
             devices: devices.clone(),
@@ -314,6 +403,7 @@ fn main() {
             microphone: inputs[1].status(),
             peak_db: last_peak.clone(),
             connected: levels.delivering(),
+            program: program.as_ref().map(|p| p.status()).unwrap_or_default(),
             problems: problems.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&status)

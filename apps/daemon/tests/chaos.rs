@@ -423,4 +423,63 @@ mod video {
         .unwrap();
         d.media_status(Duration::from_secs(3), "camera running", |s| s["camera"]["state"] == "running");
     }
+
+    fn program(s: &Value) -> &Value {
+        &s["program"]
+    }
+
+    #[test]
+    fn the_program_runs_at_full_rate_with_lyrics_that_follow_the_slide() {
+        let d = start_video("program-lyrics", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
+        let s = d.media_status(Duration::from_secs(15), "program running at full rate", |s| {
+            program(s)["state"] == "running" && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        });
+        assert!(program(&s)["kbps"].as_f64().unwrap() > 100.0, "encoding real video: {s}");
+        assert_eq!(program(&s)["slate"], false);
+
+        d.send(json!({ "type": "slide.goto", "index": 6 }), Duration::from_secs(5));
+        d.media_status(Duration::from_secs(3), "lyric layer shows slide 7", |s| {
+            program(s)["overlay"] == json!(["Slide 7"])
+        });
+        d.send(json!({ "type": "output.black", "on": true }), Duration::from_secs(5));
+        d.media_status(Duration::from_secs(3), "no lyrics while black", |s| program(s)["overlay"] == json!([]));
+    }
+
+    #[test]
+    fn losing_the_camera_and_microphone_never_stops_the_program() {
+        let d = start_video("program-slate", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
+        d.media_status(Duration::from_secs(15), "program running on the camera", |s| {
+            program(s)["state"] == "running"
+                && program(s)["slate"] == false
+                && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        });
+        let encoder = d.media_status(Duration::from_secs(1), "status", |_| true)["program"]["encoder"].clone();
+
+        // Both inputs gone (unplugged camera, no microphone).
+        std::fs::write(
+            d.data_dir.join("media.json"),
+            r#"{"version":1,"camera":{"use":"device","id":"gone","name":"Unplugged camera"},"microphone":{"use":"none"}}"#,
+        )
+        .unwrap();
+        let s = d.media_status(Duration::from_secs(5), "slate on, still at full rate", |s| {
+            s["camera"]["state"] == "waiting"
+                && program(s)["slate"] == true
+                && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        });
+        assert_eq!(program(&s)["state"], "running");
+        assert_eq!(program(&s)["encoder"], encoder, "the program itself was never restarted");
+        let before = program(&s)["framesEncoded"].as_u64().unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        let s = d.media_status(Duration::from_secs(1), "status", |_| true);
+        let gained = program(&s)["framesEncoded"].as_u64().unwrap() - before;
+        assert!(gained >= 50, "about 60 frames in 2 s on the slate, got {gained}");
+
+        // The camera comes back: off the slate.
+        std::fs::write(
+            d.data_dir.join("media.json"),
+            r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"none"}}"#,
+        )
+        .unwrap();
+        d.media_status(Duration::from_secs(5), "camera back on the program", |s| program(s)["slate"] == false);
+    }
 }

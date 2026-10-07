@@ -10,8 +10,10 @@
 
 pub mod client;
 pub mod engine;
+pub mod lyrics;
 pub mod media;
 pub mod outputs;
+pub mod program;
 pub mod protocol;
 pub mod snapshot;
 pub mod watchdog;

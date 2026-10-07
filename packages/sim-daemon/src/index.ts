@@ -1,4 +1,4 @@
-import { ack, nack, type Ack, type DaemonLike, type Envelope } from "@jivvy/protocol";
+import { ack, nack, type Ack, type DaemonLike, type Envelope, type StateSnapshot, type StreamStatus } from "@jivvy/protocol";
 
 /**
  * In-memory stand-in for the church-computer daemon. Powers the browser demo and chaos tests.
@@ -6,7 +6,7 @@ import { ack, nack, type Ack, type DaemonLike, type Envelope } from "@jivvy/prot
  * the same slide (plan: "back on the same slide in under 3 seconds").
  */
 
-export type StreamStatus = "off" | "live" | "reconnecting";
+export type { StreamStatus };
 export type Uplink = "ok" | "down" | "slow";
 
 export interface DaemonState {
@@ -70,8 +70,16 @@ export class SimDaemon implements DaemonLike {
         this.wantStream = false;
         this.set({ stream: "off" });
         break;
+      case "state.get":
+        break;
     }
-    return ack(e.id);
+    return ack(e.id, this.snapshotForUi());
+  }
+
+  /** The protocol's view of the state, as the real daemon reports it. */
+  snapshotForUi(): StateSnapshot {
+    const { slideIndex, black, stream } = this.state;
+    return { slideIndex, black, stream };
   }
 
   // ---- Failure injection (the demo's "failure buttons") ----

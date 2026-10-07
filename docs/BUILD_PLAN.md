@@ -175,7 +175,8 @@ The smallest product a pilot church can run a whole service on, with every relia
 
 **Daemon (church computer)**
 
-- [ ] Watchdog + engine as separate processes, state snapshot every second, auto-restart on the same slide
+- [x] Watchdog + engine as separate processes, state snapshot every second, auto-restart on the same slide
+  - Done (`apps/daemon`): the snapshot is saved before every change is acknowledged. Chaos tests: 100 kills, slowest return to the same slide 1.68 s; a hung engine is restarted after 2 s without a heartbeat; the engine exits if the watchdog dies; a corrupted snapshot falls back to the previous one.
 - [ ] Fullscreen output windows per monitor, custom resolutions (reuse the GameWall DisplayHost pattern)
 - [ ] Camera/capture card and audio interface input, with live audio meter
 - [ ] Lyric layer composited over camera, hardware encode, one encode sent to stream and recording

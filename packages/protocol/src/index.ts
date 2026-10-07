@@ -16,7 +16,9 @@ export type Command =
   | { type: "slide.goto"; index: number }
   | { type: "output.black"; on: boolean }
   | { type: "stream.start" }
-  | { type: "stream.stop" };
+  | { type: "stream.stop" }
+  /** Added in v1 without a version bump: older daemons answer unknown_command. */
+  | { type: "state.get" };
 
 export type CommandType = Command["type"];
 
@@ -30,7 +32,13 @@ export interface Envelope {
   command: Command;
 }
 
-export type ErrorCode = "bad_message" | "unsupported_version" | "unknown_command" | "bad_arguments";
+export type ErrorCode =
+  | "bad_message"
+  | "unsupported_version"
+  | "unknown_command"
+  | "bad_arguments"
+  /** The daemon understood the command but can't do it yet (e.g. a feature not built on this daemon). */
+  | "unavailable";
 
 export type ParseResult =
   | { ok: true; envelope: Envelope }
@@ -53,6 +61,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "slide.prev":
     case "stream.start":
     case "stream.stop":
+    case "state.get":
       return { ok: true, command: { type: raw.type } };
     case "slide.goto":
       if (typeof raw.index !== "number" || !Number.isInteger(raw.index) || raw.index < 0)
@@ -92,11 +101,22 @@ export function makeEnvelope(command: Command, opts: { id?: string; now?: number
   return { v: PROTOCOL_VERSION, id: opts.id ?? crypto.randomUUID(), ts: opts.now ?? Date.now(), command };
 }
 
+export type StreamStatus = "off" | "live" | "reconnecting";
+
+/** What every screen needs to show the live service. Sent on acks so a UI never has to guess. */
+export interface StateSnapshot {
+  slideIndex: number;
+  black: boolean;
+  stream: StreamStatus;
+}
+
 export type Ack =
-  | { v: number; id: string; ok: true }
+  /** `state` was added in v1 without a version bump; older daemons leave it out. */
+  | { v: number; id: string; ok: true; state?: StateSnapshot }
   | { v: number; id: string; ok: false; code: ErrorCode; message: string };
 
-export const ack = (id: string): Ack => ({ v: PROTOCOL_VERSION, id, ok: true });
+export const ack = (id: string, state?: StateSnapshot): Ack =>
+  state ? { v: PROTOCOL_VERSION, id, ok: true, state } : { v: PROTOCOL_VERSION, id, ok: true };
 export const nack = (id: string, code: ErrorCode, message: string): Ack => ({
   v: PROTOCOL_VERSION, id, ok: false, code, message,
 });

@@ -1,0 +1,21 @@
+[package]
+name = "jivvy-daemon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "jivvy_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jivvy-watchdog"
+path = "src/bin/watchdog.rs"
+
+[[bin]]
+name = "jivvy-engine"
+path = "src/bin/engine.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

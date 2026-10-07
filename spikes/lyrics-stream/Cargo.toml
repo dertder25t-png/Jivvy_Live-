@@ -1,0 +1,11 @@
+[package]
+name = "lyrics-stream"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2.32"
+anyhow = "1.0.104"
+gstreamer = "0.25.4"
+gstreamer-video = "0.25.4"
+sysinfo = "0.38.4"

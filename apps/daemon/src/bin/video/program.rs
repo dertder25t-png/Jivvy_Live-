@@ -195,6 +195,10 @@ impl Program {
         };
         if p.order.is_empty() {
             p.detail = "no H.264 encoder is installed".into();
+        } else {
+            // Start right away rather than on the next tick: after a restart the program
+            // should be flowing again before anything slow (like device discovery) runs.
+            p.try_encoder(0);
         }
         p
     }

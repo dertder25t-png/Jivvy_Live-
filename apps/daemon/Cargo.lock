@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "ab_glyph"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "owned_ttf_parser",
+]
+
+[[package]]
+name = "ab_glyph_rasterizer"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
+
+[[package]]
 name = "atk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -24,6 +40,12 @@ dependencies = [
  "libc",
  "system-deps 6.2.2",
 ]
+
+[[package]]
+name = "atomic_refcell"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
 
 [[package]]
 name = "autocfg"
@@ -549,6 +571,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -859,6 +887,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-app"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97f8ae9238c2352398dcc084de28df3f7099af216ac6c160b52318d23f25c010"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "glib 0.22.10",
+ "gstreamer",
+ "gstreamer-app-sys",
+ "gstreamer-base",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-app-sys"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0798b8aef6694341d40bb81edc759f8979b896b59f9f0f45d8cfa3bb7bf2e743"
+dependencies = [
+ "glib-sys 0.22.9",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps 9.0.0",
+]
+
+[[package]]
+name = "gstreamer-base"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17cbd8f59586a369c40d4b0d2f3a61cf9e9287b3cf5503cdcd8e7c5faa99265e"
+dependencies = [
+ "atomic_refcell",
+ "cfg-if",
+ "glib 0.22.10",
+ "gstreamer",
+ "gstreamer-base-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-base-sys"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b05f77bfd76b5afee6b29c27dae19eaf5018b5cf8d0d17520f3de44c6385c32"
+dependencies = [
+ "glib-sys 0.22.9",
+ "gobject-sys 0.22.9",
+ "gstreamer-sys",
+ "libc",
+ "system-deps 9.0.0",
+]
+
+[[package]]
 name = "gstreamer-sys"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -867,6 +950,36 @@ dependencies = [
  "cfg-if",
  "glib-sys 0.22.9",
  "gobject-sys 0.22.9",
+ "libc",
+ "system-deps 9.0.0",
+]
+
+[[package]]
+name = "gstreamer-video"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffe4d77b2a5e679973d9c6b6c052da8cda86b83f5c268872f8691fde693fde84"
+dependencies = [
+ "cfg-if",
+ "futures-channel",
+ "glib 0.22.10",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-video-sys",
+ "libc",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "gstreamer-video-sys"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef455da22edca97ac9299d682b868227f3d9217b303748ce0161b31ae82dc106"
+dependencies = [
+ "glib-sys 0.22.9",
+ "gobject-sys 0.22.9",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
  "libc",
  "system-deps 9.0.0",
 ]
@@ -1117,7 +1230,10 @@ dependencies = [
 name = "jivvy-daemon"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
  "serde",
  "serde_json",
  "tao",
@@ -1559,6 +1675,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aca39cf52b03268400c16eeb9b56382ea3c3353409309b63f5c8f0b1faf42754"
 dependencies = [
  "pastey",
+]
+
+[[package]]
+name = "owned_ttf_parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
+dependencies = [
+ "ttf-parser",
 ]
 
 [[package]]
@@ -2347,6 +2472,12 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typenum"

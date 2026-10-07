@@ -23,14 +23,17 @@ path = "src/bin/outputs.rs"
 # Camera and audio input. Needs GStreamer installed, so it is opt-in: --features video.
 [[bin]]
 name = "jivvy-video"
-path = "src/bin/video.rs"
+path = "src/bin/video/main.rs"
 required-features = ["video"]
 
 [features]
-video = ["dep:gstreamer"]
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
+ab_glyph = "0.2"
 gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tao = "0.37"

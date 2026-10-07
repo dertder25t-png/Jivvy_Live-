@@ -28,6 +28,9 @@ jobs:
         working-directory: apps/daemon
     steps:
       - uses: actions/checkout@v4
+      # The output windows (tao + wry) build against GTK and WebKitGTK on Linux.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -36,5 +39,5 @@ jobs:
           workspaces: apps/daemon
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings
-      # Includes the chaos tests: 100 engine kills, a hung engine, a dead watchdog, a corrupted snapshot.
+      # Includes the chaos tests: engine kills, hangs and corruption, plus the output windows run headless.
       - run: cargo test --release

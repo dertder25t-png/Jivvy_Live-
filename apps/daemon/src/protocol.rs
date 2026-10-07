@@ -27,6 +27,8 @@ pub enum Command {
     StreamStop,
     #[serde(rename = "state.get")]
     StateGet,
+    #[serde(rename = "state.subscribe")]
+    StateSubscribe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -89,6 +91,18 @@ pub enum Ack {
     },
 }
 
+/// Unsolicited message to connections that sent `state.subscribe`; it has no `id`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StateEvent {
+    pub v: u32,
+    pub event: &'static str,
+    pub state: StateSnapshot,
+}
+
+pub fn state_event(state: StateSnapshot) -> StateEvent {
+    StateEvent { v: PROTOCOL_VERSION, event: "state", state }
+}
+
 pub fn ack(id: &str, state: Option<StateSnapshot>) -> Ack {
     Ack::Ok { v: PROTOCOL_VERSION, id: id.into(), ok: true, state }
 }
@@ -125,6 +139,7 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "stream.start" => Command::StreamStart,
         "stream.stop" => Command::StreamStop,
         "state.get" => Command::StateGet,
+        "state.subscribe" => Command::StateSubscribe,
         "slide.goto" => match obj.get("index").and_then(js_integer) {
             Some(i) if i >= 0.0 => Command::SlideGoto { index: i as u64 },
             _ => return Err((ErrorCode::BadArguments, "slide.goto needs a non-negative integer index")),
@@ -192,6 +207,11 @@ mod tests {
             r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":2,"black":false,"stream":"off"}}"#
         );
         assert_eq!(serde_json::to_string(&ack("x", None)).unwrap(), r#"{"v":1,"id":"x","ok":true}"#);
+        let state = StateSnapshot { slide_index: 1, black: true, stream: StreamStatus::Off };
+        assert_eq!(
+            serde_json::to_string(&state_event(state)).unwrap(),
+            r#"{"v":1,"event":"state","state":{"slideIndex":1,"black":true,"stream":"off"}}"#
+        );
         assert_eq!(
             serde_json::to_string(&nack("x", ErrorCode::Unavailable, "no")).unwrap(),
             r#"{"v":1,"id":"x","ok":false,"code":"unavailable","message":"no"}"#

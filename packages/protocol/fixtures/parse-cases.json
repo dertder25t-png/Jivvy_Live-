@@ -9,6 +9,7 @@
     { "name": "stream.start", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"stream.start\"}}", "expect": { "ok": true, "command": { "type": "stream.start" } } },
     { "name": "stream.stop", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"stream.stop\"}}", "expect": { "ok": true, "command": { "type": "stream.stop" } } },
     { "name": "state.get", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"state.get\"}}", "expect": { "ok": true, "command": { "type": "state.get" } } },
+    { "name": "state.subscribe", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"state.subscribe\"}}", "expect": { "ok": true, "command": { "type": "state.subscribe" } } },
     { "name": "unknown extra fields are ignored", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"future\":1,\"command\":{\"type\":\"slide.next\",\"extra\":1}}", "expect": { "ok": true, "command": { "type": "slide.next" } } },
     { "name": "future version", "input": "{\"v\":2,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "unsupported_version", "id": "a" } },
     { "name": "version 0", "input": "{\"v\":0,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "unsupported_version", "id": "a" } },

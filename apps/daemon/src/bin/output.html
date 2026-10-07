@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Jivvy Live output</title>
+<style>
+  /* Runs offline on the church computer: system fonts only, nothing loaded from the network. */
+  html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; user-select: none; }
+  /* The slide is laid out at the output's canvas size, then scaled to fit with black bars. */
+  #stage { position: absolute; left: 50%; top: 50%; background: #000; overflow: hidden; transform-origin: center; }
+  #slide { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+           color: #fff; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 700; text-align: center; }
+  #ident { position: absolute; left: 4%; bottom: 4%; color: rgba(244, 241, 234, .55);
+           font-family: Consolas, ui-monospace, monospace; letter-spacing: .08em; }
+  /* !important: #slide sets display by id, which would otherwise win over this class. */
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="stage"><div id="slide" class="hidden"></div><div id="ident"></div></div>
+<script>
+  "use strict";
+  const stage = document.getElementById("stage");
+  const slide = document.getElementById("slide");
+  const ident = document.getElementById("ident");
+  const canvas = window.__jivvyCanvas || { w: 1920, h: 1080, label: "" };
+
+  function fit() {
+    const scale = Math.min(innerWidth / canvas.w, innerHeight / canvas.h);
+    stage.style.width = canvas.w + "px";
+    stage.style.height = canvas.h + "px";
+    stage.style.transform = `translate(-50%, -50%) scale(${scale})`;
+    slide.style.fontSize = Math.round(canvas.h * 0.09) + "px";
+    ident.style.fontSize = Math.round(canvas.h * 0.025) + "px";
+  }
+
+  // Until the first state arrives, show which output this is (helps setup; never shown again).
+  ident.textContent = `Jivvy Live · ${canvas.label || "Output"} · ${canvas.w}×${canvas.h}`;
+
+  window.jivvy = {
+    render(state) {
+      ident.classList.add("hidden");
+      // Placeholder content until run sheets reach the engine: the slide number.
+      slide.textContent = "Slide " + (state.slideIndex + 1);
+      slide.classList.toggle("hidden", state.black);
+    },
+  };
+
+  addEventListener("resize", fit);
+  fit();
+  window.ipc.postMessage("ready");
+</script>
+</body>
+</html>

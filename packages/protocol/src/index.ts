@@ -18,7 +18,12 @@ export type Command =
   | { type: "stream.start" }
   | { type: "stream.stop" }
   /** Added in v1 without a version bump: older daemons answer unknown_command. */
-  | { type: "state.get" };
+  | { type: "state.get" }
+  /**
+   * Added in v1 without a version bump. After the ack, the daemon sends a `state` event on this
+   * connection every time the state changes, until the connection closes.
+   */
+  | { type: "state.subscribe" };
 
 export type CommandType = Command["type"];
 
@@ -62,6 +67,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "stream.start":
     case "stream.stop":
     case "state.get":
+    case "state.subscribe":
       return { ok: true, command: { type: raw.type } };
     case "slide.goto":
       if (typeof raw.index !== "number" || !Number.isInteger(raw.index) || raw.index < 0)
@@ -114,6 +120,14 @@ export type Ack =
   /** `state` was added in v1 without a version bump; older daemons leave it out. */
   | { v: number; id: string; ok: true; state?: StateSnapshot }
   | { v: number; id: string; ok: false; code: ErrorCode; message: string };
+
+/**
+ * Unsolicited message from the daemon (no `id`), sent only to connections that asked for it.
+ * Clients must ignore events they don't recognise.
+ */
+export type DaemonEvent = { v: number; event: "state"; state: StateSnapshot };
+
+export const stateEvent = (state: StateSnapshot): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "state", state });
 
 export const ack = (id: string, state?: StateSnapshot): Ack =>
   state ? { v: PROTOCOL_VERSION, id, ok: true, state } : { v: PROTOCOL_VERSION, id, ok: true };

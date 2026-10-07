@@ -71,6 +71,7 @@ export class SimDaemon implements DaemonLike {
         this.set({ stream: "off" });
         break;
       case "state.get":
+      case "state.subscribe": // in memory, subscribers use subscribe(); the ack is the same
         break;
     }
     return ack(e.id, this.snapshotForUi());

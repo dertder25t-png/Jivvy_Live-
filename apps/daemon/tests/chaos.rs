@@ -1,5 +1,7 @@
-//! Chaos tests for the reliability table's "Video engine crashes" row:
-//! kill the engine over and over and require it back on the same slide in under 3 s.
+//! Chaos tests for the reliability table's "Video engine crashes" row: kill the engine
+//! over and over and require it back on the same slide in under 3 s; and for the output
+//! windows (run headless): screens never blank while the engine restarts, a killed outputs
+//! process comes back on the current slide, and monitors can come and go.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -14,7 +16,8 @@ const RESTORE_TARGET: Duration = Duration::from_secs(3);
 
 struct Daemon {
     watchdog: Child,
-    events: Receiver<String>,
+    engine_starts: Receiver<u32>,
+    outputs_starts: Receiver<u32>,
     addr: String,
     data_dir: PathBuf,
 }
@@ -30,39 +33,73 @@ fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("jivvy-chaos-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Starts the watchdog without output windows (they're covered by the headless tests).
 fn start(name: &str, slides: u64) -> Daemon {
-    let data_dir = std::env::temp_dir().join(format!("jivvy-chaos-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&data_dir);
+    start_in(test_dir(name), slides, false)
+}
+
+fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
     let addr = format!("127.0.0.1:{}", free_port());
+    let outputs_flag = if headless_outputs { "--outputs-headless" } else { "--no-outputs" };
     let mut watchdog = Command::new(env!("CARGO_BIN_EXE_jivvy-watchdog"))
-        .args(["--engine", env!("CARGO_BIN_EXE_jivvy-engine")])
+        .args(["--engine", env!("CARGO_BIN_EXE_jivvy-engine"), "--outputs", env!("CARGO_BIN_EXE_jivvy-outputs")])
         .args(["--data-dir", data_dir.to_str().unwrap(), "--listen", &addr, "--slides", &slides.to_string()])
+        .arg(outputs_flag)
         .env("JIVVY_TEST_HOOKS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let (tx, events) = channel();
+    let (engine_tx, engine_starts) = channel();
+    let (outputs_tx, outputs_starts) = channel();
     let out = watchdog.stdout.take().unwrap();
     std::thread::spawn(move || {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
-            let _ = tx.send(line);
+            let started =
+                |name: &str| line.strip_prefix(&format!("{name} started pid=")).map(|p| p.trim().parse().unwrap());
+            if let Some(pid) = started("engine") {
+                let _ = engine_tx.send(pid);
+            } else if let Some(pid) = started("outputs") {
+                let _ = outputs_tx.send(pid);
+            }
         }
     });
-    Daemon { watchdog, events, addr, data_dir }
+    Daemon { watchdog, engine_starts, outputs_starts, addr, data_dir }
 }
 
 impl Daemon {
     /// Waits for the next "engine started" event and returns the engine's pid.
     fn next_engine_pid(&self, within: Duration) -> u32 {
+        self.engine_starts.recv_timeout(within).expect("engine did not (re)start in time")
+    }
+
+    fn next_outputs_pid(&self, within: Duration) -> u32 {
+        self.outputs_starts.recv_timeout(within).expect("outputs did not (re)start in time")
+    }
+
+    /// Waits until `outputs-status.json` satisfies `ok`, returning it.
+    fn outputs_status(&self, within: Duration, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + within;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = self.events.recv_timeout(left).expect("engine did not restart in time");
-            if let Some(pid) = line.strip_prefix("engine started pid=") {
-                return pid.trim().parse().unwrap();
+        let mut last = Value::Null;
+        while Instant::now() < deadline {
+            if let Ok(b) = std::fs::read(self.data_dir.join("outputs-status.json"))
+                && let Ok(v) = serde_json::from_slice::<Value>(&b)
+            {
+                if ok(&v) {
+                    return v;
+                }
+                last = v;
             }
+            std::thread::sleep(Duration::from_millis(25));
         }
+        panic!("outputs never reached: {what}; last status {last}");
     }
 
     /// Sends one command, retrying the connection until the engine answers or time runs out.
@@ -176,4 +213,92 @@ fn corrupted_state_file_falls_back_to_the_previous_snapshot() {
     d.next_engine_pid(RESTORE_TARGET);
     let r = d.send(json!({ "type": "state.get" }), RESTORE_TARGET);
     assert_eq!(r["state"]["slideIndex"], json!(2));
+}
+
+fn displays(dir: &std::path::Path, names: &[&str]) {
+    let list: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| json!({ "name": n, "x": i as i32 * 1920, "y": 0, "width": 1920, "height": 1080, "scale": 1.0, "primary": i == 0 }))
+        .collect();
+    let tmp = dir.join("test-displays.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&list).unwrap()).unwrap();
+    std::fs::rename(tmp, dir.join("test-displays.json")).unwrap();
+}
+
+fn output_ids(status: &Value) -> Vec<String> {
+    status["outputs"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn outputs_keep_the_last_slide_while_the_engine_restarts_then_follow_again() {
+    let dir = test_dir("outputs-engine");
+    displays(&dir, &["OPERATOR", "PROJECTOR"]);
+    let d = start_in(dir, 10, true);
+    let engine = d.next_engine_pid(Duration::from_secs(10));
+    d.next_outputs_pid(Duration::from_secs(10));
+    d.send(json!({ "type": "slide.goto", "index": 5 }), Duration::from_secs(5));
+    let s = d.outputs_status(Duration::from_secs(5), "showing slide 5 on the projector", |s| {
+        s["shown"]["slideIndex"] == 5 && output_ids(s) == ["auto:PROJECTOR"]
+    });
+    assert_eq!(s["connected"], true);
+
+    kill_hard(engine);
+    let s = d.outputs_status(Duration::from_secs(3), "noticing the engine is gone", |s| s["connected"] == false);
+    assert_eq!(s["shown"]["slideIndex"], 5, "the screen must keep the last slide, not go blank");
+    d.next_engine_pid(RESTORE_TARGET);
+    d.send(json!({ "type": "slide.goto", "index": 6 }), RESTORE_TARGET);
+    d.outputs_status(RESTORE_TARGET, "following the restarted engine", |s| {
+        s["connected"] == true && s["shown"]["slideIndex"] == 6
+    });
+    assert!(d.outputs_starts.try_recv().is_err(), "the outputs process must not restart when the engine does");
+}
+
+#[test]
+fn killed_outputs_process_comes_back_on_the_current_slide() {
+    let dir = test_dir("outputs-kill");
+    displays(&dir, &["OPERATOR", "PROJECTOR"]);
+    let d = start_in(dir.clone(), 10, true);
+    d.next_engine_pid(Duration::from_secs(10));
+    let outputs = d.next_outputs_pid(Duration::from_secs(10));
+    d.send(json!({ "type": "slide.goto", "index": 3 }), Duration::from_secs(5));
+    d.outputs_status(Duration::from_secs(5), "slide 3", |s| s["shown"]["slideIndex"] == 3);
+
+    std::fs::remove_file(dir.join("outputs-status.json")).unwrap();
+    let killed_at = Instant::now();
+    kill_hard(outputs);
+    d.next_outputs_pid(RESTORE_TARGET);
+    d.outputs_status(RESTORE_TARGET, "slide 3 after restart", |s| s["shown"]["slideIndex"] == 3);
+    assert!(killed_at.elapsed() < RESTORE_TARGET, "outputs back after {:?}", killed_at.elapsed());
+}
+
+#[test]
+fn monitors_coming_and_going_never_put_an_output_on_the_operators_screen() {
+    let dir = test_dir("outputs-hotplug");
+    displays(&dir, &["OPERATOR", "PROJECTOR"]);
+    std::fs::write(
+        dir.join("outputs.json"),
+        r#"{"version":1,"outputs":[{"id":"proj","monitor":"PROJECTOR","width":1280,"height":720}]}"#,
+    )
+    .unwrap();
+    let d = start_in(dir.clone(), 10, true);
+    d.next_outputs_pid(Duration::from_secs(10));
+    let s = d.outputs_status(Duration::from_secs(5), "projector output", |s| output_ids(s) == ["proj"]);
+    assert_eq!(
+        (s["outputs"][0]["canvasWidth"].clone(), s["outputs"][0]["canvasHeight"].clone()),
+        (json!(1280), json!(720))
+    );
+
+    displays(&dir, &["OPERATOR"]);
+    let s = d.outputs_status(Duration::from_secs(3), "projector unplugged", |s| output_ids(s).is_empty());
+    assert!(s["problems"][0]["message"].as_str().unwrap().contains("not connected"));
+
+    displays(&dir, &["OPERATOR", "PROJECTOR"]);
+    d.outputs_status(Duration::from_secs(3), "projector plugged back in", |s| output_ids(s) == ["proj"]);
+
+    std::fs::write(dir.join("outputs.json"), "{ half-saved").unwrap();
+    let s = d.outputs_status(Duration::from_secs(3), "a broken config reported", |s| {
+        s["problems"].as_array().is_some_and(|p| !p.is_empty())
+    });
+    assert_eq!(output_ids(&s), ["proj"], "a broken config file keeps the screens as they were");
 }

@@ -54,7 +54,7 @@ Budgets: under ~10% CPU on this machine; the plan's target is under 40% on a $30
 | `mfvideosrc ! d3d12upload ! d3d12h264enc` | 0 | |
 | Media Foundation encoder (`mfh264enc`), 25 runs incl. full spike | 0 | |
 
-So it is the Quick Sync plugin's start-up (where it enumerates Intel's oneVPL runtimes), not the camera and not a 1.28 regression. The process loads the current driver's `libmfx64-gen.dll` (26.05) plus Intel's MFX Loader `System32\libmfxhw64.dll` (23.06), which the same driver installs. Next step for an upstream report: a crash dump with symbols (WinDbg or ProcDump) and a page-heap run to catch the code that corrupts the heap. It may belong to GStreamer's `qsv` plugin or to Intel's runtime for this new GPU.
+So it is the Quick Sync plugin's start-up (where it enumerates Intel's oneVPL runtimes), not the camera and not a 1.28 regression. The process loads the current driver's `libmfx64-gen.dll` (26.05) plus Intel's MFX Loader `System32\libmfxhw64.dll` (23.06), which the same driver installs. A debugger trace (see [crash-report.md](crash-report.md)) shows the corruption detected while `d3d11.dll` unwinds a failed `CreateVideoDecoder` call made by Intel's runtime (`libmfx64_gen`) during the plugin's capability probe. Full page heap hides it (12/12 clean), so it is timing-dependent. Most likely an Intel driver/runtime bug on this new GPU.
 
 ### 2. Direct3D 12 encoder output is wrong on this GPU
 

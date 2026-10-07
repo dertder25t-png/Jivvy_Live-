@@ -12,7 +12,10 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use jivvy_daemon::log;
-use jivvy_daemon::stream::{self, Destination, DestinationStatus, QUEUE_PACKETS, STALL, StreamConfig, reconnect_delay};
+use jivvy_daemon::stream::{
+    self, Delivery, DeliveryTracker, Destination, DestinationStatus, QUEUE_PACKETS, RtmpStats, StreamConfig,
+    reconnect_delay,
+};
 
 use crate::program::Feed;
 
@@ -195,6 +198,18 @@ fn run(dest: Destination, feed: Arc<Feed>, stop: Arc<AtomicBool>, status: Arc<Mu
     set(&status, "off", String::new(), 0.0);
 }
 
+/// The RTMP sink's connection counters.
+fn rtmp_stats(sink: &gst::Element) -> RtmpStats {
+    let Ok(st) = sink.property_value("stats").get::<gst::Structure>() else { return RtmpStats::default() };
+    let n = |f: &str| st.get::<u64>(f).unwrap_or(0);
+    RtmpStats {
+        in_bytes: n("in-bytes-total"),
+        out_bytes: n("out-bytes-total"),
+        acked: n("out-bytes-acked"),
+        window: st.get::<u32>("in-window-ack-size").map(u64::from).unwrap_or(0),
+    }
+}
+
 /// One connection, from the first keyframe until it fails (Err) or the stream is no longer
 /// wanted (Ok).
 fn session(
@@ -241,16 +256,6 @@ fn session(
     // The key goes straight to the sink, never into a pipeline description or a log line.
     out.set_property("location", dest.publish_url());
     vsrc.set_caps(Some(&video_caps));
-    let sent = Arc::new(AtomicU64::new(0));
-    {
-        let sent = sent.clone();
-        out.static_pad("sink").ok_or("rtmp2sink has no pad")?.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if let Some(b) = info.buffer() {
-                sent.fetch_add(b.size() as u64, Ordering::Relaxed);
-            }
-            gst::PadProbeReturn::Ok
-        });
-    }
     let stop_pipeline = |p: &gst::Pipeline| {
         let _ = p.set_state(gst::State::Null);
     };
@@ -270,9 +275,10 @@ fn session(
     push(&vsrc, &first);
 
     let mut audio_caps_set = false;
-    let (mut last_sent, mut last_progress, mut last_rate_at) = (0u64, Instant::now(), Instant::now());
-    let mut rate_bytes = 0u64;
-    let mut live_since: Option<Instant> = None;
+    // Delivery is judged from the sink's connection counters, never from buffers reaching
+    // the sink (those are accepted before the connection even exists).
+    let mut tracker = DeliveryTracker::new(Instant::now());
+    let (mut rate_bytes, mut last_rate_at) = (0u64, Instant::now());
     let result = loop {
         if stop.load(Ordering::Relaxed) || !wanted(feed) {
             break Ok(());
@@ -314,21 +320,24 @@ fn session(
             }
         }
         let now = Instant::now();
-        let total = sent.load(Ordering::Relaxed);
-        if total > last_sent {
-            (last_sent, last_progress) = (total, now);
-            live_since.get_or_insert(now);
-        } else if now.duration_since(last_progress) > STALL {
-            break Err(format!("no data reached the server for {} s", STALL.as_secs()));
+        let st = rtmp_stats(&out);
+        let delivery = tracker.update(st, now);
+        if let Delivery::Failed(why) = delivery {
+            break Err(why.to_string());
         }
         if now.duration_since(last_rate_at) >= Duration::from_secs(1) {
-            let kbps = (total - rate_bytes) as f64 * 8.0 / 1000.0 / now.duration_since(last_rate_at).as_secs_f64();
-            (rate_bytes, last_rate_at) = (total, now);
+            let kbps = st.out_bytes.saturating_sub(rate_bytes) as f64 * 8.0
+                / 1000.0
+                / now.duration_since(last_rate_at).as_secs_f64();
+            (rate_bytes, last_rate_at) = (st.out_bytes, now);
             let mut s = status.lock().unwrap();
-            // Live once data has kept flowing for a second without an error.
-            if live_since.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+            if delivery == Delivery::Live {
                 s.state = "live";
                 s.detail.clear();
+            } else if s.state == "live" {
+                // Was live, now catching up (e.g. confirmations falling behind).
+                s.state = "reconnecting";
+                s.detail = "The streaming server is slow to confirm. Waiting for it.".into();
             }
             s.kbps = kbps;
         }

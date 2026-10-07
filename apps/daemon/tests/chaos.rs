@@ -36,10 +36,10 @@ impl Drop for Daemon {
     }
 }
 
-/// At most this many daemons with a video process run at once: each loads GStreamer's GPU
-/// and encoder plugins at start-up, and a dozen doing it together on one laptop is not
-/// what a church computer sees.
-const VIDEO_SLOTS: u32 = 3;
+/// Daemons with a video process run one at a time. Each loads GStreamer's GPU plugins at
+/// start-up and encodes 1080p30 on the machine's one hardware encoder: two or three at once
+/// held the founder's laptop to ~20 fps, while a church computer only ever runs one.
+const VIDEO_SLOTS: u32 = 1;
 static VIDEO_IN_USE: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 static VIDEO_FREED: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -759,5 +759,37 @@ mod video {
                 assert!(!text.contains(TEST_KEY), "{f} contains the stream key");
             }
         }
+    }
+
+    #[test]
+    fn a_server_that_accepts_but_never_answers_is_never_shown_live() {
+        // Accepts TCP connections and then says nothing: buffers still reach the sink.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in silent.incoming().flatten() {
+                held.push(conn);
+            }
+        });
+        let (d, _) = start_streaming("stream-silent", port);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(14);
+        let mut reconnected = false;
+        while Instant::now() < deadline {
+            assert_ne!(stream_state(&d), "live", "never live when nothing reaches the server");
+            if let Ok(t) = std::fs::read_to_string(d.data_dir.join("media-status.json"))
+                && let Ok(v) = serde_json::from_str::<Value>(&t)
+            {
+                let dest = &v["stream"]["destinations"][0];
+                assert_ne!(dest["state"], "live", "{dest}");
+                if dest["reconnects"].as_u64().unwrap_or(0) >= 1 {
+                    assert!(dest["detail"].as_str().unwrap().contains("Can't reach"), "{dest}");
+                    reconnected = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(reconnected, "gave up on the silent server and reconnected");
     }
 }

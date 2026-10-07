@@ -68,7 +68,8 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
 `                     └─> destination B: ...`
 
 - **Isolated from the program.** Each destination has its own small pipeline on its own thread, fed copies of the already-encoded packets. A network failure tears down and reconnects only that destination; the program (and the recording) never notice. A destination that can't keep up is disconnected and reconnects, never slowing the program.
-- **Comes back by itself.** Reconnects after 0.5 s, 1 s, 2 s, 3 s, then every 5 s, starting on the next keyframe with timestamps from zero. No data reaching the server for 5 s counts as dropped. On the founder's laptop the stream was live again **0.7 s** after a killed server came back, and **~6 s** after the video process itself was killed.
+- **Comes back by itself.** Reconnects after 0.5 s, 1 s, 2 s, 3 s, then every 5 s, starting on the next keyframe with timestamps from zero. On the founder's laptop the stream was live again **~2.7 s** after a killed server came back, and **~5–6 s** after the video process itself was killed.
+- **"Live" means the server is really getting it,** judged from the RTMP sink's own connection counters, never from buffers reaching the sink (those are accepted before a connection exists). Live needs the server to have answered (handshake and publish), the socket to have taken our bytes for a second, and the server's acknowledgements to keep up (no more than 2 windows behind). Dropped, and reconnected: no answer within 10 s, no bytes taken for 5 s, or more than 3 windows unacknowledged.
 - **Survives crashes.** `stream.start` / `stream.stop` set "wanted" in the engine, saved like the slide; a restarted engine or video process resumes streaming without anyone touching it.
 - **Status everyone can trust.** The video process reports `live` or `reconnecting` once a second (`stream.report`); screens see `live` only while those reports keep coming and every destination is live.
 - **Destinations** in `stream.json` (data directory):
@@ -126,8 +127,11 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | Program on test sources | Runs at > 25 fps, lyric layer follows slide changes and black |
 | Camera unplugged and microphone removed mid-program | Slate on, still ~30 fps (≥ 50 frames in 2 s), same encoder, never restarted; off the slate when the camera returns |
 | Change the program size mid-run (1080p → 720p) | Back running at the new size on the camera at full rate, no encoder failure, and the video process is not restarted |
-| Stream to MediaMTX, kill the server, bring it back | Screens see `reconnecting` (plain-words reason), the program stays at ~30 fps, and the stream is live again by itself (~0.7 s after the server returns); the video process never restarts |
+| Stream to MediaMTX, kill the server, bring it back | Screens see `reconnecting` (plain-words reason), the program stays at ~30 fps, and the stream is live again by itself (~2.7 s after the server returns); the video process never restarts |
 | Kill the video process while streaming, then stop | Stream resumes by itself (~6 s); after `stream.stop` the server stops receiving |
 | Stream to a port nothing listens on | `reconnecting` with "Can't reach the streaming server", retries counted, the key in no status or state file |
+| Stream to a server that accepts the connection but never answers | Never shown live; gives up after 10 s with "Can't reach the streaming server" and keeps retrying |
+
+The video tests run one daemon at a time: a church computer runs one program, and several 1080p30 encodes sharing a laptop's hardware encoder held it to ~20 fps.
 
 On the founder's laptop with real devices: Laptop Camera at 30 fps, the microphone array reporting levels ten times a second, the speaker loopback and duplicate camera entries filtered out.

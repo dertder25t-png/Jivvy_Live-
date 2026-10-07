@@ -123,11 +123,11 @@ pub fn load_config(dir: &Path) -> Result<StreamConfig, String> {
 pub fn plain_error(raw: &str) -> String {
     let r = raw.to_ascii_lowercase();
     let says = |words: &[&str]| words.iter().any(|w| r.contains(w));
-    if says(&["refused", "could not connect", "failed to connect", "no route", "unreachable"]) {
+    if says(&["refused", "could not connect", "failed to connect", "no route", "unreachable", "never answered"]) {
         "Can't reach the streaming server. Check the internet connection and the server address.".into()
     } else if says(&["resolve", "name or service", "no such host", "dns"]) {
         "Can't find the streaming server. Check the server address and the internet connection.".into()
-    } else if says(&["no data reached the server", "timed out", "timeout"]) {
+    } else if says(&["no data reached the server", "stopped confirming", "timed out", "timeout"]) {
         "The streaming server stopped responding. Reconnecting.".into()
     } else if says(&["reset", "forcibly closed", "broken pipe", "error receiving data", "error sending data", "closed"])
     {
@@ -152,6 +152,83 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
         3 => Duration::from_secs(2),
         4 => Duration::from_secs(3),
         _ => Duration::from_secs(5),
+    }
+}
+
+/// A server that hasn't answered the RTMP handshake in this long is unreachable.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The RTMP sink's own connection counters (its `stats` property).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RtmpStats {
+    /// Bytes the server sent us: above zero once it has answered the handshake and publish.
+    pub in_bytes: u64,
+    /// Bytes the socket accepted from us.
+    pub out_bytes: u64,
+    /// Bytes the server has confirmed receiving (it confirms once per `window`).
+    pub acked: u64,
+    /// The server's acknowledgement window; 0 if it hasn't said.
+    pub window: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The server hasn't answered yet.
+    Connecting,
+    /// Answered and data is moving, not yet long enough to call it live.
+    Starting,
+    Live,
+    /// Give up on this connection and reconnect.
+    Failed(&'static str),
+}
+
+/// Decides from the sink's counters whether data is really reaching the server. Buffers
+/// arriving at the sink prove nothing (they're accepted before the connection exists);
+/// only the server's answer, the socket taking our bytes, and the server's
+/// acknowledgements do.
+#[derive(Debug)]
+pub struct DeliveryTracker {
+    started: std::time::Instant,
+    connected_at: Option<std::time::Instant>,
+    last_out: u64,
+    last_out_at: Option<std::time::Instant>,
+    flowing_since: Option<std::time::Instant>,
+}
+
+impl DeliveryTracker {
+    pub fn new(now: std::time::Instant) -> Self {
+        DeliveryTracker { started: now, connected_at: None, last_out: 0, last_out_at: None, flowing_since: None }
+    }
+
+    pub fn update(&mut self, s: RtmpStats, now: std::time::Instant) -> Delivery {
+        if s.in_bytes == 0 {
+            return if now.duration_since(self.started) > CONNECT_TIMEOUT {
+                Delivery::Failed("the server never answered")
+            } else {
+                Delivery::Connecting
+            };
+        }
+        let connected_at = *self.connected_at.get_or_insert(now);
+        if s.out_bytes > self.last_out {
+            (self.last_out, self.last_out_at) = (s.out_bytes, Some(now));
+            self.flowing_since.get_or_insert(now);
+        } else if now.duration_since(self.last_out_at.unwrap_or(connected_at)) > STALL {
+            return Delivery::Failed("no data reached the server for 5 s");
+        }
+        let unacked = s.out_bytes.saturating_sub(s.acked);
+        if s.window > 0 && unacked > 3 * s.window {
+            return Delivery::Failed("the server stopped confirming what it received");
+        }
+        // Before the first window completes no confirmation is possible yet; after that,
+        // confirmations must keep up for the stream to count as live.
+        let confirmed = s.window == 0 || unacked <= 2 * s.window;
+        // Writes go out about 30 times a second; two seconds without one isn't "live" any
+        // more, even before it counts as a stall.
+        let recent = self.last_out_at.is_some_and(|t| now.duration_since(t) <= Duration::from_secs(2));
+        match self.flowing_since {
+            Some(t) if confirmed && recent && now.duration_since(t) >= Duration::from_secs(1) => Delivery::Live,
+            _ => Delivery::Starting,
+        }
     }
 }
 
@@ -267,6 +344,65 @@ mod tests {
         for (raw, expect) in cases {
             assert!(plain_error(raw).contains(expect), "{raw} -> {}", plain_error(raw));
         }
+    }
+
+    fn at(t0: std::time::Instant, ms: u64) -> std::time::Instant {
+        t0 + Duration::from_millis(ms)
+    }
+
+    fn stats(in_bytes: u64, out_bytes: u64, acked: u64) -> RtmpStats {
+        RtmpStats { in_bytes, out_bytes, acked, window: 2_500_000 }
+    }
+
+    #[test]
+    fn a_black_holed_server_is_never_live() {
+        let t0 = std::time::Instant::now();
+        let mut d = DeliveryTracker::new(t0);
+        // Buffers pile into the sink but the server never answers.
+        for ms in (0..=10_000).step_by(500) {
+            assert_eq!(d.update(RtmpStats::default(), at(t0, ms)), Delivery::Connecting);
+        }
+        assert_eq!(d.update(RtmpStats::default(), at(t0, 10_001)), Delivery::Failed("the server never answered"));
+    }
+
+    #[test]
+    fn live_only_after_the_server_answers_and_a_second_of_real_writes() {
+        let t0 = std::time::Instant::now();
+        let mut d = DeliveryTracker::new(t0);
+        assert_eq!(d.update(stats(394, 0, 0), at(t0, 100)), Delivery::Starting, "answered, nothing written yet");
+        assert_eq!(d.update(stats(394, 700_000, 0), at(t0, 200)), Delivery::Starting);
+        assert_eq!(d.update(stats(394, 1_400_000, 0), at(t0, 1_000)), Delivery::Starting);
+        assert_eq!(
+            d.update(stats(394, 2_200_000, 0), at(t0, 1_250)),
+            Delivery::Live,
+            "first window not done: writes count"
+        );
+        assert_eq!(d.update(stats(406, 3_000_000, 2_500_000), at(t0, 2_000)), Delivery::Live);
+    }
+
+    #[test]
+    fn a_server_that_stops_confirming_or_a_blocked_socket_is_dropped() {
+        let t0 = std::time::Instant::now();
+        let mut d = DeliveryTracker::new(t0);
+        d.update(stats(394, 1_000_000, 0), at(t0, 0));
+        // The socket keeps accepting (big buffers) but the server never confirms.
+        assert_eq!(
+            d.update(stats(394, 6_000_000, 0), at(t0, 6_000)),
+            Delivery::Starting,
+            "too far behind to call live"
+        );
+        assert_eq!(
+            d.update(stats(394, 7_600_000, 0), at(t0, 8_000)),
+            Delivery::Failed("the server stopped confirming what it received")
+        );
+        // The socket stops taking bytes at all.
+        let mut d = DeliveryTracker::new(t0);
+        d.update(stats(394, 1_000_000, 0), at(t0, 0));
+        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 4_900)), Delivery::Starting);
+        assert_eq!(
+            d.update(stats(394, 1_000_000, 0), at(t0, 5_100)),
+            Delivery::Failed("no data reached the server for 5 s")
+        );
     }
 
     #[test]

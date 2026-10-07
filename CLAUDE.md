@@ -9,11 +9,12 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 4. Never break the command protocol: add fields, never rename/remove, keep the previous version working.
 5. Nothing during a service may depend on the cloud. If a change adds that dependency, stop and flag it.
 6. Keep secrets (stream keys, API keys) out of the repo and out of logs.
+7. No church outreach, pilots or surveys until the Stage 1 alpha is done (decided Oct 6, 2026).
 
 ## Layout
 - `apps/site` — live.jivvy.org (Astro, Cloudflare Pages + Pages Functions)
-- `apps/web` — app.jivvy.org (not started; Stage 1)
-- `apps/daemon` — church-computer app (not started; Stage 0 spike first)
+- `apps/web` — app.jivvy.org (not started; Stage 1 alpha)
+- `apps/daemon` — church-computer app (not started; Stage 1 alpha, after the Stage 0 spike in `spikes/lyrics-stream`)
 - `packages/protocol` — versioned command protocol (TypeScript, zero runtime deps)
 - `packages/sim-daemon` — in-memory fake daemon (demo + chaos tests); must honor the same reliability contract as the real one
 

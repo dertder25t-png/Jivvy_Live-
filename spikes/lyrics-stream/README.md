@@ -69,7 +69,7 @@ So it is the Quick Sync plugin's start-up (where it enumerates Intel's oneVPL ru
 ## Next steps
 
 - Stream to a private YouTube event once live streaming is enabled on the channel (needs phone verification, then up to 24 h).
-- Crash dump and page-heap run for issue 1 (needs Microsoft debugging tools installed), then file reports with GStreamer and Intel.
+- File the drafted report ([crash-report.md](crash-report.md)) with Intel and GStreamer once approved.
 - Retest Quick Sync and D3D12 encode after the next Intel driver update.
 - Measure the x264 software fallback's CPU cost.
 - Repeat on a cheap laptop before Stage 1 ships.

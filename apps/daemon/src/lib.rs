@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod engine;
+pub mod media;
 pub mod outputs;
 pub mod protocol;
 pub mod snapshot;
@@ -47,6 +48,27 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Tells the watchdog this process is alive (one heartbeat line on stdout). Exits if the
+/// watchdog is gone and stdout is closed.
+pub fn heartbeat() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    if writeln!(out, "{HEARTBEAT_LINE}").and_then(|_| out.flush()).is_err() {
+        std::process::exit(0);
+    }
+}
+
+/// Exits when the watchdog closes our stdin, so a supervised process never outlives it.
+pub fn exit_when_orphaned(who: &'static str) {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = [0u8; 64];
+        while matches!(std::io::stdin().read(&mut sink), Ok(n) if n > 0) {}
+        log(who, "watchdog gone; exiting");
+        std::process::exit(0);
+    });
 }
 
 /// Prints one log line to stderr with a timestamp. Never pass secrets here.

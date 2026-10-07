@@ -23,7 +23,13 @@ export type Command =
    * Added in v1 without a version bump. After the ack, the daemon sends a `state` event on this
    * connection every time the state changes, until the connection closes.
    */
-  | { type: "state.subscribe" };
+  | { type: "state.subscribe" }
+  /**
+   * Added in v1 without a version bump. Audio input levels in dBFS, one entry per channel,
+   * sent about ten times a second by the daemon's video process. The daemon relays them to
+   * subscribers as `levels` events; they are not part of the saved state.
+   */
+  | { type: "media.levels"; peakDb: number[]; rmsDb: number[] };
 
 export type CommandType = Command["type"];
 
@@ -56,6 +62,15 @@ export function isVersionSupported(v: number): boolean {
   return Number.isInteger(v) && v >= MIN_SUPPORTED_VERSION && v <= PROTOCOL_VERSION;
 }
 
+/** Most audio channels a levels report may carry. */
+export const MAX_CHANNELS = 32;
+
+/** A list of finite dB values, or null. */
+function dbList(x: unknown): number[] | null {
+  if (!Array.isArray(x) || x.length < 1 || x.length > MAX_CHANNELS) return null;
+  return x.every((n) => typeof n === "number" && Number.isFinite(n)) ? (x as number[]) : null;
+}
+
 type CommandResult = { ok: true; command: Command } | { ok: false; code: ErrorCode; message: string };
 
 function parseCommand(raw: unknown): CommandResult {
@@ -73,6 +88,12 @@ function parseCommand(raw: unknown): CommandResult {
       if (typeof raw.index !== "number" || !Number.isInteger(raw.index) || raw.index < 0)
         return { ok: false, code: "bad_arguments", message: "slide.goto needs a non-negative integer index" };
       return { ok: true, command: { type: "slide.goto", index: raw.index } };
+    case "media.levels": {
+      const peakDb = dbList(raw.peakDb), rmsDb = dbList(raw.rmsDb);
+      if (!peakDb || !rmsDb || peakDb.length !== rmsDb.length)
+        return { ok: false, code: "bad_arguments", message: `media.levels needs peakDb and rmsDb: 1-${MAX_CHANNELS} numbers each, same length` };
+      return { ok: true, command: { type: "media.levels", peakDb, rmsDb } };
+    }
     case "output.black":
       if (typeof raw.on !== "boolean")
         return { ok: false, code: "bad_arguments", message: "output.black needs boolean on" };
@@ -125,9 +146,18 @@ export type Ack =
  * Unsolicited message from the daemon (no `id`), sent only to connections that asked for it.
  * Clients must ignore events they don't recognise.
  */
-export type DaemonEvent = { v: number; event: "state"; state: StateSnapshot };
+export interface Levels {
+  peakDb: number[];
+  rmsDb: number[];
+}
+
+export type DaemonEvent =
+  | { v: number; event: "state"; state: StateSnapshot }
+  /** Live audio input levels, about ten a second, for meters. */
+  | { v: number; event: "levels"; levels: Levels };
 
 export const stateEvent = (state: StateSnapshot): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "state", state });
+export const levelsEvent = (levels: Levels): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "levels", levels });
 
 export const ack = (id: string, state?: StateSnapshot): Ack =>
   state ? { v: PROTOCOL_VERSION, id, ok: true, state } : { v: PROTOCOL_VERSION, id, ok: true };

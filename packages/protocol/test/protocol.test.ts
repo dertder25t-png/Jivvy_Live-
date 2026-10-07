@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, type DaemonLike } from "../src/index";
+import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, type Command, type DaemonLike } from "../src/index";
 import fixtures from "../fixtures/parse-cases.json";
 
 type Case = { name: string; input: string; expect: { ok: boolean; command?: unknown; code?: string; id?: string } };
@@ -22,7 +22,8 @@ describe("parseEnvelope", () => {
     for (const command of [
       { type: "slide.next" }, { type: "slide.prev" }, { type: "slide.goto", index: 3 },
       { type: "output.black", on: true }, { type: "stream.start" }, { type: "stream.stop" }, { type: "state.get" }, { type: "state.subscribe" },
-    ] as const) {
+      { type: "media.levels", peakDb: [-6, -7.5], rmsDb: [-18, -20] },
+    ] satisfies Command[]) {
       const r = parseEnvelope(JSON.stringify(makeEnvelope(command)));
       expect(r.ok && r.envelope.command).toEqual(command);
     }

@@ -1,9 +1,10 @@
-//! `jivvy-watchdog`: starts and supervises `jivvy-engine` and `jivvy-outputs`.
+//! `jivvy-watchdog`: starts and supervises `jivvy-engine`, `jivvy-outputs` and `jivvy-video`.
 //!
-//! jivvy-watchdog [--data-dir DIR] [--listen ADDR] [--no-outputs | --outputs-headless]
-//!                [--engine PATH] [--outputs PATH] [--hang-timeout-ms N] [engine args...]
+//! jivvy-watchdog [--data-dir DIR] [--listen ADDR] [--no-outputs | --outputs-headless] [--no-video]
+//!                [--engine PATH] [--outputs PATH] [--video PATH] [--hang-timeout-ms N] [engine args...]
 //!
-//! `--data-dir` and `--listen` go to both children (outputs connect to the engine there).
+//! `--data-dir` and `--listen` go to every child (the others connect to the engine there).
+//! `jivvy-video` is skipped when it isn't installed (builds without the `video` feature).
 //! Anything else it doesn't recognise is passed through to the engine.
 
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ fn main() {
     let mut engine = sibling("jivvy-engine");
     let mut outputs = Some(sibling("jivvy-outputs"));
     let mut outputs_headless = false;
+    let mut video = Some(sibling("jivvy-video"));
     let mut hang_timeout = Duration::from_secs(2);
     let mut shared: Vec<String> = Vec::new();
     let mut listen = jivvy_daemon::DEFAULT_LISTEN.to_string();
@@ -36,6 +38,8 @@ fn main() {
             "--outputs" => outputs = Some(value(&mut args, "--outputs").into()),
             "--no-outputs" => outputs = None,
             "--outputs-headless" => outputs_headless = true,
+            "--video" => video = Some(value(&mut args, "--video").into()),
+            "--no-video" => video = None,
             "--hang-timeout-ms" => {
                 hang_timeout =
                     Duration::from_millis(value(&mut args, "--hang-timeout-ms").parse().expect("a number of ms"))
@@ -55,12 +59,23 @@ fn main() {
         startup_grace: hang_timeout,
     }];
     if let Some(exe) = outputs {
-        let mut args = [shared, vec!["--connect".into(), listen]].concat();
+        let mut args = [shared.clone(), vec!["--connect".into(), listen.clone()]].concat();
         if outputs_headless {
             args.push("--headless".into());
         }
         // Creating the first WebView can take a few seconds on a slow laptop.
         children.push(ChildSpec { name: "outputs", exe, args, hang_timeout, startup_grace: Duration::from_secs(10) });
+    }
+    match video {
+        Some(exe) if exe.exists() => {
+            let args = [shared, vec!["--connect".into(), listen]].concat();
+            // Opening a camera can take a few seconds the first time.
+            children.push(ChildSpec { name: "video", exe, args, hang_timeout, startup_grace: Duration::from_secs(10) });
+        }
+        Some(exe) => {
+            jivvy_daemon::log("watchdog", format!("{} not installed; running without camera and audio", exe.display()))
+        }
+        None => {}
     }
     run(children)
 }

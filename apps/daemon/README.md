@@ -7,6 +7,7 @@ The church-computer side of Jivvy Live. See `docs/BUILD_PLAN.md` (Stage 1, Daemo
 - **`jivvy-watchdog`** starts `jivvy-engine` and `jivvy-outputs` and restarts each one independently when it exits, crashes, or stops sending its heartbeat for 2 seconds (outputs get 10 seconds for their first one, since WebView2 can be slow to start). It holds no state. If the watchdog dies, its children notice their stdin closing and exit, so nothing stale keeps the command port.
 - **`jivvy-engine`** holds the live state (current slide, black screen) and answers protocol commands. It saves a snapshot **before acknowledging every change** (stricter than the plan's "every second"): temp file, flush to disk, rename over `state.json`, keeping the last good file as `state.prev.json`. On start it resumes from the newest readable snapshot. Connections that send `state.subscribe` get a `state` event after every change; one that stops reading is disconnected rather than ever slowing the engine.
 - **`jivvy-outputs`** shows the state fullscreen on the projector and TVs. It follows the engine over the command channel like any other device, so **an engine restart never blanks a screen**: windows keep the last slide until the engine is back.
+- **`jivvy-video`** (built with `--features video`; needs GStreamer) captures the camera or capture card and the audio input, and sends audio levels to the engine about ten times a second for live meters. Skipped by the watchdog when not installed.
 
 Video, recording and streaming plug into the engine in later Stage 1 items. Until streaming lands, `stream.start` and `stream.stop` answer `unavailable`.
 
@@ -29,9 +30,24 @@ Borderless, always-on-top fullscreen windows placed in physical pixels on each m
 
 Until run sheets reach the engine, an output shows "Slide N" (or nothing when black). Configuring outputs from the web app comes with the System screen.
 
+## Camera and audio input
+
+Camera and microphone run as separate GStreamer pipelines, so one failing never stops the other. Today they only capture (and measure); the lyric layer, encoder, recording and stream attach to them in the next Stage 1 items.
+
+- **Devices:** listed in `media-status.json` with a stable id. Speaker "loopback" inputs are left out, the Windows default microphone is marked `default`, and a camera reported by two Windows APIs is listed once (Media Foundation preferred). Two identical USB cameras stay two.
+- **`media.json`** chooses inputs; without it the first camera and the default microphone are used:
+  ```json
+  { "version": 1,
+    "camera": { "use": "device", "id": "<id from media-status.json>", "name": "Blackmagic ATEM" },
+    "microphone": { "use": "auto" } }
+  ```
+  `use` is `auto`, `none`, `test` (test pattern / tone) or `device` (matched by id, then by name).
+- **Unplugged or failed device:** the input shows `waiting` with the reason and is retried every second; it comes back by itself. It is never swapped for a different device.
+- **Live meter:** levels (peak and RMS dBFS per channel) reach every subscribed screen as `levels` events. The meter widget comes with the operator view.
+
 ## Command channel (for now)
 
-Newline-delimited JSON on `127.0.0.1:47800`, one protocol envelope per line and one ack per line. Every ok ack carries `state`. The secure per-church WebSocket channel is a later Stage 1 item; the envelope and ack formats stay the same.
+Newline-delimited JSON on `127.0.0.1:47800`, one protocol envelope per line and one ack per line. Every ok ack carries `state`. After `state.subscribe`, the connection also receives `state` events on every change and `levels` events for meters. The secure per-church WebSocket channel is a later Stage 1 item; the envelope and ack formats stay the same.
 
 `src/protocol.rs` is a port of `packages/protocol`, and both are tested against `packages/protocol/fixtures/parse-cases.json`, so they can't drift apart.
 
@@ -45,8 +61,12 @@ cargo run --release --bin jivvy-watchdog -- --data-dir .\tmp --listen 127.0.0.1:
 ## Test
 
 ```powershell
-cargo test --release      # unit tests + chaos tests (about 3 minutes)
+cargo test --release      # unit tests + chaos tests (about 3 minutes), without camera/audio
+.\dev.ps1 test           # the same plus the video tests (sets GStreamer's paths for this process)
+.\dev.ps1 build          # builds jivvy-video too
 ```
+
+CI runs the video tests on Linux; the Windows CI job builds without the `video` feature until GStreamer is installed there.
 
 Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine crashes" row, part of "Corrupted settings", and the output windows (run with `--outputs-headless`, which reads monitors from `test-displays.json`):
 
@@ -59,3 +79,7 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | Kill the engine while outputs show slide 6 | Outputs keep showing it (never blank), reconnect, and follow the restarted engine; the outputs process itself is not restarted |
 | Kill the outputs process | Back on the current slide in under 3 s |
 | Unplug the projector, plug it back, then save a broken `outputs.json` | Output closes (never moves to the operator's screen), reopens, and keeps running on the last good config |
+| Kill the video process (test pattern + tone) | Restarted; audio levels reach screens again 2.3 s after the kill |
+| Configured camera missing | Camera `waiting`, audio keeps running; the camera starts within a second of becoming available |
+
+On the founder's laptop with real devices: Laptop Camera at 30 fps, the microphone array reporting levels ten times a second, the speaker loopback and duplicate camera entries filtered out.

@@ -29,6 +29,27 @@ pub enum Command {
     StateGet,
     #[serde(rename = "state.subscribe")]
     StateSubscribe,
+    #[serde(rename = "media.levels")]
+    MediaLevels(Levels),
+}
+
+/// Audio input levels in dBFS, one entry per channel.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Levels {
+    pub peak_db: Vec<f64>,
+    pub rms_db: Vec<f64>,
+}
+
+/// Most audio channels a levels report may carry (same as the TypeScript package).
+pub const MAX_CHANNELS: usize = 32;
+
+fn db_list(v: Option<&Value>) -> Option<Vec<f64>> {
+    let list = v?.as_array()?;
+    if list.is_empty() || list.len() > MAX_CHANNELS {
+        return None;
+    }
+    list.iter().map(|n| n.as_f64().filter(|f| f.is_finite())).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -103,6 +124,18 @@ pub fn state_event(state: StateSnapshot) -> StateEvent {
     StateEvent { v: PROTOCOL_VERSION, event: "state", state }
 }
 
+/// Live audio levels, relayed to subscribers for meters.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LevelsEvent<'a> {
+    pub v: u32,
+    pub event: &'static str,
+    pub levels: &'a Levels,
+}
+
+pub fn levels_event(levels: &Levels) -> LevelsEvent<'_> {
+    LevelsEvent { v: PROTOCOL_VERSION, event: "levels", levels }
+}
+
 pub fn ack(id: &str, state: Option<StateSnapshot>) -> Ack {
     Ack::Ok { v: PROTOCOL_VERSION, id: id.into(), ok: true, state }
 }
@@ -140,6 +173,12 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "stream.stop" => Command::StreamStop,
         "state.get" => Command::StateGet,
         "state.subscribe" => Command::StateSubscribe,
+        "media.levels" => match (db_list(obj.get("peakDb")), db_list(obj.get("rmsDb"))) {
+            (Some(peak_db), Some(rms_db)) if peak_db.len() == rms_db.len() => {
+                Command::MediaLevels(Levels { peak_db, rms_db })
+            }
+            _ => return Err((ErrorCode::BadArguments, "media.levels needs peakDb and rmsDb of equal length")),
+        },
         "slide.goto" => match obj.get("index").and_then(js_integer) {
             Some(i) if i >= 0.0 => Command::SlideGoto { index: i as u64 },
             _ => return Err((ErrorCode::BadArguments, "slide.goto needs a non-negative integer index")),
@@ -177,6 +216,18 @@ mod tests {
 
     const FIXTURES: &str = include_str!("../../../packages/protocol/fixtures/parse-cases.json");
 
+    /// JSON equality as JavaScript sees it: `-6` and `-6.0` are the same number.
+    fn js_equal(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+            (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| js_equal(p, q)),
+            (Value::Object(x), Value::Object(y)) => {
+                x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| js_equal(v, w)))
+            }
+            _ => a == b,
+        }
+    }
+
     #[test]
     fn matches_every_shared_conformance_case() {
         let doc: Value = serde_json::from_str(FIXTURES).unwrap();
@@ -188,7 +239,8 @@ mod tests {
             match parse_envelope(c["input"].as_str().unwrap()) {
                 Ok(e) => {
                     assert!(expect["ok"].as_bool().unwrap(), "{name}: parsed but expected an error");
-                    assert_eq!(serde_json::to_value(&e.command).unwrap(), expect["command"], "{name}");
+                    let got = serde_json::to_value(&e.command).unwrap();
+                    assert!(js_equal(&got, &expect["command"]), "{name}: got {got}, expected {}", expect["command"]);
                 }
                 Err(e) => {
                     assert!(!expect["ok"].as_bool().unwrap(), "{name}: expected ok, got {e:?}");

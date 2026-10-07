@@ -12,14 +12,13 @@
 //! `test-displays.json` in the data directory; the chaos tests use it.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use jivvy_daemon::client::{self, LiveState, Update};
 use jivvy_daemon::outputs::{Model, MonitorInfo, Placement};
-use jivvy_daemon::{DEFAULT_LISTEN, HEARTBEAT_LINE, default_data_dir, log};
+use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log};
 
 const OUTPUT_HTML: &str = include_str!("output.html");
 const TICK: Duration = Duration::from_millis(250);
@@ -55,24 +54,6 @@ fn fail(msg: &str) -> ! {
     std::process::exit(2);
 }
 
-/// Tells the watchdog this process is alive; exits if the watchdog is gone.
-fn heartbeat() {
-    let mut out = std::io::stdout();
-    if writeln!(out, "{HEARTBEAT_LINE}").and_then(|_| out.flush()).is_err() {
-        std::process::exit(0);
-    }
-}
-
-/// Exits when the watchdog closes our stdin, so a stale process never lingers.
-fn exit_when_orphaned() {
-    std::thread::spawn(|| {
-        let mut sink = [0u8; 64];
-        while matches!(std::io::stdin().read(&mut sink), Ok(n) if n > 0) {}
-        log("outputs", "watchdog gone; exiting");
-        std::process::exit(0);
-    });
-}
-
 fn apply(model: &mut Model, update: Update) -> Option<LiveState> {
     match update {
         Update::Connected => model.connected = true,
@@ -97,7 +78,7 @@ fn main() {
         fail(&format!("data dir {}: {e}", args.data_dir.display()));
     }
     if args.supervised {
-        exit_when_orphaned();
+        exit_when_orphaned("outputs");
     }
     if args.headless { run_headless(args) } else { ui::run(args) }
 }

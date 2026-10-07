@@ -58,7 +58,7 @@ fn parse_args() -> Result<Args> {
             "--font" => a.font = Some(val()?),
             "--encoder" => a.encoder = val()?,
             "-h" | "--help" => {
-                println!("lyrics-stream [--source test|webcam] [--seconds N] [--slide-seconds N] [--bitrate KBPS] [--out FILE] [--font TTF] [--encoder qsv|mf]");
+                println!("lyrics-stream [--source test|webcam] [--seconds N] [--slide-seconds N] [--bitrate KBPS] [--out FILE] [--font TTF] [--encoder qsv|mf|x264]");
                 println!("Set JIVVY_YT_STREAM_KEY to also stream to YouTube.");
                 std::process::exit(0);
             }
@@ -68,8 +68,8 @@ fn parse_args() -> Result<Args> {
     if a.source != "test" && a.source != "webcam" {
         bail!("--source must be test or webcam");
     }
-    if a.encoder != "qsv" && a.encoder != "mf" {
-        bail!("--encoder must be qsv or mf");
+    if !["qsv", "mf", "x264"].contains(&a.encoder.as_str()) {
+        bail!("--encoder must be qsv, mf or x264");
     }
     Ok(a)
 }
@@ -115,6 +115,11 @@ fn pipeline_description(a: &Args, streaming: bool) -> String {
         // Media Foundation's Intel encoder takes system or D3D11 memory, not D3D12.
         "mf" => format!(
             "d3d12download ! video/x-raw,format=NV12 ! mfh264enc name=enc rc-mode=cbr bitrate={br} gop-size={gop} bframes=0 low-latency=true"
+        ),
+        // Software fallback for when no hardware encoder works. veryfast is the
+        // usual live-streaming preset; vbv-buf-capacity (ms) keeps it near CBR.
+        "x264" => format!(
+            "d3d12download ! video/x-raw,format=NV12 ! x264enc name=enc bitrate={br} vbv-buf-capacity=1000 key-int-max={gop} bframes=0 speed-preset=veryfast tune=zerolatency"
         ),
         _ => format!("qsvh264enc name=enc bitrate={br} max-bitrate={br} rate-control=cbr gop-size={gop} b-frames=0 target-usage=7"),
     };
@@ -283,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn lyrics_are_composited_on_the_gpu_for_both_encoders() {
+    fn lyrics_are_composited_on_the_gpu_for_every_encoder() {
         let mut a = Args { source: "webcam".into(), seconds: 1, slide_seconds: 4, bitrate: 6000, out: "x.mkv".into(), font: None, encoder: "qsv".into() };
         let qsv = pipeline_description(&a, false);
         assert!(qsv.contains("d3d12upload ! overlaycomposition name=lyrics ! d3d12overlaycompositor"));
@@ -291,5 +296,8 @@ mod tests {
         a.encoder = "mf".into();
         let mf = pipeline_description(&a, false);
         assert!(mf.contains("d3d12overlaycompositor") && mf.contains("d3d12download ! video/x-raw,format=NV12 ! mfh264enc"));
+        a.encoder = "x264".into();
+        let x264 = pipeline_description(&a, false);
+        assert!(x264.contains("d3d12overlaycompositor") && x264.contains("d3d12download ! video/x-raw,format=NV12 ! x264enc"));
     }
 }

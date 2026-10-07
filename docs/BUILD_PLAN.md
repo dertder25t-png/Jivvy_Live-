@@ -138,7 +138,7 @@ Prove churches want it before writing the daemon.
 - [ ] Optional "founding church" preorder to test real willingness to pay
 - [ ] Line up 3–5 pilot churches you can visit in person
 - [ ] Tech spike: web lyrics composited over a camera feed, hardware-encoded, streamed to YouTube, on a $300 laptop
-  - In progress (`spikes/lyrics-stream`): lyrics over webcam at 1080p30, GPU compositing, hardware encode and crash-safe recording all work. Left: stream to YouTube (waiting on channel live access) and a run on a cheap laptop. Found an Intel Quick Sync driver crash on the test laptop; Media Foundation's encoder avoids it.
+  - In progress (`spikes/lyrics-stream`): lyrics over webcam at 1080p30, GPU compositing, hardware encode and crash-safe recording all work, and the x264 software fallback also holds 1080p30 (about one core; ~28% of two pinned cores). Left: stream to YouTube (waiting on channel live access) and a run on a cheap laptop. Found an Intel Quick Sync driver crash on the test laptop; Media Foundation's encoder avoids it.
 
 **Done when:** at least 10 churches say they'd switch, 3–5 commit to piloting, and the tech spike holds 1080p30 with CPU under 40%.
 

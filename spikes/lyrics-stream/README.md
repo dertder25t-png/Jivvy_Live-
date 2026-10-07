@@ -17,9 +17,10 @@ Needs Rust (MSVC) and GStreamer 1.28 (`winget install gstreamerproject.gstreamer
 .\run.ps1 run -- --seconds 60                                 # test pattern, record to recording.mkv
 .\run.ps1 run -- --source webcam --encoder mf --seconds 30    # laptop camera, Media Foundation encoder
 .\run.ps1 run -Cores 2 -- --source webcam --encoder mf        # pin to 2 cores to simulate a cheap laptop
+.\run.ps1 run -- --source webcam --encoder x264 --seconds 30  # software fallback, no hardware encoder
 ```
 
-`--encoder qsv` (default) uses GStreamer's Quick Sync plugin; `--encoder mf` uses Windows Media Foundation's Intel H.264 encoder. See known issues before choosing.
+`--encoder qsv` (default) uses GStreamer's Quick Sync plugin; `--encoder mf` uses Windows Media Foundation's Intel H.264 encoder; `--encoder x264` is the software fallback (`veryfast`, `zerolatency`). With x264 the lyrics are still composited on the GPU; only the finished frame is copied back for encoding. See known issues before choosing.
 
 To stream to YouTube, put the stream key in `spikes/lyrics-stream/.stream-key` (git-ignored) or set `JIVVY_YT_STREAM_KEY`. The key is never printed; errors are scrubbed of it.
 
@@ -34,8 +35,11 @@ All at 1080p30, lyrics on, 6 Mbps H.264, MKV with AAC.
 | **Webcam, GPU lyrics, Media Foundation encoder, 30 s** | **avg 0.8%, max 1.7% of machine** | ~878 / 900 (first second is camera warm-up), worst second 28 fps | **13 / 13 runs clean** |
 | Webcam, GPU lyrics, MF, pinned to 2 cores | ~6% of those 2 cores | 878 / 900 | clean |
 | Webcam, GPU lyrics, QSV | ~0.7% | 880 / 900 when it runs | crashed 2 of 3 |
+| Test pattern, x264 software fallback, 30 s | avg 5.4%, max 17.6% of machine | 904 / 900, worst second 29 fps | clean |
+| **Webcam, GPU lyrics, x264, 30 s** | **avg 6.3%, max 10.7% of machine** (about one core) | 882 / 900, worst second 29 fps | clean |
+| Webcam, GPU lyrics, x264, pinned to 2 cores | ~28% of those 2 cores | 885 / 900, worst second 29 fps | clean |
 
-Recording checked: 21.5 MB for 30 s (matches 6 Mbps), lyrics correctly placed over the camera image.
+Recording checked: 21.5 MB for 30 s (matches 6 Mbps), lyrics correctly placed over the camera image. The x264 webcam recording is 22.4 MB for 29.4 s (about 6.1 Mbps), High profile, lyrics correctly placed. On the mostly static test pattern x264 comes in under the bitrate (it caps rather than pads), which is fine for streaming.
 
 Budgets: under ~10% CPU on this machine; the plan's target is under 40% on a $300 laptop.
 
@@ -64,6 +68,7 @@ So it is the Quick Sync plugin's start-up (where it enumerates Intel's oneVPL ru
 
 - **Composite lyrics on the GPU** and draw the lyric layer only on slide change.
 - **Treat the encoder as something that can fail on a church's PC.** Run a quick encoder self-test in pre-flight, keep a fallback order (here: Media Foundation → Quick Sync → x264), and run the encoder where the watchdog can restart it without losing the recording.
+- **x264 is a usable fallback, not just a last resort.** At 1080p30 `veryfast` it used about one core of this machine and ~28% of two pinned cores, inside the 40% budget. A $300 laptop's cores are slower, so measure it there; if it is tight, the fallback can step down to 720p30.
 - Camera capture already decodes to NV12 through Media Foundation, so a USB camera (or an ATEM Mini, which appears to Windows as a webcam) needs no CPU conversion.
 
 ## Next steps
@@ -71,5 +76,4 @@ So it is the Quick Sync plugin's start-up (where it enumerates Intel's oneVPL ru
 - Stream to a private YouTube event once live streaming is enabled on the channel (needs phone verification, then up to 24 h).
 - File the drafted report ([crash-report.md](crash-report.md)) with Intel and GStreamer once approved.
 - Retest Quick Sync and D3D12 encode after the next Intel driver update.
-- Measure the x264 software fallback's CPU cost.
 - Repeat on a cheap laptop before Stage 1 ships.

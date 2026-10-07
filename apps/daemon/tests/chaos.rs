@@ -394,6 +394,7 @@ mod video {
                 && s["microphone"]["state"] == "running"
         });
         assert!(s["microphone"]["rate"].as_f64().unwrap() > 5.0, "about ten level reports a second: {s}");
+        d.media_status(Duration::from_secs(3), "levels acknowledged by the engine", |s| s["connected"] == true);
 
         let killed_at = Instant::now();
         kill_hard(video);

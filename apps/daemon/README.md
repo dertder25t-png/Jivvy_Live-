@@ -41,8 +41,10 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
     "camera": { "use": "device", "id": "<id from media-status.json>", "name": "Blackmagic ATEM" },
     "microphone": { "use": "auto" } }
   ```
-  `use` is `auto`, `none`, `test` (test pattern / tone) or `device` (matched by id, then by name).
-- **Unplugged or failed device:** the input shows `waiting` with the reason and is retried every second; it comes back by itself. It is never swapped for a different device.
+  `use` is `auto`, `none`, `test` (test pattern / tone) or `device`.
+- **Never a different camera by surprise.** `auto` picks the default (or first) device once and stays on it until `media.json` changes, even across restarts (`media-memory.json`). A configured device is matched by id; by name only when its id changed (e.g. another USB port) and that name has never belonged to two devices at once, so unplugging one of two identical cameras never switches to the other.
+- **Unplugged or failed device:** the input shows `waiting` with the reason and is retried every second; it comes back by itself.
+- **`connected`** in `media-status.json` means the engine acknowledged the latest level report or check (checked at least once a second, even with no microphone).
 - **Live meter:** levels (peak and RMS dBFS per channel) reach every subscribed screen as `levels` events. The meter widget comes with the operator view.
 
 ## Command channel (for now)

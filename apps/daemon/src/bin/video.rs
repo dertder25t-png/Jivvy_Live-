@@ -14,13 +14,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, RawDevice, Status};
+use jivvy_daemon::client::LevelsSender;
+use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, RawDevice, Status};
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
 
 const TICK: Duration = Duration::from_millis(250);
@@ -194,36 +194,6 @@ fn levels_from(s: &gst::StructureRef) -> Option<(Vec<f64>, Vec<f64>)> {
     Some((list("peak")?, list("rms")?))
 }
 
-/// Sends level reports to the engine on its own thread, reconnecting as needed. Reports
-/// are dropped (never queued up) while the engine is away: old levels are useless.
-fn levels_sender(addr: String) -> SyncSender<(Vec<f64>, Vec<f64>)> {
-    let (tx, rx) = sync_channel::<(Vec<f64>, Vec<f64>)>(4);
-    std::thread::spawn(move || send_levels(&addr, rx));
-    tx
-}
-
-fn send_levels(addr: &str, rx: Receiver<(Vec<f64>, Vec<f64>)>) {
-    use std::io::{BufRead, BufReader, Write};
-    let mut conn: Option<(std::net::TcpStream, BufReader<std::net::TcpStream>)> = None;
-    for (peak, rms) in rx {
-        if conn.is_none() {
-            conn = std::net::TcpStream::connect(addr)
-                .and_then(|s| {
-                    s.set_read_timeout(Some(Duration::from_secs(1)))?;
-                    Ok((s.try_clone()?, BufReader::new(s)))
-                })
-                .ok();
-        }
-        let Some((w, r)) = conn.as_mut() else { continue };
-        let msg = serde_json::json!({ "v": 1, "id": "lv", "ts": 0, "command": { "type": "media.levels", "peakDb": peak, "rmsDb": rms } });
-        let mut ack = String::new();
-        // Request/response keeps the engine's per-connection queue from ever filling up.
-        if writeln!(w, "{msg}").is_err() || r.read_line(&mut ack).unwrap_or(0) == 0 {
-            conn = None;
-        }
-    }
-}
-
 fn main() {
     let args = parse_args();
     if let Err(e) = gst::init() {
@@ -241,15 +211,16 @@ fn main() {
     if monitor.start().is_err() {
         log("video", "device monitor did not start; only test sources will work");
     }
-    let levels = levels_sender(args.connect.clone());
+    let levels = LevelsSender::start(args.connect.clone());
     let mut inputs = [Input::new(Kind::Camera), Input::new(Kind::Microphone)];
     let mut devices: Vec<DeviceInfo> = Vec::new();
     let mut config = media::MediaConfig::default();
+    // Auto pins and ambiguous names survive restarts, so a restart never switches cameras.
+    let mut memory = Memory::load(&args.data_dir);
     let mut problems: Vec<String> = Vec::new();
     let mut last_peak: Vec<f64> = Vec::new();
     let mut last_written = Vec::new();
     let mut last_rescan: Option<Instant> = None;
-    let mut sent_ok = false;
 
     loop {
         let tick_end = Instant::now() + TICK;
@@ -267,7 +238,7 @@ fn main() {
                             {
                                 input.count.fetch_add(1, Ordering::Relaxed);
                                 last_peak = peak.clone();
-                                sent_ok = !matches!(levels.try_send((peak, rms)), Err(TrySendError::Disconnected(_)));
+                                levels.send(peak, rms);
                             }
                         }
                         gst::MessageView::Error(err) => {
@@ -301,9 +272,11 @@ fn main() {
             }
             let raw: Vec<RawDevice> = monitor.devices().iter().map(raw_device).collect();
             devices = media::devices(&raw);
+            let remembered = memory.clone();
+            memory.observe(&devices);
             for input in inputs.iter_mut() {
                 let sel = if input.kind == Kind::Camera { &config.camera } else { &config.microphone };
-                let choice = media::choose(sel, input.kind, &devices);
+                let choice = memory.choose(sel, input.kind, &devices);
                 if let Some(e) = elapsed {
                     let n = input.count.load(Ordering::Relaxed);
                     input.rate = (n - input.last_count) as f64 / e.as_secs_f64();
@@ -325,6 +298,13 @@ fn main() {
                     }
                 }
             }
+            if memory != remembered
+                && let Err(e) = serde_json::to_vec_pretty(&memory)
+                    .map_err(std::io::Error::other)
+                    .and_then(|b| write_atomic(&args.data_dir.join(media::MEMORY_FILE), &b))
+            {
+                log("video", format!("could not save {}: {e}", media::MEMORY_FILE));
+            }
             last_rescan = Some(now);
         }
 
@@ -333,7 +313,7 @@ fn main() {
             camera: inputs[0].status(),
             microphone: inputs[1].status(),
             peak_db: last_peak.clone(),
-            connected: sent_ok,
+            connected: levels.delivering(),
             problems: problems.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&status)

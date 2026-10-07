@@ -1,9 +1,10 @@
 //! Camera and microphone choice for `jivvy-video`. Pure logic, tested without devices.
 //!
 //! Configuration is `media.json` in the data directory; without it the first camera and
-//! the computer's default microphone are used. A chosen device that is unplugged is
-//! waited for, never silently swapped for another one (the stream would suddenly show a
-//! different camera); the status file reports it so the tech lead can see why.
+//! the computer's default microphone are used, and then kept (`media-memory.json`) until
+//! the configuration changes. A chosen device that is unplugged is waited for, never
+//! silently swapped for another one (the stream would suddenly show a different camera);
+//! the status file reports it so the tech lead can see why.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -153,22 +154,95 @@ pub enum Choice {
     },
 }
 
-pub fn choose(sel: &Selection, kind: Kind, devices: &[DeviceInfo]) -> Choice {
-    let of_kind = || devices.iter().filter(move |d| d.kind == kind);
-    let pick = |d: &DeviceInfo| Choice::Device { id: d.id.clone(), name: d.name.clone() };
-    match sel {
-        Selection::None => Choice::None,
-        Selection::Test => Choice::Test,
-        Selection::Auto => {
-            of_kind().find(|d| d.default).or_else(|| of_kind().next()).map(pick).unwrap_or(Choice::Missing {
-                name: format!("any {}", if kind == Kind::Camera { "camera" } else { "microphone" }),
-            })
+pub const MEMORY_FILE: &str = "media-memory.json";
+
+/// The device `auto` resolved to, kept until `media.json` changes, so unplugging it means
+/// waiting for it rather than switching the live picture to another camera.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pin {
+    pub id: String,
+    pub name: String,
+}
+
+/// What `jivvy-video` remembers across restarts (`media-memory.json`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Memory {
+    /// Auto pins by kind ("camera", "microphone").
+    #[serde(default)]
+    pub auto_pins: BTreeMap<String, Pin>,
+    /// Device names ever seen on two devices at once, by kind. A configured device that
+    /// disappears is never replaced by name for these: the other one is a different device.
+    #[serde(default)]
+    pub ambiguous_names: BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+fn kind_key(kind: Kind) -> &'static str {
+    if kind == Kind::Camera { "camera" } else { "microphone" }
+}
+
+impl Memory {
+    /// Reads `media-memory.json`; missing or unreadable starts fresh.
+    pub fn load(dir: &Path) -> Memory {
+        std::fs::read(dir.join(MEMORY_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// Records names currently shared by two or more devices of a kind.
+    pub fn observe(&mut self, devices: &[DeviceInfo]) {
+        for (i, d) in devices.iter().enumerate() {
+            if devices[i + 1..].iter().any(|o| o.kind == d.kind && o.name == d.name && o.id != d.id) {
+                self.ambiguous_names.entry(kind_key(d.kind).into()).or_default().insert(d.name.clone());
+            }
         }
-        Selection::Device { id, name } => of_kind()
-            .find(|d| d.id == *id)
-            .or_else(|| of_kind().find(|d| d.name == *name))
-            .map(pick)
-            .unwrap_or(Choice::Missing { name: name.clone() }),
+    }
+
+    /// The device with this id; if the id changed (e.g. a different USB port), the one
+    /// device with this name, unless that name has ever belonged to two devices at once.
+    fn find<'a>(&self, kind: Kind, id: &str, name: &str, devices: &'a [DeviceInfo]) -> Option<&'a DeviceInfo> {
+        let of_kind = || devices.iter().filter(move |d| d.kind == kind);
+        if let Some(d) = of_kind().find(|d| d.id == id) {
+            return Some(d);
+        }
+        if self.ambiguous_names.get(kind_key(kind)).is_some_and(|names| names.contains(name)) {
+            return None;
+        }
+        let mut same_name = of_kind().filter(|d| d.name == name);
+        match (same_name.next(), same_name.next()) {
+            (Some(d), None) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// What to use for one input. `auto` picks the default (or first) device once and then
+    /// stays on it; any other selection clears that pin, so the next `auto` picks afresh.
+    pub fn choose(&mut self, sel: &Selection, kind: Kind, devices: &[DeviceInfo]) -> Choice {
+        let device = |d: &DeviceInfo| Choice::Device { id: d.id.clone(), name: d.name.clone() };
+        if *sel != Selection::Auto {
+            self.auto_pins.remove(kind_key(kind));
+        }
+        match sel {
+            Selection::None => Choice::None,
+            Selection::Test => Choice::Test,
+            Selection::Device { id, name } => {
+                self.find(kind, id, name, devices).map(device).unwrap_or(Choice::Missing { name: name.clone() })
+            }
+            Selection::Auto => {
+                if let Some(pin) = self.auto_pins.get(kind_key(kind)) {
+                    return self
+                        .find(kind, &pin.id, &pin.name, devices)
+                        .map(device)
+                        .unwrap_or(Choice::Missing { name: pin.name.clone() });
+                }
+                let of_kind = || devices.iter().filter(move |d| d.kind == kind);
+                match of_kind().find(|d| d.default).or_else(|| of_kind().next()) {
+                    Some(d) => {
+                        self.auto_pins.insert(kind_key(kind).into(), Pin { id: d.id.clone(), name: d.name.clone() });
+                        device(d)
+                    }
+                    None => Choice::Missing { name: format!("any {}", kind_key(kind)) },
+                }
+            }
+        }
     }
 }
 
@@ -196,6 +270,7 @@ pub struct Status {
     pub camera: InputStatus,
     pub microphone: InputStatus,
     pub peak_db: Vec<f64>,
+    /// The engine acknowledged the latest level report or check (at least once a second).
     pub connected: bool,
     pub problems: Vec<String>,
 }
@@ -277,25 +352,86 @@ mod tests {
         assert_eq!(devices(&cams).len(), 2);
     }
 
+    fn cam(name: &str, id: &str) -> DeviceInfo {
+        DeviceInfo {
+            kind: Kind::Camera,
+            id: id.into(),
+            name: name.into(),
+            api: "mediafoundation".into(),
+            default: false,
+        }
+    }
+
     #[test]
     fn choice_follows_the_config_and_waits_for_a_missing_device() {
         let d = devices(&laptop());
+        let mut m = Memory::default();
         assert!(
-            matches!(choose(&Selection::Auto, Kind::Camera, &d), Choice::Device { ref name, .. } if name == "Laptop Camera")
+            matches!(m.choose(&Selection::Auto, Kind::Camera, &d), Choice::Device { ref name, .. } if name == "Laptop Camera")
         );
         assert!(
-            matches!(choose(&Selection::Auto, Kind::Microphone, &d), Choice::Device { ref name, .. } if name.starts_with("Microphone Array"))
+            matches!(m.choose(&Selection::Auto, Kind::Microphone, &d), Choice::Device { ref name, .. } if name.starts_with("Microphone Array"))
         );
         let by_name = Selection::Device { id: "old-id".into(), name: "Laptop Camera".into() };
         assert!(
-            matches!(choose(&by_name, Kind::Camera, &d), Choice::Device { .. }),
-            "falls back to the name when the id changed"
+            matches!(m.choose(&by_name, Kind::Camera, &d), Choice::Device { .. }),
+            "an unambiguous name finds a device whose id changed (another USB port)"
         );
         let atem = Selection::Device { id: "x".into(), name: "Blackmagic ATEM".into() };
-        assert_eq!(choose(&atem, Kind::Camera, &d), Choice::Missing { name: "Blackmagic ATEM".into() });
-        assert_eq!(choose(&Selection::Auto, Kind::Camera, &[]), Choice::Missing { name: "any camera".into() });
-        assert_eq!(choose(&Selection::None, Kind::Camera, &d), Choice::None);
-        assert_eq!(choose(&Selection::Test, Kind::Microphone, &d), Choice::Test);
+        assert_eq!(m.choose(&atem, Kind::Camera, &d), Choice::Missing { name: "Blackmagic ATEM".into() });
+        assert_eq!(
+            Memory::default().choose(&Selection::Auto, Kind::Camera, &[]),
+            Choice::Missing { name: "any camera".into() }
+        );
+        assert_eq!(m.choose(&Selection::None, Kind::Camera, &d), Choice::None);
+        assert_eq!(m.choose(&Selection::Test, Kind::Microphone, &d), Choice::Test);
+    }
+
+    #[test]
+    fn auto_stays_on_its_camera_when_it_is_unplugged_until_the_config_changes() {
+        let (a, b) = (cam("Front camera", "path-a"), cam("Side camera", "path-b"));
+        let mut m = Memory::default();
+        let a_choice = Choice::Device { id: "path-a".into(), name: "Front camera".into() };
+        assert_eq!(m.choose(&Selection::Auto, Kind::Camera, &[a.clone(), b.clone()]), a_choice);
+        // A unplugged, B still there: wait for A, never switch the live picture to B.
+        assert_eq!(
+            m.choose(&Selection::Auto, Kind::Camera, std::slice::from_ref(&b)),
+            Choice::Missing { name: "Front camera".into() }
+        );
+        // A back: picked up again.
+        assert_eq!(m.choose(&Selection::Auto, Kind::Camera, &[b.clone(), a.clone()]), a_choice);
+        // The pin survives a restart of the video process.
+        let saved: Memory = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let mut restarted = saved;
+        assert_eq!(
+            restarted.choose(&Selection::Auto, Kind::Camera, std::slice::from_ref(&b)),
+            Choice::Missing { name: "Front camera".into() }
+        );
+        // Changing the config (here to none, then back to auto) re-resolves.
+        restarted.choose(&Selection::None, Kind::Camera, std::slice::from_ref(&b));
+        assert!(
+            matches!(restarted.choose(&Selection::Auto, Kind::Camera, std::slice::from_ref(&b)), Choice::Device { ref id, .. } if id == "path-b")
+        );
+    }
+
+    #[test]
+    fn unplugging_one_of_two_identical_cameras_never_switches_to_the_other() {
+        let (a, b) = (cam("USB Camera", "path-a"), cam("USB Camera", "path-b"));
+        let configured = Selection::Device { id: "path-a".into(), name: "USB Camera".into() };
+        let mut m = Memory::default();
+        m.observe(&[a.clone(), b.clone()]);
+        assert!(
+            matches!(m.choose(&configured, Kind::Camera, &[a, b.clone()]), Choice::Device { ref id, .. } if id == "path-a")
+        );
+        assert_eq!(
+            m.choose(&configured, Kind::Camera, std::slice::from_ref(&b)),
+            Choice::Missing { name: "USB Camera".into() },
+            "the name has belonged to two devices, so the other one is not a substitute"
+        );
+        // The same holds for an auto pin.
+        let mut m2 = m.clone();
+        m2.auto_pins.insert("camera".into(), Pin { id: "path-a".into(), name: "USB Camera".into() });
+        assert_eq!(m2.choose(&Selection::Auto, Kind::Camera, &[b]), Choice::Missing { name: "USB Camera".into() });
     }
 
     #[test]

@@ -14,7 +14,7 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 ## Layout
 - `apps/site` — live.jivvy.org (Astro, Cloudflare Pages + Pages Functions)
 - `apps/web` — app.jivvy.org (not started; Stage 1 alpha)
-- `apps/daemon` — church-computer app (not started; Stage 1 alpha, after the Stage 0 spike in `spikes/lyrics-stream`)
+- `apps/daemon` — church-computer app (Rust): `jivvy-watchdog` supervises `jivvy-engine`; chaos tests in `tests/chaos.rs`
 - `packages/protocol` — versioned command protocol (TypeScript, zero runtime deps)
 - `packages/sim-daemon` — in-memory fake daemon (demo + chaos tests); must honor the same reliability contract as the real one
 

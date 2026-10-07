@@ -244,9 +244,18 @@ fn outputs_keep_the_last_slide_while_the_engine_restarts_then_follow_again() {
     assert_eq!(s["connected"], true);
 
     kill_hard(engine);
-    let s = d.outputs_status(Duration::from_secs(3), "noticing the engine is gone", |s| s["connected"] == false);
-    assert_eq!(s["shown"]["slideIndex"], 5, "the screen must keep the last slide, not go blank");
-    d.next_engine_pid(RESTORE_TARGET);
+    // Until the new engine is up, every sample must still show slide 5. (The disconnect
+    // itself can be too brief to see: on Linux the engine is back within one status write.)
+    let deadline = Instant::now() + RESTORE_TARGET;
+    loop {
+        let s = d.outputs_status(Duration::from_secs(1), "a readable status", |_| true);
+        assert_eq!(s["shown"]["slideIndex"], 5, "the screen must keep the last slide, not go blank");
+        if let Ok(_new_engine) = d.engine_starts.try_recv() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "engine did not restart in time");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     d.send(json!({ "type": "slide.goto", "index": 6 }), RESTORE_TARGET);
     d.outputs_status(RESTORE_TARGET, "following the restarted engine", |s| {
         s["connected"] == true && s["shown"]["slideIndex"] == 6

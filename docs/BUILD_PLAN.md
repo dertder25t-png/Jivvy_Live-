@@ -32,9 +32,9 @@ Use proven, mostly free building blocks and write only the parts that make Jivvy
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| Desktop app shell | Tauri or Electron (decide in Stage 1, week 1) | Tray icon, auto-start, updater, output windows on each monitor. See the note below. |
+| Desktop app shell | **Tauri** (decided Oct 6, 2026) | Tray icon, auto-start, updater, output windows on each monitor. See the note below. |
 | Video engine | Rust + GStreamer | Live pipelines with hardware encoders, bitrate changes on the fly, one encode sent to both stream and file |
-| Hardware encoding | Intel Quick Sync, NVIDIA NVENC, AMD AMF, Apple VideoToolbox; x264 fallback | Low CPU on cheap laptops, software fallback when no chip is usable |
+| Hardware encoding | Windows Media Foundation (vendor encoder), Intel Quick Sync, NVIDIA NVENC, AMD AMF, Apple VideoToolbox; x264 fallback | Low CPU on cheap laptops; a self-test picks the first encoder that works on each machine, so a bad driver can't stop a service |
 | Streaming out | RTMP/RTMPS with auto-reconnect; SRT where a platform accepts it | What YouTube and Facebook take, no server in between |
 | Cloud relay (Pro only) | Cloudflare Stream live inputs with simulcast outputs | Upload once, fan out to up to 50 platforms; about $1 per 1,000 minutes sent, nothing for us to run |
 | Recording | Matroska or fragmented MP4, converted to MP4 after service | A crash never corrupts the file |
@@ -48,6 +48,8 @@ Use proven, mostly free building blocks and write only the parts that make Jivvy
 | Payments and licenses | Stripe + license keys tied to the church account | One-time $200 and Plus renewals |
 
 **Tauri vs. Electron — test before committing.** The hardest piece is putting web-built lyrics onto the video. Electron has built-in offscreen rendering, so the same HTML that draws the projector screen can become the video's lyric layer. Tauri is much lighter but would need a second renderer for that. Build a one-week prototype of "web lyrics over camera, hardware-encoded, streamed to YouTube" in each and pick the one that holds 1080p30 on a $300 laptop.
+
+**Decision (Oct 6, 2026): Tauri.** The stream's lyric layer is drawn natively in Rust from the same theme data as the web screens, only when the slide changes, and composited on the GPU. The spike (`spikes/lyrics-stream`) holds 1080p30 from a webcam at about 1% CPU on the founder's laptop. Screenshot tests will keep the native lyric layer matching the HTML screens.
 
 ## Domains and hosting
 
@@ -136,6 +138,7 @@ Prove churches want it before writing the daemon.
 - [ ] Optional "founding church" preorder to test real willingness to pay
 - [ ] Line up 3–5 pilot churches you can visit in person
 - [ ] Tech spike: web lyrics composited over a camera feed, hardware-encoded, streamed to YouTube, on a $300 laptop
+  - In progress (`spikes/lyrics-stream`): lyrics over webcam at 1080p30, GPU compositing, hardware encode and crash-safe recording all work. Left: stream to YouTube (waiting on channel live access) and a run on a cheap laptop. Found an Intel Quick Sync driver crash on the test laptop; Media Foundation's encoder avoids it.
 
 **Done when:** at least 10 churches say they'd switch, 3–5 commit to piloting, and the tech spike holds 1080p30 with CPU under 40%.
 
@@ -146,6 +149,7 @@ Anyone can try Jivvy Live in their browser with no install, no account and no in
 **The demo (runs entirely in the browser, free static hosting)**
 
 - [ ] Same web app as the real product, connected to a simulated church computer that runs in the browser. Design the command protocol so a fake daemon can stand in; it doubles as a testing tool.
+  - Done: versioned command protocol (`packages/protocol`) and simulated daemon with crash and offline failure injection (`packages/sim-daemon`). Not started: the demo app itself.
 - [ ] Demo church preloaded: a full Sunday run sheet with public-domain hymns, scripture, sermon slides, announcements and a countdown
 - [ ] "Projector" opens in a second tab or on a TV; a QR code turns the visitor's phone into the remote
 - [ ] Stream preview uses their webcam (or a sample video) with lyrics on top
@@ -157,7 +161,8 @@ Anyone can try Jivvy Live in their browser with no install, no account and no in
 **Questions without the founder on call**
 
 - [ ] FAQ and 1–2 minute how-to videos covering the common questions
-- [ ] "Got questions? Book a call" button using a Google Calendar booking page with only the time slots the founder opens
+- [x] "Got questions? Book a call" button using a Google Calendar booking page with only the time slots the founder opens
+  - Live on live.jivvy.org; shows the contact email until `PUBLIC_BOOKING_URL` is set to the Google booking page.
 - [ ] A short booking form (church size, current software, biggest problem) so every call is focused
 - [ ] Email contact form for people who'd rather not call
 - [ ] Privacy-friendly analytics on which demo steps visitors use and where they leave
@@ -178,6 +183,9 @@ The smallest product a pilot church can run a whole service on, with every relia
 - [ ] Crash-safe local recording
 - [ ] Local secure command channel (per-church hostname + certificate); certificate renewal stays free forever for every church
 - [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all
+- [ ] Local database on the church computer (SQLite) holding the library, plans, themes and settings. It is the master copy during a service and the only copy for churches without Plus; the cloud is a synced copy, never the source of truth on Sunday
+- [ ] Automatic local backups: a snapshot after every successful save (keep the last 5 good states) plus one per day for 30 days, each integrity-checked, with one-click restore. Backups never run mid-service and never fill the disk (pre-flight warns first)
+- [ ] Encoder self-test and fallback: on install, after driver updates and in pre-flight, encode a few seconds with each available encoder and pick the first that works (Media Foundation, vendor plugin, then x264). The encoder runs where the watchdog can restart it without losing the recording
 - [ ] Keyboard and clicker control on the computer itself
 - [ ] Blocks sleep during services; no updates during service windows; signed auto-updates with rollback
 
@@ -193,6 +201,8 @@ The smallest product a pilot church can run a whole service on, with every relia
 - [ ] Church account, Stripe checkout, license key, 30-day trial
 - [ ] Feature gating by release date: every gated feature has a `releasedAt`; a license unlocks local features released before its updates window ends and cloud features while Plus is active. Checked offline, never during a service window, never shown to volunteers or on screen
 - [ ] Export of songs, run sheets, themes and settings in open formats, available on every license
+- [ ] Sync engine between the church computer and Supabase: queues edits made offline, syncs when the connection returns, resolves edits made in two places (per-field last-writer-wins with a visible "changed elsewhere" notice; songs keep both versions), and shows sync status. Pauses cleanly when Plus ends, leaving the local copy complete. Chaos test: edit on two devices while the internet is cut
+- [ ] System screen for tech leads: sync status and last sync, local backups (browse, restore, export), cameras, audio and encoders (with the self-test result), disk space, license and updates. Locked behind the admin PIN once roles exist; hidden in volunteer mode
 
 **Done when:** 3 pilot churches run 4 Sundays each with zero service-stopping failures, and a first-time volunteer runs a service after a 5-minute walkthrough.
 
@@ -320,9 +330,9 @@ This plan is the source of truth for whoever (or whichever Claude session) is bu
 
 **Order to start in**
 
-1. Stage 0 tech spike (daemon prototype: lyrics over camera, hardware encode, YouTube upload)
-2. `packages/protocol` and a simulated daemon
-3. Website and demo on Cloudflare Pages
+1. Stage 0 tech spike (daemon prototype: lyrics over camera, hardware encode, YouTube upload) — in progress
+2. `packages/protocol` and a simulated daemon — done
+3. Website and demo on Cloudflare Pages — website done; demo not started
 4. Stage 1 items
 
 ## Costs, pricing and business

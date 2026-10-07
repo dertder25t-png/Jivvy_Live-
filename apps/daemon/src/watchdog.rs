@@ -32,7 +32,37 @@ pub fn next_delay(previous: Duration, ran_for: Duration) -> Duration {
     }
 }
 
-fn spawn(cfg: &Config) -> std::io::Result<(Child, Arc<AtomicU64>)> {
+/// Time since the engine's last heartbeat, on the monotonic clock: a wall-clock
+/// correction (common on church PCs) must never hide a hung engine.
+#[derive(Clone)]
+pub struct Heartbeat {
+    start: Instant,
+    /// Milliseconds after `start` of the last beat.
+    last: Arc<AtomicU64>,
+}
+
+impl Heartbeat {
+    /// Starts counting as if a beat just arrived.
+    pub fn new() -> Self {
+        Heartbeat { start: Instant::now(), last: Arc::new(AtomicU64::new(0)) }
+    }
+
+    pub fn beat(&self) {
+        self.last.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn silence(&self) -> Duration {
+        self.start.elapsed().saturating_sub(Duration::from_millis(self.last.load(Ordering::Relaxed)))
+    }
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn spawn(cfg: &Config) -> std::io::Result<(Child, Heartbeat)> {
     let mut child = Command::new(&cfg.engine)
         .args(&cfg.engine_args)
         .arg("--supervised")
@@ -40,18 +70,18 @@ fn spawn(cfg: &Config) -> std::io::Result<(Child, Arc<AtomicU64>)> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
-    let last = Arc::new(AtomicU64::new(crate::now_ms()));
+    let heartbeat = Heartbeat::new();
     let stdout = child.stdout.take().expect("piped stdout");
-    let beat = last.clone();
+    let beat = heartbeat.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if line.trim() == crate::HEARTBEAT_LINE {
-                beat.store(crate::now_ms(), Ordering::Relaxed);
+                beat.beat();
             }
         }
     });
-    Ok((child, last))
+    Ok((child, heartbeat))
 }
 
 /// Runs forever.
@@ -60,7 +90,7 @@ pub fn run(cfg: Config) -> ! {
     loop {
         std::thread::sleep(delay);
         let started = Instant::now();
-        let (mut child, last_beat) = match spawn(&cfg) {
+        let (mut child, heartbeat) = match spawn(&cfg) {
             Ok(c) => c,
             Err(e) => {
                 crate::log("watchdog", format!("could not start engine {}: {e}", cfg.engine.display()));
@@ -76,11 +106,11 @@ pub fn run(cfg: Config) -> ! {
                 Ok(None) => {}
                 Err(e) => break format!("wait failed ({e})"),
             }
-            let silent = crate::now_ms().saturating_sub(last_beat.load(Ordering::Relaxed));
-            if silent > cfg.hang_timeout.as_millis() as u64 {
+            let silent = heartbeat.silence();
+            if silent > cfg.hang_timeout {
                 let _ = child.kill();
                 let _ = child.wait();
-                break format!("hung (no heartbeat for {silent} ms); killed");
+                break format!("hung (no heartbeat for {} ms); killed", silent.as_millis());
             }
         };
         println!("engine stopped pid={} reason={reason}", child.id());
@@ -92,6 +122,16 @@ pub fn run(cfg: Config) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_silence_grows_until_the_next_beat() {
+        let hb = Heartbeat::new();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(hb.silence() >= Duration::from_millis(60));
+        let other_thread = hb.clone();
+        std::thread::spawn(move || other_thread.beat()).join().unwrap();
+        assert!(hb.silence() < Duration::from_millis(60));
+    }
 
     #[test]
     fn restarts_immediately_after_a_long_run_and_backs_off_on_a_crash_loop() {

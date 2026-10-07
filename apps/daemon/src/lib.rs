@@ -16,7 +16,8 @@ pub const HEARTBEAT_LINE: &str = "hb";
 /// Default address for the local command channel (loopback until the secure channel lands).
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:47800";
 
-/// Milliseconds since the Unix epoch.
+/// Milliseconds since the Unix epoch. Wall clock: for timestamps only, never for measuring
+/// how long something took (it can jump when the system clock is corrected; use `Instant`).
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

@@ -101,6 +101,28 @@ pub fn serve(listener: TcpListener, engine: Arc<Mutex<Engine>>) {
     }
 }
 
+/// Skips input up to and including the next newline (or end of stream) without keeping
+/// any of it, so a client that never sends a newline can't grow our memory: only the
+/// reader's own fixed-size buffer is ever used. Returns how many bytes were skipped.
+fn discard_line(reader: &mut impl BufRead) -> std::io::Result<u64> {
+    let mut skipped = 0u64;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(skipped);
+        }
+        let (used, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (buf.len(), false),
+        };
+        reader.consume(used);
+        skipped += used as u64;
+        if done {
+            return Ok(skipped);
+        }
+    }
+}
+
 fn serve_connection(stream: TcpStream, engine: &Mutex<Engine>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let mut out = stream.try_clone()?;
@@ -113,9 +135,7 @@ fn serve_connection(stream: TcpStream, engine: &Mutex<Engine>) -> std::io::Resul
             return Ok(());
         }
         let ack = if n > MAX_LINE && buf.last() != Some(&b'\n') {
-            // Drop the rest of an oversized line rather than buffering it.
-            let mut skip = Vec::new();
-            reader.read_until(b'\n', &mut skip)?;
+            discard_line(&mut reader)?;
             protocol::nack("", ErrorCode::BadMessage, "message too long")
         } else {
             // Invalid UTF-8 becomes a bad_message nack, never a dropped connection.
@@ -204,6 +224,38 @@ mod tests {
         let r =
             serde_json::to_value(e.handle_line(r#"{"v":9,"id":"z","ts":1,"command":{"type":"slide.next"}}"#)).unwrap();
         assert_eq!((r["code"].clone(), r["id"].clone()), (json!("unsupported_version"), json!("z")));
+    }
+
+    /// Yields `len` bytes of 'x' without allocating them, then `tail`.
+    struct Flood {
+        len: u64,
+        tail: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl Read for Flood {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.len == 0 {
+                return self.tail.read(out);
+            }
+            let n = out.len().min(self.len as usize);
+            out[..n].fill(b'x');
+            self.len -= n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn discarding_a_huge_line_keeps_nothing_and_the_next_message_still_reads() {
+        let flood = 256 * 1024 * 1024; // would be a 256 MiB allocation if it were retained
+        let tail = b"\n{\"next\":1}\n".to_vec();
+        let mut r = BufReader::with_capacity(8 * 1024, Flood { len: flood, tail: std::io::Cursor::new(tail) });
+        assert_eq!(discard_line(&mut r).unwrap(), flood + 1);
+        let mut next = String::new();
+        r.read_line(&mut next).unwrap();
+        assert_eq!(next, "{\"next\":1}\n");
+        // A stream that ends without a newline just stops.
+        let mut r = BufReader::new(Flood { len: 100_000, tail: std::io::Cursor::new(Vec::new()) });
+        assert_eq!(discard_line(&mut r).unwrap(), 100_000);
     }
 
     #[test]

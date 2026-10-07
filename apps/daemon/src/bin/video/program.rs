@@ -15,11 +15,9 @@ use jivvy_daemon::log;
 use jivvy_daemon::lyrics;
 use jivvy_daemon::program::{
     AUDIO_CHANNELS, AUDIO_CHUNK, AUDIO_RATE, AudioFifo, EncoderChoice, FrameSource, ProgramConfig, ProgramStatus,
-    encoder_order, frame_source, frames_due, lines_for, next_frame_at,
+    Trial, encoder_order, frame_fits, frame_source, frames_due, judge_trial, lines_for, next_frame_at,
 };
 
-/// How long an encoder gets to produce its first frame before the next one is tried.
-const TRIAL: Duration = Duration::from_secs(4);
 /// After every encoder failed, wait this long before trying the list again.
 const RETRY: Duration = Duration::from_secs(1);
 
@@ -49,9 +47,16 @@ struct Sources {
 }
 
 enum State {
-    Trying { index: usize, since: Instant },
+    /// `baseline`: frames encoded (by any earlier pipeline) when this trial began.
+    Trying {
+        index: usize,
+        since: Instant,
+        baseline: u64,
+    },
     Running,
-    Failed { retry_at: Instant },
+    Failed {
+        retry_at: Instant,
+    },
 }
 
 pub struct Program {
@@ -168,6 +173,8 @@ impl Program {
         let sources: Arc<Mutex<Sources>> = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
         start_pacers(&cfg, sources.clone(), feed.clone(), alive.clone());
+        let (last_frames, last_bytes) =
+            (feed.frames_encoded.load(Ordering::Relaxed), feed.bytes_encoded.load(Ordering::Relaxed));
         let mut p = Program {
             cfg,
             gpu,
@@ -180,8 +187,9 @@ impl Program {
             current: None,
             alive,
             detail: String::new(),
-            last_frames: 0,
-            last_bytes: 0,
+            // The feed's counters outlive programs: measure from where they are now.
+            last_frames,
+            last_bytes,
             out_fps: 0.0,
             kbps: 0.0,
         };
@@ -223,7 +231,8 @@ impl Program {
             Ok(()) => {
                 log("video", format!("program: trying encoder {}", enc.name()));
                 self.current = Some(enc);
-                self.state = State::Trying { index, since: Instant::now() };
+                let baseline = self.feed.frames_encoded.load(Ordering::Relaxed);
+                self.state = State::Trying { index, since: Instant::now(), baseline };
             }
             Err(e) => {
                 self.detail = format!("{}: {e}", enc.name());
@@ -295,20 +304,26 @@ impl Program {
         }
         let encoded = self.feed.frames_encoded.load(Ordering::Relaxed);
         match self.state {
-            State::Trying { index, since } => {
+            State::Trying { index, since, baseline } => {
                 let enc = self.order[index];
                 if let Some(e) = error {
                     self.detail = format!("{}: {e}", enc.name());
                     log("video", format!("program: {}", self.detail));
                     self.try_encoder(index + 1);
-                } else if encoded > self.last_frames {
-                    log("video", format!("program: running on {}", enc.name()));
-                    self.detail.clear();
-                    self.state = State::Running;
-                } else if since.elapsed() > TRIAL {
-                    self.detail = format!("{} produced no frames", enc.name());
-                    log("video", format!("program: {}", self.detail));
-                    self.try_encoder(index + 1);
+                } else {
+                    match judge_trial(encoded, baseline, since.elapsed()) {
+                        Trial::Working => {
+                            log("video", format!("program: running on {}", enc.name()));
+                            self.detail.clear();
+                            self.state = State::Running;
+                        }
+                        Trial::NoOutput => {
+                            self.detail = format!("{} produced no frames", enc.name());
+                            log("video", format!("program: {}", self.detail));
+                            self.try_encoder(index + 1);
+                        }
+                        Trial::Waiting => {}
+                    }
                 }
             }
             State::Running => {
@@ -371,7 +386,7 @@ impl Drop for Program {
 /// Starts the two pacer threads. They run until the `Program` is dropped and push into
 /// whatever pipeline it currently has, so an encoder restart picks up seamlessly.
 fn start_pacers(cfg: &ProgramConfig, sources: Arc<Mutex<Sources>>, feed: Arc<Feed>, alive: Arc<AtomicBool>) {
-    let (fps, frame) = (cfg.fps, cfg.frame_duration());
+    let (fps, frame, width, height) = (cfg.fps, cfg.frame_duration(), cfg.width, cfg.height);
     let slate = slate(cfg);
     let (s, f, a) = (sources.clone(), feed.clone(), alive.clone());
     std::thread::spawn(move || {
@@ -398,7 +413,7 @@ fn start_pacers(cfg: &ProgramConfig, sources: Arc<Mutex<Sources>>, feed: Arc<Fee
                 let source = frame_source(latest.as_ref().map(|(at, _)| at.elapsed()));
                 f.slate.store(source == FrameSource::Slate, Ordering::Relaxed);
                 let base = match (source, latest) {
-                    (FrameSource::Camera, Some((_, b))) => b,
+                    (FrameSource::Camera, Some((_, b))) if frame_fits(b.size(), width, height) => b,
                     _ => slate.clone(),
                 };
                 // A shallow copy shares the pixels; only the timestamps are new.

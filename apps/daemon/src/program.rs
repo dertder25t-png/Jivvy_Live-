@@ -139,6 +139,42 @@ pub fn next_frame_at(sent: u64, fps: u32) -> Duration {
     Duration::from_nanos(((sent as u128 + 1) * 1_000_000_000).div_ceil(fps.max(1) as u128) as u64)
 }
 
+/// How long an encoder gets to produce its first frame before the next one is tried.
+pub const ENCODER_TRIAL: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trial {
+    Waiting,
+    /// The encoder produced a frame: it works.
+    Working,
+    /// Nothing within `ENCODER_TRIAL`: try the next encoder.
+    NoOutput,
+}
+
+/// Judges an encoder trial from the cumulative encoded-frame count. `baseline` is the
+/// count when this trial began, so frames from an earlier pipeline (before a config change
+/// or an encoder restart) never make a silent encoder look like it works.
+pub fn judge_trial(encoded: u64, baseline: u64, elapsed: Duration) -> Trial {
+    if encoded > baseline {
+        Trial::Working
+    } else if elapsed > ENCODER_TRIAL {
+        Trial::NoOutput
+    } else {
+        Trial::Waiting
+    }
+}
+
+/// Bytes in one NV12 frame.
+pub fn nv12_size(width: u32, height: u32) -> usize {
+    width as usize * height as usize * 3 / 2
+}
+
+/// Whether a camera buffer holds a whole frame at the program size. A frame left over from
+/// another size never goes into the program (the slate does instead).
+pub fn frame_fits(buffer_size: usize, width: u32, height: u32) -> bool {
+    buffer_size >= nv12_size(width, height)
+}
+
 /// Microphone samples waiting to go into the program (interleaved S16, stereo).
 #[derive(Debug, Default)]
 pub struct AudioFifo {
@@ -245,6 +281,23 @@ mod tests {
         assert_eq!(frames_due(Duration::from_millis(1000), 30), 30);
         assert_eq!(frames_due(Duration::from_millis(1033), 30), 30);
         assert_eq!(frames_due(Duration::from_secs(3600), 30), 108_000);
+    }
+
+    #[test]
+    fn an_encoder_trial_only_counts_frames_produced_after_it_began() {
+        // An earlier pipeline encoded 5,000 frames; the replacement hasn't produced any.
+        let baseline = 5_000;
+        assert_eq!(judge_trial(5_000, baseline, Duration::from_millis(250)), Trial::Waiting);
+        assert_eq!(judge_trial(5_000, baseline, Duration::from_secs(5)), Trial::NoOutput, "a hung encoder is replaced");
+        assert_eq!(judge_trial(5_001, baseline, Duration::from_millis(500)), Trial::Working);
+        assert_eq!(judge_trial(0, 0, Duration::from_secs(1)), Trial::Waiting);
+    }
+
+    #[test]
+    fn a_frame_from_another_size_never_reaches_the_program() {
+        assert!(frame_fits(nv12_size(1920, 1080), 1920, 1080));
+        assert!(frame_fits(nv12_size(1920, 1080) + 4096, 1920, 1080), "row padding is fine");
+        assert!(!frame_fits(nv12_size(1280, 720), 1920, 1080), "an old 720p frame after switching to 1080p");
     }
 
     #[test]

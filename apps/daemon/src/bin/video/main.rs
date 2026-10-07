@@ -348,10 +348,13 @@ fn main() {
                 .is_some_and(|p| (p.config().width, p.config().height) != (program_cfg.width, program_cfg.height));
             if program.as_ref().map(|p| p.config()) != Some(&program_cfg) {
                 drop(program.take()); // stops the old one first
-                program = Some(Program::new(program_cfg.clone(), feed.clone(), font));
                 if resized {
+                    // Stop capturing at the old size and forget its last frame before the new
+                    // program starts, so no old-size frame is pushed under the new size's caps.
                     inputs[0].stop();
+                    *feed.frame.lock().unwrap() = None;
                 }
+                program = Some(Program::new(program_cfg.clone(), feed.clone(), font));
             }
             if let (Some(p), Some(e)) = (program.as_mut(), elapsed) {
                 p.measure(e);

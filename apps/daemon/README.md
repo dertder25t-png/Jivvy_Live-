@@ -44,6 +44,7 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
   `use` is `auto`, `none`, `test` (test pattern / tone) or `device`.
 - **Never a different camera by surprise.** `auto` picks the default (or first) device once and stays on it until `media.json` changes, even across restarts (`media-memory.json`). A configured device is matched by id; by name only when its id changed (e.g. another USB port) and that name has never belonged to two devices at once, so unplugging one of two identical cameras never switches to the other.
 - **Unplugged or failed device:** the input shows `waiting` with the reason and is retried every second; it comes back by itself.
+- **Device discovery never blocks the main loop.** Devices are listed on their own thread (listing can take a second or more, longer with a bad USB driver); a blocked main loop would miss heartbeats and get the process killed as hung. At start-up the program comes first, then the device monitor.
 - **`connected`** in `media-status.json` means the engine acknowledged the latest level report or check (checked at least once a second, even with no microphone).
 - **Live meter:** levels (peak and RMS dBFS per channel) reach every subscribed screen as `levels` events. The meter widget comes with the operator view.
 
@@ -95,9 +96,10 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | Kill the engine while outputs show slide 6 | Outputs keep showing it (never blank), reconnect, and follow the restarted engine; the outputs process itself is not restarted |
 | Kill the outputs process | Back on the current slide in under 3 s |
 | Unplug the projector, plug it back, then save a broken `outputs.json` | Output closes (never moves to the operator's screen), reopens, and keeps running on the last good config |
-| Kill the video process (test pattern + tone) | Restarted; audio levels reach screens again 2.3 s after the kill |
+| Kill the video process (test pattern + tone) | Restarted; the program is fed again first, then the inputs; audio levels reach screens again about 4–6 s after the kill (most of it is GStreamer loading its GPU and encoder plugins) |
 | Configured camera missing | Camera `waiting`, audio keeps running; the camera starts within a second of becoming available |
 | Program on test sources | Runs at > 25 fps, lyric layer follows slide changes and black |
 | Camera unplugged and microphone removed mid-program | Slate on, still ~30 fps (≥ 50 frames in 2 s), same encoder, never restarted; off the slate when the camera returns |
+| Change the program size mid-run (1080p → 720p) | Back running at the new size on the camera at full rate, no encoder failure, and the video process is not restarted |
 
 On the founder's laptop with real devices: Laptop Camera at 30 fps, the microphone array reporting levels ten times a second, the speaker loopback and duplicate camera entries filtered out.

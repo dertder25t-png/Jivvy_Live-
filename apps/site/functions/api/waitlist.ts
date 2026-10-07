@@ -22,8 +22,17 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   if (!env.DB) return json({ ok: false, error: "Signups are not open yet. Please email jivvysystems@gmail.com." }, 503);
   try {
     await env.DB.prepare(
-      "INSERT INTO waitlist (email, church, size, software) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(email) DO UPDATE SET church = ?2, size = ?3, software = ?4",
-    ).bind(v.value.email, v.value.church, v.value.size, v.value.software).run();
+      // Signing up again only adds information: blank fields keep the earlier answers,
+      // and an unticked box never removes someone from the alpha tester list.
+      "INSERT INTO waitlist (email, church, size, software, alpha_tester) VALUES (?1, ?2, ?3, ?4, ?5) " +
+        "ON CONFLICT(email) DO UPDATE SET " +
+        "church = CASE WHEN ?2 <> '' THEN ?2 ELSE church END, " +
+        "size = CASE WHEN ?3 <> '' THEN ?3 ELSE size END, " +
+        "software = CASE WHEN ?4 <> '' THEN ?4 ELSE software END, " +
+        "alpha_tester = MAX(alpha_tester, ?5)",
+    )
+      .bind(v.value.email, v.value.church, v.value.size, v.value.software, v.value.alphaTester ? 1 : 0)
+      .run();
   } catch {
     return json({ ok: false, error: "Something went wrong on our side. Please try again." }, 500);
   }

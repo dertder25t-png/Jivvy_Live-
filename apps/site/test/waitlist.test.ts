@@ -4,7 +4,13 @@ import { validateWaitlist } from "../src/lib/waitlist";
 describe("validateWaitlist", () => {
   it("accepts and normalizes a good entry", () => {
     const r = validateWaitlist({ email: "  Tech@Church.org ", church: "Grace", size: "100-250", software: "ProPresenter" });
-    expect(r).toMatchObject({ ok: true, spam: false, value: { email: "tech@church.org", church: "Grace" } });
+    expect(r).toMatchObject({ ok: true, spam: false, value: { email: "tech@church.org", church: "Grace", alphaTester: false } });
+  });
+  it("reads the alpha tester checkbox from a form post or JSON", () => {
+    for (const alpha of ["on", true, "true", " YES "])
+      expect(validateWaitlist({ email: "a@b.co", alpha })).toMatchObject({ ok: true, value: { alphaTester: true } });
+    for (const alpha of [undefined, "", "off", false, 1, "no"])
+      expect(validateWaitlist({ email: "a@b.co", alpha })).toMatchObject({ ok: true, value: { alphaTester: false } });
   });
   it("rejects bad emails and non-objects", () => {
     for (const x of [null, "x", {}, { email: "nope" }, { email: "a@b" }, { email: 5 }])

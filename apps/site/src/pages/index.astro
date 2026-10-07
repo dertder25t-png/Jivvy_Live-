@@ -1,10 +1,7 @@
 ---
-import { bookingUrl, CONTACT_EMAIL } from "../lib/booking";
 import { PRICING, plusMonthly } from "../lib/pricing";
 
-// Set PUBLIC_BOOKING_URL (a Google Calendar booking page) in the Cloudflare build
-// settings; without it the booking section falls back to email.
-const booking = bookingUrl(import.meta.env.PUBLIC_BOOKING_URL);
+const CONTACT_EMAIL = "jivvysystems@gmail.com";
 const features = [
   ["Run sheet", "Songs, scripture, images, PDF slides, countdowns and a pre-service loop, all in order for Sunday."],
   ["Song editor", "Arrangement blocks, paste-to-slides with verse and chorus detection, and a public-domain hymn library."],
@@ -21,7 +18,8 @@ const faqs = [
   ["Does my video go through your servers?", "No. Video goes straight from your church to YouTube, Facebook and other platforms. We never touch it, so there is no relay to go down on a Sunday."],
   ["Can a volunteer run it?", "That is the design goal: a locked volunteer view, plain-English messages, and a 30-second pre-flight check before every service."],
   ["How much will it cost?", `Planned pricing is a one-time $${PRICING.oneTime} per church with unlimited users and devices, including the first year of Plus updates. After that, Plus is $${PRICING.plusYearly} a year. There is a ${PRICING.trialDays}-day free trial.`],
-  ["Is it ready today?", "Not yet. We are building it with a small group of pilot churches first, because a service must never stop because of our software. Join the list and we will tell you when it is ready to try."],
+  ["Is it ready today?", "Not yet. We are building the whole system and testing it ourselves first, because a service must never stop because of our software. Join the waitlist and we will email you when alpha testing opens, and again when Jivvy Live launches."],
+  ["Can my church help test it?", "Yes. Tick \"I'd like to help test the alpha\" when you join the waitlist. When alpha testing opens, testers try Jivvy Live before launch and tell us what to fix."],
 ];
 const promises = [
   ["Works without the cloud", "Slides, stream, recording and control all run on your computer and your Wi-Fi."],
@@ -35,7 +33,7 @@ const promises = [
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Jivvy Live: church slides and streaming that never stops</title>
-    <meta name="description" content="Lyrics, slides, streaming and recording for churches. Runs on your own computer so a service never stops because of the internet. Join the founding church list." />
+    <meta name="description" content="Lyrics, slides, streaming and recording for churches. Runs on your own computer so a service never stops because of the internet. Join the waitlist to hear when alpha testing opens." />
     <meta name="theme-color" content="#10224F" />
     <link rel="icon" href="/brand/jivvy-app-icon.svg" type="image/svg+xml" />
     <meta property="og:title" content="Jivvy Live" />
@@ -50,7 +48,7 @@ const promises = [
         <a href="#features">Features</a>
         <a href="#pricing">Pricing</a>
         <a href="#faq">FAQ</a>
-        <a class="btn small" href="#join">Join the list</a>
+        <a class="btn small" href="#join">Join the waitlist</a>
       </nav>
     </header>
 
@@ -59,8 +57,8 @@ const promises = [
         <p class="eyebrow">For church tech teams</p>
         <h1>Sunday never stops <span class="spark">because of us.</span></h1>
         <p class="lead">Lyrics, slides, streaming and recording that run on your own computer. If the internet drops, your service keeps going.</p>
-        <a class="btn" href="#join">Join the founding church list</a>
-        <p class="note">In development with pilot churches. Not yet released.</p>
+        <a class="btn" href="#join">Join the waitlist</a>
+        <p class="note">In development. Not yet released.</p>
       </section>
 
       <section class="wrap cards" aria-label="What makes it different">
@@ -71,7 +69,7 @@ const promises = [
 
       <section class="wrap" id="features">
         <h2 class="section">Features</h2>
-        <p class="sub">What a pilot church runs a whole Sunday on. Planned for the first release.</p>
+        <p class="sub">Everything a church needs to run a whole Sunday. Planned for the first release.</p>
         <ul class="features">
           {features.map(([t, d]) => (
             <li><h3>{t}</h3><p>{d}</p></li>
@@ -112,8 +110,8 @@ const promises = [
       </section>
 
       <section class="wrap join" id="join">
-        <h2 class="section">Founding church list</h2>
-        <p>Tell us a little about your church. We will reach out as pilots open up.</p>
+        <h2 class="section">Waitlist</h2>
+        <p>Get an email when alpha testing opens, and another when Jivvy Live launches. We only email you about those two things.</p>
         <form id="wl" method="post" action="/api/waitlist">
           <label>Email <input name="email" type="email" required autocomplete="email" /></label>
           <label>Church name <input name="church" type="text" autocomplete="organization" /></label>
@@ -123,23 +121,16 @@ const promises = [
             </select>
           </label>
           <label>Software you use today <input name="software" type="text" placeholder="ProPresenter, EasyWorship, ..." /></label>
+          <label class="check"><input name="alpha" type="checkbox" /> <span>I'd like to help test the alpha</span></label>
           <input class="hp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true" />
-          <button class="btn" type="submit">Join the list</button>
+          <button class="btn" type="submit">Join the waitlist</button>
           <p id="msg" role="status" aria-live="polite"></p>
         </form>
       </section>
 
-      <section class="wrap book" id="book">
+      <section class="wrap ask" id="questions">
         <h2 class="section">Got questions?</h2>
-        {booking ? (
-          <>
-            <p>Book a call with the founder at a time that suits you.</p>
-            <a class="btn" href={booking} target="_blank" rel="noopener noreferrer">Book a call</a>
-            <p class="note">Opens Google Calendar in a new tab. Rather not call? Email <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.</p>
-          </>
-        ) : (
-          <p>Email <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a> and we will get back to you.</p>
-        )}
+        <p>Email <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a> and we will get back to you.</p>
       </section>
     </main>
 
@@ -155,7 +146,7 @@ const promises = [
         try {
           const r = await fetch(f.action, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(f))) });
           const j = await r.json().catch(() => ({}));
-          if (r.ok && j.ok) { f.reset(); m.textContent = "Thank you. You are on the list."; }
+          if (r.ok && j.ok) { f.reset(); m.textContent = "Thank you. We will email you when alpha testing opens."; }
           else m.textContent = j.error || "Something went wrong. Please try again.";
         } catch { m.textContent = "Could not reach us. Check your connection and try again."; }
       });
@@ -203,13 +194,15 @@ const promises = [
       .amount span { font-size:1rem; font-weight:500; opacity:.8; }
       .price ul { margin:0; padding-left:1.2em; opacity:.9; }
       .price li { margin:4px 0; }
-      .book { padding-bottom:72px; }
-      .book a:not(.btn) { color:var(--paper); }
+      .ask { padding-bottom:72px; }
+      .ask a { color:var(--paper); }
       #faq { padding-bottom:56px; }
       .join { padding-bottom:72px; }
       form { display:grid; gap:14px; max-width:520px; }
       label { display:grid; gap:6px; font-weight:600; font-size:.95rem; }
       input, select { font:inherit; padding:12px; border:2px solid transparent; background:var(--paper); color:var(--navy); border-radius:0; }
+      .check { display:flex; align-items:center; gap:10px; font-weight:600; cursor:pointer; }
+      .check input { width:22px; height:22px; padding:0; margin:0; accent-color:var(--blue); flex:none; }
       .hp { position:absolute; left:-9999px; }
       #msg { min-height:1.5em; margin:0; }
       .foot { padding-top:24px; padding-bottom:40px; font-size:.9rem; opacity:.75; }

@@ -245,7 +245,7 @@ fn start(input: &mut Input, devices: &DeviceCache, feed: &Arc<Feed>, cfg: &Progr
                         let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                         if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
                             let samples: Vec<i16> =
-                                map.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+                                map.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect();
                             feed.audio.lock().unwrap().push(&samples);
                         }
                         Ok(gst::FlowSuccess::Ok)

@@ -72,6 +72,7 @@ export class SimDaemon implements DaemonLike {
         break;
       case "state.get":
       case "state.subscribe": // in memory, subscribers use subscribe(); the ack is the same
+      case "media.levels": // the simulated daemon has no audio input to relay
         break;
     }
     return ack(e.id, this.snapshotForUi());

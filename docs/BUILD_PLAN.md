@@ -158,7 +158,8 @@ Everything a church needs to run a whole service, with every reliability feature
   - Done (`apps/daemon`): the snapshot is saved before every change is acknowledged. Chaos tests: 100 kills, slowest return to the same slide 1.68 s; a hung engine is restarted after 2 s without a heartbeat; the engine exits if the watchdog dies; a corrupted snapshot falls back to the previous one.
 - [x] Fullscreen output windows per monitor, custom resolutions (reuse the GameWall DisplayHost pattern)
   - Done (`jivvy-outputs`): its own supervised process that follows the engine, so an engine restart never blanks a screen. Automatic on every non-operator monitor, or `outputs.json` for named outputs and custom (letterboxed) resolutions; never falls back to the operator's screen; hot-plug re-checked every second. Shows "Slide N" until run sheets reach the engine; configuring outputs from the UI comes with the System screen.
-- [ ] Camera/capture card and audio interface input, with live audio meter
+- [x] Camera/capture card and audio interface input, with live audio meter
+  - Done (`jivvy-video`): camera and audio as separate GStreamer pipelines, chosen in `media.json` (auto by default), retried every second when unplugged, never swapped for another device. Levels reach every screen ten times a second as `levels` events; the meter widget itself comes with the operator view. Tested on the laptop camera (30 fps) and microphone, and on test sources in CI (Linux).
 - [ ] Lyric layer composited over camera, hardware encode, one encode sent to stream and recording
 - [ ] Streaming per the Streaming design section: YouTube segment upload with retries, RTMPS for other platforms, bandwidth manager with Auto and Advanced modes, two-connection support. Build and test against a local RTMP/HLS test server; verify on a private YouTube event once the channel can go live
 - [ ] Crash-safe local recording

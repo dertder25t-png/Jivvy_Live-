@@ -89,6 +89,13 @@ impl Engine {
                 return protocol::nack(id, ErrorCode::Unavailable, "streaming is not built into this daemon yet");
             }
             Command::StateGet => {}
+            Command::MediaLevels(levels) => {
+                // Live meter data: relayed, never saved, never a state change.
+                if let Ok(line) = serde_json::to_vec(&protocol::levels_event(&levels)) {
+                    self.send_to_subscribers(line);
+                }
+                return protocol::ack(id, None);
+            }
             Command::StateSubscribe => match outbox {
                 Some(o) => self.subscribers.push(o.clone()),
                 None => return protocol::nack(id, ErrorCode::Unavailable, "this connection can't receive events"),
@@ -111,7 +118,12 @@ impl Engine {
     /// whose queue is full is disconnected (it reconnects and resubscribes), and one whose
     /// connection is gone is dropped.
     fn broadcast(&mut self) {
-        let Ok(mut line) = serde_json::to_vec(&protocol::state_event(self.view())) else { return };
+        if let Ok(line) = serde_json::to_vec(&protocol::state_event(self.view())) {
+            self.send_to_subscribers(line);
+        }
+    }
+
+    fn send_to_subscribers(&mut self, mut line: Vec<u8>) {
         line.push(b'\n');
         self.subscribers.retain(|s| match s.tx.try_send(line.clone()) {
             Ok(()) => true,
@@ -364,6 +376,24 @@ mod tests {
 
         // Without a connection there's nowhere to send events.
         assert_eq!(send(&mut e, json!({ "type": "state.subscribe" }))["code"], json!("unavailable"));
+    }
+
+    #[test]
+    fn levels_are_relayed_to_subscribers_without_touching_the_saved_state() {
+        let (mut e, dir) = engine("levels", 10);
+        let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
+        e.handle_line_from(
+            r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#,
+            Some(&Outbox::new(tx, None)),
+        );
+        let r = send(&mut e, json!({ "type": "media.levels", "peakDb": [-6.0, -7.5], "rmsDb": [-18.0, -20.0] }));
+        assert_eq!(r["ok"], json!(true));
+        let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            ev,
+            json!({ "v": 1, "event": "levels", "levels": { "peakDb": [-6.0, -7.5], "rmsDb": [-18.0, -20.0] } })
+        );
+        assert!(!dir.join("state.json").exists(), "levels must never be written to disk");
     }
 
     #[test]

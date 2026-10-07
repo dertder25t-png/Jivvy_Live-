@@ -1,7 +1,9 @@
 //! Chaos tests for the reliability table's "Video engine crashes" row: kill the engine
 //! over and over and require it back on the same slide in under 3 s; and for the output
 //! windows (run headless): screens never blank while the engine restarts, a killed outputs
-//! process comes back on the current slide, and monitors can come and go.
+//! process comes back on the current slide, and monitors can come and go. With the `video`
+//! feature, also camera and audio input (GStreamer test sources): levels reach screens,
+//! survive a video crash, and a missing camera never stops the audio.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +20,8 @@ struct Daemon {
     watchdog: Child,
     engine_starts: Receiver<u32>,
     outputs_starts: Receiver<u32>,
+    #[allow(dead_code)] // only read by the video tests
+    video_starts: Receiver<u32>,
     addr: String,
     data_dir: PathBuf,
 }
@@ -40,18 +44,24 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Starts the watchdog without output windows (they're covered by the headless tests).
+/// Starts the watchdog without output windows (they're covered by the headless tests)
+/// and without camera/audio (never open the real camera during tests).
 fn start(name: &str, slides: u64) -> Daemon {
     start_in(test_dir(name), slides, false)
 }
 
 fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
+    start_with(data_dir, slides, headless_outputs, &["--no-video"])
+}
+
+fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&str]) -> Daemon {
     let addr = format!("127.0.0.1:{}", free_port());
     let outputs_flag = if headless_outputs { "--outputs-headless" } else { "--no-outputs" };
     let mut watchdog = Command::new(env!("CARGO_BIN_EXE_jivvy-watchdog"))
         .args(["--engine", env!("CARGO_BIN_EXE_jivvy-engine"), "--outputs", env!("CARGO_BIN_EXE_jivvy-outputs")])
         .args(["--data-dir", data_dir.to_str().unwrap(), "--listen", &addr, "--slides", &slides.to_string()])
         .arg(outputs_flag)
+        .args(extra)
         .env("JIVVY_TEST_HOOKS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -59,6 +69,7 @@ fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
         .unwrap();
     let (engine_tx, engine_starts) = channel();
     let (outputs_tx, outputs_starts) = channel();
+    let (video_tx, video_starts) = channel();
     let out = watchdog.stdout.take().unwrap();
     std::thread::spawn(move || {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -68,10 +79,12 @@ fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
                 let _ = engine_tx.send(pid);
             } else if let Some(pid) = started("outputs") {
                 let _ = outputs_tx.send(pid);
+            } else if let Some(pid) = started("video") {
+                let _ = video_tx.send(pid);
             }
         }
     });
-    Daemon { watchdog, engine_starts, outputs_starts, addr, data_dir }
+    Daemon { watchdog, engine_starts, outputs_starts, video_starts, addr, data_dir }
 }
 
 impl Daemon {
@@ -310,4 +323,104 @@ fn monitors_coming_and_going_never_put_an_output_on_the_operators_screen() {
         s["problems"].as_array().is_some_and(|p| !p.is_empty())
     });
     assert_eq!(output_ids(&s), ["proj"], "a broken config file keeps the screens as they were");
+}
+
+#[cfg(feature = "video")]
+mod video {
+    use super::*;
+
+    impl Daemon {
+        /// Subscribes to the engine and waits for a `levels` event matching `ok`.
+        fn wait_for_levels(&self, within: Duration, ok: impl Fn(&Value) -> bool) -> Value {
+            let deadline = Instant::now() + within;
+            while Instant::now() < deadline {
+                let Ok(mut s) = TcpStream::connect(&self.addr) else {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
+                s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                let _ = s.write_all(b"{\"v\":1,\"id\":\"m\",\"ts\":1,\"command\":{\"type\":\"state.subscribe\"}}\n");
+                let mut lines = BufReader::new(s).lines();
+                while Instant::now() < deadline {
+                    let Some(Ok(line)) = lines.next() else { break };
+                    let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                    if v["event"] == "levels" && ok(&v["levels"]) {
+                        return v["levels"].clone();
+                    }
+                }
+            }
+            panic!("no matching levels event in {within:?}");
+        }
+
+        fn media_status(&self, within: Duration, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
+            let deadline = Instant::now() + within;
+            let mut last = Value::Null;
+            while Instant::now() < deadline {
+                if let Ok(b) = std::fs::read(self.data_dir.join("media-status.json"))
+                    && let Ok(v) = serde_json::from_slice::<Value>(&b)
+                {
+                    if ok(&v) {
+                        return v;
+                    }
+                    last = v;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("video never reached: {what}; last status {last}");
+        }
+    }
+
+    fn start_video(name: &str, media_json: &str) -> Daemon {
+        let dir = test_dir(name);
+        std::fs::write(dir.join("media.json"), media_json).unwrap();
+        start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")])
+    }
+
+    /// A -6 dBFS test tone (volume 0.5), give or take.
+    fn is_test_tone(levels: &Value) -> bool {
+        levels["peakDb"]
+            .as_array()
+            .is_some_and(|p| !p.is_empty() && p.iter().all(|v| (-9.0..=-3.0).contains(&v.as_f64().unwrap())))
+    }
+
+    #[test]
+    fn audio_levels_reach_screens_and_come_back_after_a_video_crash() {
+        let d = start_video("video-levels", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
+        let video = d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        d.wait_for_levels(Duration::from_secs(10), is_test_tone);
+        let s = d.media_status(Duration::from_secs(5), "camera and microphone running", |s| {
+            s["camera"]["state"] == "running"
+                && s["camera"]["rate"].as_f64().unwrap_or(0.0) > 20.0
+                && s["microphone"]["state"] == "running"
+        });
+        assert!(s["microphone"]["rate"].as_f64().unwrap() > 5.0, "about ten level reports a second: {s}");
+        d.media_status(Duration::from_secs(3), "levels acknowledged by the engine", |s| s["connected"] == true);
+
+        let killed_at = Instant::now();
+        kill_hard(video);
+        d.video_starts.recv_timeout(RESTORE_TARGET).expect("video restarted");
+        d.wait_for_levels(Duration::from_secs(5), is_test_tone);
+        println!("levels back {:?} after the video process was killed", killed_at.elapsed());
+    }
+
+    #[test]
+    fn a_missing_camera_waits_without_stopping_the_audio_and_is_picked_up_when_it_appears() {
+        let d = start_video(
+            "video-missing",
+            r#"{"version":1,"camera":{"use":"device","id":"no-such-path","name":"Blackmagic ATEM"},"microphone":{"use":"test"}}"#,
+        );
+        let s = d.media_status(Duration::from_secs(10), "camera waiting, audio running", |s| {
+            s["camera"]["state"] == "waiting" && s["microphone"]["state"] == "running"
+        });
+        assert!(s["camera"]["detail"].as_str().unwrap().contains("Blackmagic ATEM is not connected"));
+        d.wait_for_levels(Duration::from_secs(5), is_test_tone);
+
+        // "Plugging it in": the configured source becomes available.
+        std::fs::write(
+            d.data_dir.join("media.json"),
+            r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#,
+        )
+        .unwrap();
+        d.media_status(Duration::from_secs(3), "camera running", |s| s["camera"]["state"] == "running");
+    }
 }

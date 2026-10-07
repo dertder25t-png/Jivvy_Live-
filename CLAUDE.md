@@ -14,13 +14,13 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 ## Layout
 - `apps/site` — live.jivvy.org (Astro, Cloudflare Pages + Pages Functions)
 - `apps/web` — app.jivvy.org (not started; Stage 1 alpha)
-- `apps/daemon` — church-computer app (Rust): `jivvy-watchdog` supervises `jivvy-engine` and `jivvy-outputs` (fullscreen output windows); chaos tests in `tests/chaos.rs`
+- `apps/daemon` — church-computer app (Rust): `jivvy-watchdog` supervises `jivvy-engine`, `jivvy-outputs` (fullscreen output windows) and `jivvy-video` (camera/audio, `--features video`); chaos tests in `tests/chaos.rs`
 - `packages/protocol` — versioned command protocol (TypeScript, zero runtime deps)
 - `packages/sim-daemon` — in-memory fake daemon (demo + chaos tests); must honor the same reliability contract as the real one
 
 ## Commands
 `npm install`, `npm test`, `npm run typecheck`, `npm run build`, `npm run dev:site`
-Daemon: `cargo test --release` in `apps/daemon` (includes chaos tests, ~3 min); `cargo fmt` and `cargo clippy` must be clean
+Daemon: `cargo test --release` in `apps/daemon` (includes chaos tests, ~3 min); `.\dev.ps1 test` adds the camera/audio tests (needs GStreamer); `cargo fmt` and `cargo clippy` must be clean
 
 ## Brand
 Navy #10224F, Paper #F4F1EA, Jivvy blue #2E6BFF, On-air orange #FF7A1A (small accents only, never large areas).

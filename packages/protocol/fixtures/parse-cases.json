@@ -1,0 +1,32 @@
+{
+  "about": "Conformance cases for parseEnvelope. Every implementation (TypeScript here, Rust in apps/daemon) must give these results. Add cases; never change an existing expectation without a protocol version bump.",
+  "cases": [
+    { "name": "slide.next", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": true, "command": { "type": "slide.next" } } },
+    { "name": "slide.prev", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.prev\"}}", "expect": { "ok": true, "command": { "type": "slide.prev" } } },
+    { "name": "slide.goto", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.goto\",\"index\":3}}", "expect": { "ok": true, "command": { "type": "slide.goto", "index": 3 } } },
+    { "name": "slide.goto with 3.0 is an integer", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.goto\",\"index\":3.0}}", "expect": { "ok": true, "command": { "type": "slide.goto", "index": 3 } } },
+    { "name": "output.black on", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"output.black\",\"on\":true}}", "expect": { "ok": true, "command": { "type": "output.black", "on": true } } },
+    { "name": "stream.start", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"stream.start\"}}", "expect": { "ok": true, "command": { "type": "stream.start" } } },
+    { "name": "stream.stop", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"stream.stop\"}}", "expect": { "ok": true, "command": { "type": "stream.stop" } } },
+    { "name": "state.get", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"state.get\"}}", "expect": { "ok": true, "command": { "type": "state.get" } } },
+    { "name": "unknown extra fields are ignored", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"future\":1,\"command\":{\"type\":\"slide.next\",\"extra\":1}}", "expect": { "ok": true, "command": { "type": "slide.next" } } },
+    { "name": "future version", "input": "{\"v\":2,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "unsupported_version", "id": "a" } },
+    { "name": "version 0", "input": "{\"v\":0,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "unsupported_version", "id": "a" } },
+    { "name": "fractional version", "input": "{\"v\":1.5,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "unsupported_version", "id": "a" } },
+    { "name": "invalid JSON", "input": "{", "expect": { "ok": false, "code": "bad_message" } },
+    { "name": "JSON null", "input": "null", "expect": { "ok": false, "code": "bad_message" } },
+    { "name": "JSON number", "input": "5", "expect": { "ok": false, "code": "bad_message" } },
+    { "name": "JSON array", "input": "[]", "expect": { "ok": false, "code": "bad_message" } },
+    { "name": "empty object", "input": "{}", "expect": { "ok": false, "code": "bad_message" } },
+    { "name": "empty id", "input": "{\"v\":1,\"id\":\"\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "bad_message", "id": "" } },
+    { "name": "missing ts keeps the id", "input": "{\"v\":1,\"id\":\"a\",\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "bad_message", "id": "a" } },
+    { "name": "string ts", "input": "{\"v\":1,\"id\":\"a\",\"ts\":\"1\",\"command\":{\"type\":\"slide.next\"}}", "expect": { "ok": false, "code": "bad_message", "id": "a" } },
+    { "name": "missing command", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1}", "expect": { "ok": false, "code": "bad_message", "id": "a" } },
+    { "name": "command is a number", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":7}", "expect": { "ok": false, "code": "bad_message", "id": "a" } },
+    { "name": "negative goto", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.goto\",\"index\":-1}}", "expect": { "ok": false, "code": "bad_arguments", "id": "a" } },
+    { "name": "fractional goto", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.goto\",\"index\":1.5}}", "expect": { "ok": false, "code": "bad_arguments", "id": "a" } },
+    { "name": "string goto", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.goto\",\"index\":\"1\"}}", "expect": { "ok": false, "code": "bad_arguments", "id": "a" } },
+    { "name": "black without on", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"output.black\"}}", "expect": { "ok": false, "code": "bad_arguments", "id": "a" } },
+    { "name": "unknown command", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"nope\"}}", "expect": { "ok": false, "code": "unknown_command", "id": "a" } }
+  ]
+}

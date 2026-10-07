@@ -1,11 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, type DaemonLike } from "../src/index";
+import fixtures from "../fixtures/parse-cases.json";
+
+type Case = { name: string; input: string; expect: { ok: boolean; command?: unknown; code?: string; id?: string } };
+const cases = fixtures.cases as Case[];
+
+describe("shared conformance cases (also run by the Rust daemon)", () => {
+  it.each(cases.map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    const r = parseEnvelope(c.input);
+    expect(r.ok).toBe(c.expect.ok);
+    if (r.ok) expect(r.envelope.command).toEqual(c.expect.command);
+    else {
+      expect(r.code).toBe(c.expect.code);
+      expect(r.id).toBe(c.expect.id);
+    }
+  });
+});
 
 describe("parseEnvelope", () => {
   it("round-trips every command", () => {
     for (const command of [
       { type: "slide.next" }, { type: "slide.prev" }, { type: "slide.goto", index: 3 },
-      { type: "output.black", on: true }, { type: "stream.start" }, { type: "stream.stop" },
+      { type: "output.black", on: true }, { type: "stream.start" }, { type: "stream.stop" }, { type: "state.get" },
     ] as const) {
       const r = parseEnvelope(JSON.stringify(makeEnvelope(command)));
       expect(r.ok && r.envelope.command).toEqual(command);
@@ -38,6 +54,11 @@ describe("dispatch", () => {
   const daemon: DaemonLike = { handle: (e) => ack(e.id) };
   it("acks valid commands", async () => {
     expect(await dispatch(daemon, makeEnvelope({ type: "slide.next" }, { id: "x" }))).toMatchObject({ ok: true, id: "x" });
+  });
+  it("only includes state on an ack when the daemon reports it", () => {
+    expect(ack("x")).not.toHaveProperty("state");
+    const state = { slideIndex: 2, black: false, stream: "off" } as const;
+    expect(ack("x", state)).toEqual({ v: PROTOCOL_VERSION, id: "x", ok: true, state });
   });
   it("nacks invalid input and survives daemon exceptions", async () => {
     expect(await dispatch(daemon, "oops")).toMatchObject({ ok: false, code: "bad_message" });

@@ -20,6 +20,7 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 
 ## Commands
 `npm install`, `npm test`, `npm run typecheck`, `npm run build`, `npm run dev:site`
+Daemon: `cargo test --release` in `apps/daemon` (includes chaos tests, ~3 min); `cargo fmt` and `cargo clippy` must be clean
 
 ## Brand
 Navy #10224F, Paper #F4F1EA, Jivvy blue #2E6BFF, On-air orange #FF7A1A (small accents only, never large areas).

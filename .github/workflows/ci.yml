@@ -16,3 +16,25 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+  daemon:
+    # The daemon targets Windows first; Linux keeps it portable.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/daemon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/daemon
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      # Includes the chaos tests: 100 engine kills, a hung engine, a dead watchdog, a corrupted snapshot.
+      - run: cargo test --release

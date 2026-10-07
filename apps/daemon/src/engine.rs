@@ -1,11 +1,13 @@
 //! The live engine: owns the service state and answers protocol commands.
 //!
 //! Every change is saved to the snapshot store before it is acknowledged, so whatever
-//! an operator saw acknowledged survives a crash. Video, outputs and streaming plug in
-//! here in later items; until then `stream.start` answers `unavailable`.
+//! an operator saw acknowledged survives a crash. Connections that send `state.subscribe`
+//! (output windows, operator screens) get a `state` event after every change. Video and
+//! streaming plug in here in later items; until then `stream.start` answers `unavailable`.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,11 +16,29 @@ use crate::snapshot::{Snapshot, Store};
 
 /// Longest line accepted on the command channel; protocol messages are tiny.
 const MAX_LINE: usize = 16 * 1024;
+/// Messages queued for one connection before it counts as stuck and is disconnected.
+const OUTBOX_CAPACITY: usize = 256;
+
+/// Where messages for one connection go. All writes to a socket go through its outbox so
+/// acks and events never interleave mid-line.
+#[derive(Clone)]
+pub struct Outbox {
+    tx: SyncSender<Vec<u8>>,
+    /// Closed if the client stops reading, so it reconnects and gets fresh state.
+    stream: Option<Arc<TcpStream>>,
+}
+
+impl Outbox {
+    pub fn new(tx: SyncSender<Vec<u8>>, stream: Option<Arc<TcpStream>>) -> Self {
+        Outbox { tx, stream }
+    }
+}
 
 pub struct Engine {
     state: Snapshot,
     store: Store,
     slide_count: u64,
+    subscribers: Vec<Outbox>,
 }
 
 impl Engine {
@@ -27,7 +47,7 @@ impl Engine {
         let mut state = state;
         // A snapshot from a longer run sheet must not point past the end of this one.
         state.slide_index = state.slide_index.min(slide_count - 1);
-        Engine { state, store, slide_count }
+        Engine { state, store, slide_count, subscribers: Vec::new() }
     }
 
     pub fn state(&self) -> &Snapshot {
@@ -38,8 +58,17 @@ impl Engine {
         StateSnapshot { slide_index: self.state.slide_index, black: self.state.black, stream: StreamStatus::Off }
     }
 
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
+    }
+
     /// Handles one raw message and returns the ack to send back.
     pub fn handle_line(&mut self, line: &str) -> Ack {
+        self.handle_line_from(line, None)
+    }
+
+    /// Like `handle_line`, for a connection that can receive events through `outbox`.
+    pub fn handle_line_from(&mut self, line: &str, outbox: Option<&Outbox>) -> Ack {
         let env = match protocol::parse_envelope(line) {
             Ok(e) => e,
             Err(e) => return protocol::nack(e.id.as_deref().unwrap_or(""), e.code, e.message),
@@ -60,6 +89,10 @@ impl Engine {
                 return protocol::nack(id, ErrorCode::Unavailable, "streaming is not built into this daemon yet");
             }
             Command::StateGet => {}
+            Command::StateSubscribe => match outbox {
+                Some(o) => self.subscribers.push(o.clone()),
+                None => return protocol::nack(id, ErrorCode::Unavailable, "this connection can't receive events"),
+            },
         }
         if next != self.state {
             next.saved_at = crate::now_ms();
@@ -69,8 +102,28 @@ impl Engine {
                 return protocol::nack(id, ErrorCode::Unavailable, "could not save state; try again");
             }
             self.state = next;
+            self.broadcast();
         }
         protocol::ack(id, Some(self.view()))
+    }
+
+    /// Sends the current state to every subscriber without ever blocking: a subscriber
+    /// whose queue is full is disconnected (it reconnects and resubscribes), and one whose
+    /// connection is gone is dropped.
+    fn broadcast(&mut self) {
+        let Ok(mut line) = serde_json::to_vec(&protocol::state_event(self.view())) else { return };
+        line.push(b'\n');
+        self.subscribers.retain(|s| match s.tx.try_send(line.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                crate::log("engine", "subscriber stopped reading; disconnecting it");
+                if let Some(stream) = &s.stream {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 }
 
@@ -125,7 +178,24 @@ fn discard_line(reader: &mut impl BufRead) -> std::io::Result<u64> {
 
 fn serve_connection(stream: TcpStream, engine: &Mutex<Engine>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
+    let shared = Arc::new(stream.try_clone()?);
+    let (tx, rx) = sync_channel::<Vec<u8>>(OUTBOX_CAPACITY);
+    let outbox = Outbox::new(tx, Some(shared.clone()));
     let mut out = stream.try_clone()?;
+    std::thread::spawn(move || {
+        for msg in rx {
+            if out.write_all(&msg).is_err() {
+                break;
+            }
+        }
+    });
+    let result = read_commands(stream, engine, &outbox);
+    // Unblocks the writer and tells the client we're done with this connection.
+    let _ = shared.shutdown(Shutdown::Both);
+    result
+}
+
+fn read_commands(stream: TcpStream, engine: &Mutex<Engine>, outbox: &Outbox) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
@@ -146,11 +216,14 @@ fn serve_connection(stream: TcpStream, engine: &Mutex<Engine>) -> std::io::Resul
             }
             // A panic in one handler must not poison the engine for every other device.
             let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
-            e.handle_line(msg)
+            e.handle_line_from(msg, Some(outbox))
         };
         let mut bytes = serde_json::to_vec(&ack)?;
         bytes.push(b'\n');
-        out.write_all(&bytes)?;
+        // Blocking here only stalls this connection, never the engine (the lock is released).
+        if outbox.tx.send(bytes).is_err() {
+            return Ok(());
+        }
     }
 }
 
@@ -256,6 +329,64 @@ mod tests {
         // A stream that ends without a newline just stops.
         let mut r = BufReader::new(Flood { len: 100_000, tail: std::io::Cursor::new(Vec::new()) });
         assert_eq!(discard_line(&mut r).unwrap(), 100_000);
+    }
+
+    #[test]
+    fn subscribers_get_every_change_and_stuck_or_gone_ones_never_block_the_engine() {
+        let (mut e, _) = engine("subs", 1000);
+        let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
+        let sub = |e: &mut Engine, outbox: &Outbox| {
+            e.handle_line_from(r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#, Some(outbox))
+        };
+        assert_eq!(serde_json::to_value(sub(&mut e, &Outbox::new(tx, None))).unwrap()["ok"], json!(true));
+        send(&mut e, json!({ "type": "slide.goto", "index": 5 }));
+        send(&mut e, json!({ "type": "state.get" })); // no change, no event
+        let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            ev,
+            json!({ "v": 1, "event": "state", "state": { "slideIndex": 5, "black": false, "stream": "off" } })
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Never reads: more changes than its queue holds, and the engine carries on.
+        for i in 0..(OUTBOX_CAPACITY as u64 + 10) {
+            send(&mut e, json!({ "type": "slide.goto", "index": i % 900 }));
+        }
+        assert_eq!(e.subscriber_count(), 0);
+        drop(rx);
+
+        // A subscriber whose connection is gone is dropped on the next change.
+        let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
+        sub(&mut e, &Outbox::new(tx, None));
+        drop(rx);
+        send(&mut e, json!({ "type": "slide.next" }));
+        assert_eq!(e.subscriber_count(), 0);
+
+        // Without a connection there's nowhere to send events.
+        assert_eq!(send(&mut e, json!({ "type": "state.subscribe" }))["code"], json!("unavailable"));
+    }
+
+    #[test]
+    fn a_subscribed_connection_receives_changes_made_by_another_device() {
+        let (e, _) = engine("tcp-subs", 10);
+        let listener = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, Arc::new(Mutex::new(e))));
+        let mut screen = TcpStream::connect(addr).unwrap();
+        screen.write_all(b"{\"v\":1,\"id\":\"s\",\"ts\":1,\"command\":{\"type\":\"state.subscribe\"}}\n").unwrap();
+        let mut screen = BufReader::new(screen);
+        let mut line = String::new();
+        screen.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], json!("s"));
+
+        let mut remote = TcpStream::connect(addr).unwrap();
+        remote
+            .write_all(b"{\"v\":1,\"id\":\"r\",\"ts\":1,\"command\":{\"type\":\"slide.goto\",\"index\":3}}\n")
+            .unwrap();
+        line.clear();
+        screen.read_line(&mut line).unwrap();
+        let ev: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!((ev["event"].clone(), ev["state"]["slideIndex"].clone()), (json!("state"), json!(3)));
     }
 
     #[test]

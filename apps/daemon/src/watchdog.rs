@@ -1,27 +1,33 @@
-//! Supervises the engine process: restarts it when it exits, crashes or stops sending
-//! heartbeats. The engine resumes from its own snapshot, so the watchdog holds no state.
+//! Supervises the daemon's processes (engine, outputs): restarts each one independently
+//! when it exits, crashes or stops sending heartbeats. Each resumes from its own state, so
+//! the watchdog holds none.
 //!
-//! The watchdog keeps the engine's stdin open; if the watchdog dies, the engine sees
-//! end-of-file and exits, so a stale engine never holds the command port.
+//! The watchdog keeps every child's stdin open; if the watchdog dies, the children see
+//! end-of-file and exit, so a stale engine never holds the command port.
 //!
-//! Event lines on stdout are stable and machine-readable (`engine started pid=N`, ...);
-//! the chaos tests and, later, the System screen read them.
+//! Event lines on stdout are stable and machine-readable (`engine started pid=N`,
+//! `outputs stopped pid=N reason=...`); the chaos tests and, later, the System screen read them.
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-pub struct Config {
-    pub engine: PathBuf,
-    pub engine_args: Vec<String>,
-    /// No heartbeat for this long means the engine is hung and gets killed.
+/// One supervised process.
+pub struct ChildSpec {
+    /// Short name used in event lines and logs, e.g. `engine`.
+    pub name: &'static str,
+    pub exe: PathBuf,
+    pub args: Vec<String>,
+    /// No heartbeat for this long means the process is hung and gets killed.
     pub hang_timeout: Duration,
+    /// Allowed silence before the first heartbeat (start-up can be slower than steady state).
+    pub startup_grace: Duration,
 }
 
-/// Delay before the next start. Restarts are immediate unless the engine keeps dying
+/// Delay before the next start. Restarts are immediate unless the process keeps dying
 /// right after starting; then back off a little, never past 1 s (the plan's target is
 /// back on the same slide in under 3 s).
 pub fn next_delay(previous: Duration, ran_for: Duration) -> Duration {
@@ -32,23 +38,30 @@ pub fn next_delay(previous: Duration, ran_for: Duration) -> Duration {
     }
 }
 
-/// Time since the engine's last heartbeat, on the monotonic clock: a wall-clock
-/// correction (common on church PCs) must never hide a hung engine.
+/// Time since a process's last heartbeat, on the monotonic clock: a wall-clock
+/// correction (common on church PCs) must never hide a hung process.
 #[derive(Clone)]
 pub struct Heartbeat {
     start: Instant,
     /// Milliseconds after `start` of the last beat.
     last: Arc<AtomicU64>,
+    beaten: Arc<AtomicBool>,
 }
 
 impl Heartbeat {
     /// Starts counting as if a beat just arrived.
     pub fn new() -> Self {
-        Heartbeat { start: Instant::now(), last: Arc::new(AtomicU64::new(0)) }
+        Heartbeat { start: Instant::now(), last: Arc::new(AtomicU64::new(0)), beaten: Arc::default() }
     }
 
     pub fn beat(&self) {
         self.last.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.beaten.store(true, Ordering::Relaxed);
+    }
+
+    /// True once at least one heartbeat has arrived.
+    pub fn has_beaten(&self) -> bool {
+        self.beaten.load(Ordering::Relaxed)
     }
 
     pub fn silence(&self) -> Duration {
@@ -62,9 +75,9 @@ impl Default for Heartbeat {
     }
 }
 
-fn spawn(cfg: &Config) -> std::io::Result<(Child, Heartbeat)> {
-    let mut child = Command::new(&cfg.engine)
-        .args(&cfg.engine_args)
+fn spawn(spec: &ChildSpec) -> std::io::Result<(Child, Heartbeat)> {
+    let mut child = Command::new(&spec.exe)
+        .args(&spec.args)
         .arg("--supervised")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -84,21 +97,32 @@ fn spawn(cfg: &Config) -> std::io::Result<(Child, Heartbeat)> {
     Ok((child, heartbeat))
 }
 
-/// Runs forever.
-pub fn run(cfg: Config) -> ! {
+/// Supervises every child, each on its own thread. Runs forever.
+pub fn run(children: Vec<ChildSpec>) -> ! {
+    for spec in children {
+        std::thread::spawn(move || supervise(spec));
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Keeps one child running forever.
+pub fn supervise(spec: ChildSpec) -> ! {
+    let name = spec.name;
     let mut delay = Duration::ZERO;
     loop {
         std::thread::sleep(delay);
         let started = Instant::now();
-        let (mut child, heartbeat) = match spawn(&cfg) {
+        let (mut child, heartbeat) = match spawn(&spec) {
             Ok(c) => c,
             Err(e) => {
-                crate::log("watchdog", format!("could not start engine {}: {e}", cfg.engine.display()));
+                crate::log("watchdog", format!("could not start {name} {}: {e}", spec.exe.display()));
                 delay = next_delay(delay, Duration::ZERO);
                 continue;
             }
         };
-        println!("engine started pid={}", child.id());
+        println!("{name} started pid={}", child.id());
         let reason = loop {
             std::thread::sleep(Duration::from_millis(50));
             match child.try_wait() {
@@ -107,14 +131,15 @@ pub fn run(cfg: Config) -> ! {
                 Err(e) => break format!("wait failed ({e})"),
             }
             let silent = heartbeat.silence();
-            if silent > cfg.hang_timeout {
+            let allowed = if heartbeat.has_beaten() { spec.hang_timeout } else { spec.startup_grace };
+            if silent > allowed {
                 let _ = child.kill();
                 let _ = child.wait();
                 break format!("hung (no heartbeat for {} ms); killed", silent.as_millis());
             }
         };
-        println!("engine stopped pid={} reason={reason}", child.id());
-        crate::log("watchdog", format!("engine {reason}; restarting"));
+        println!("{name} stopped pid={} reason={reason}", child.id());
+        crate::log("watchdog", format!("{name} {reason}; restarting"));
         delay = next_delay(delay, started.elapsed());
     }
 }
@@ -131,6 +156,7 @@ mod tests {
         let other_thread = hb.clone();
         std::thread::spawn(move || other_thread.beat()).join().unwrap();
         assert!(hb.silence() < Duration::from_millis(60));
+        assert!(hb.has_beaten() && !Heartbeat::new().has_beaten());
     }
 
     #[test]

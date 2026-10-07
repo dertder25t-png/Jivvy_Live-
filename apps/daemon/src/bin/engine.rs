@@ -9,18 +9,7 @@ use std::time::Duration;
 
 use jivvy_daemon::engine::{self, Engine};
 use jivvy_daemon::snapshot::Store;
-use jivvy_daemon::{DEFAULT_LISTEN, HEARTBEAT_LINE, log};
-
-fn default_data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(d).join("JivvyLive");
-    }
-    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(d).join("jivvy-live");
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/share/jivvy-live")
-}
+use jivvy_daemon::{DEFAULT_LISTEN, HEARTBEAT_LINE, default_data_dir, log};
 
 fn main() {
     let mut data_dir = default_data_dir();

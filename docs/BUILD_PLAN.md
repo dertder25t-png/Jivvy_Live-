@@ -58,7 +58,7 @@ Everything lives under jivvy.org, so no new domain is needed; this project is ho
 | Address | What it is | Hosted on |
 | --- | --- | --- |
 | jivvy.org | Ministry brand home; links to Jivvy Live | Unchanged |
-| live.jivvy.org | Jivvy Live website: features, pricing, FAQ, waitlist, Google Calendar booking | Cloudflare Pages (Astro) |
+| live.jivvy.org | Jivvy Live website: features, pricing, FAQ and the alpha waitlist | Cloudflare Pages (Astro) |
 | live.jivvy.org/demo | Self-serve demo | Cloudflare Pages |
 | app.jivvy.org | The web app churches sign in to | Cloudflare Pages |
 | \*.d.jivvy.org | Per-church hostnames for booth computers, each with its own certificate | Cloudflare DNS |
@@ -127,27 +127,28 @@ For churches with weak upload or many platforms: the church computer sends one s
 - **Cost:** Stream bills $1 per 1,000 minutes sent to platforms; ingest is free. A 90-minute service to 3 platforms is about $0.27, so roughly $1–4 per church per month. Stream needs a paid subscription for the account (shared by all churches).
 - **Stream keys** are stored as Stream outputs through the API and never logged.
 - **Prove these in a 1–2 day spike first:** (1) RTMPS output to Facebook works; (2) what Stream does when a platform drops the connection mid-stream; (3) there's no published uptime guarantee, so measure fallback time with the relay blocked.
-- **Build when** pilot churches run Jivvy Live every Sunday, ask for the relay, and Sunday mornings are covered.
+- **Build when** alpha test churches run Jivvy Live every Sunday, ask for the relay, and Sunday mornings are covered.
 
 ## Stage 0: Prove the tech (done)
 
 Prove the hardest piece works before building on it.
 
-- [x] Website at live.jivvy.org (Astro on Cloudflare Pages) with features, pricing, FAQ, waitlist and Google Calendar booking
+- [x] Website at live.jivvy.org (Astro on Cloudflare Pages) with features, pricing, FAQ and waitlist
+  - Oct 6, 2026: call booking removed. The waitlist collects emails for two announcements (alpha testing opens, launch) and an "I'd like to help test the alpha" checkbox.
 - [x] Tech spike: web lyrics composited over a camera feed, hardware-encoded, streamed to YouTube, on a $300 laptop
   - Done (`spikes/lyrics-stream`): lyrics over webcam at 1080p30 with GPU compositing at about 1% CPU (Media Foundation encoder), crash-safe recording, and an x264 software fallback that also holds 1080p30 (about one core; ~28% of two pinned cores). Found an Intel Quick Sync driver crash on the test laptop; Media Foundation's encoder avoids it.
   - Moved to Stage 1: streaming to YouTube (the new channel can't go live yet) is part of the Streaming item, and the $300-laptop run is part of the hardware lab.
 - [x] Versioned command protocol (`packages/protocol`) and simulated daemon with crash and offline failure injection (`packages/sim-daemon`)
 
-## Build order: alpha before any church
+## Build order: a working system before any church
 
-Decided Oct 6, 2026: build a complete, working system and prove it in-house before contacting any church. No surveys, pilots or preorders until Stage 1 is done. The website and waitlist stay up and collect interest passively in the meantime.
+Decided Oct 6, 2026: build a complete, working system and prove it in-house before contacting any church. No surveys, calls, pilots or preorders until Stage 1 is done. The website's waitlist collects interest passively in the meantime; nobody gets an email until alpha testing opens.
 
-1. **Stage 1, Alpha:** everything a church needs to run a whole service, built and tested by us on our own hardware.
-2. **Stage 2, Pilots and launch:** the demo, outreach and pilot churches, using the finished alpha.
-3. Stages 3 onward, shaped by what pilot churches ask for.
+1. **Stage 1, Build and test in-house:** everything a church needs to run a whole service, built and tested by us on our own hardware.
+2. **Stage 2, Alpha testing and launch:** email the waitlist, churches that asked to test join the alpha, then launch.
+3. Stages 3 onward, shaped by what alpha test churches ask for.
 
-## Stage 1: Alpha, a complete system tested in-house (12–16 weeks)
+## Stage 1: Build the complete system, tested in-house (12–16 weeks)
 
 Everything a church needs to run a whole service, with every reliability feature built in from the start. Built and tested by us on our own hardware before any church sees it.
 
@@ -187,24 +188,26 @@ Everything a church needs to run a whole service, with every reliability feature
 - [ ] Hardware lab: the founder's laptop plus a ~$300 Windows laptop (repeat the Stage 0 spike on it first), a USB capture card and a USB audio interface; a Mac when Mac support starts
 - [ ] Chaos test suite: every row of the reliability table scripted and passing, against the simulated daemon in CI and the real daemon on the lab machines
 - [ ] Soak test: a 4-hour simulated service (camera, lyrics, stream, recording) on every lab machine
-- [ ] Mock Sundays: run a full service plan end to end, as a church would, every week of the alpha; each failure gets a write-up and a test that reproduces it
+- [ ] Mock Sundays: run a full service plan end to end, as a church would, every week of Stage 1; each failure gets a write-up and a test that reproduces it
 
 **Done when:** 4 mock Sundays in a row run on the lab machines with zero service-stopping failures, every chaos test passes, the stream reaches a private YouTube event, and a first-time volunteer (a friend, not a church) runs a service after a 5-minute walkthrough.
 
-## Stage 2: Pilots and launch (4–8 weeks)
+## Stage 2: Alpha testing and launch (6–10 weeks)
 
-Only after the alpha is done. Show churches a finished product, not a promise.
+Only after Stage 1 is done. Show churches a finished product, not a promise.
 
-**Outreach and pilots**
+**Alpha testing**
 
-- [ ] Send the church overview doc (with a link to the demo) to 10–15 church tech leads and collect answers
+- [ ] Waitlist email: a transactional email provider, a plain-text template, a one-click unsubscribe link and no tracking pixels. Sends only the two announcements the site promises
+- [ ] Email the waitlist that alpha testing is open; churches that ticked "help test the alpha" are invited first
+- [ ] Pick 3–5 alpha test churches from those who said yes, nearby ones first so you can visit on a Sunday
 - [ ] Optional "founding church" preorder to test real willingness to pay
-- [ ] Line up 3–5 pilot churches you can visit in person
-- [ ] Beta ring: pilot churches get updates midweek and run real services
+- [ ] Beta ring: alpha test churches get updates midweek and run real services
+- [ ] Launch email to the whole waitlist when alpha testing is done
 
 **The self-serve demo (runs entirely in the browser, free static hosting)**
 
-Anyone can try Jivvy Live in their browser with no install, no account and no involvement from the founder; questions go to a booking page on the founder's schedule.
+Anyone can try Jivvy Live in their browser with no install, no account and no involvement from the founder; questions go to email.
 
 - [ ] Same web app as the real product, connected to the simulated daemon (`packages/sim-daemon`) running in the browser
 - [ ] Demo church preloaded: a full Sunday run sheet with public-domain hymns, scripture, sermon slides, announcements and a countdown
@@ -218,13 +221,12 @@ Anyone can try Jivvy Live in their browser with no install, no account and no in
 **Questions without the founder on call**
 
 - [ ] FAQ and 1–2 minute how-to videos covering the common questions
-- [x] "Got questions? Book a call" button using a Google Calendar booking page with only the time slots the founder opens
-  - Live on live.jivvy.org; shows the contact email until `PUBLIC_BOOKING_URL` is set to the Google booking page.
-- [ ] A short booking form (church size, current software, biggest problem) so every call is focused
+- [ ] Calls on the founder's schedule (Google Calendar booking page) with a short form so every call is focused
+  - Paused Oct 6, 2026: one-on-one calls with everyone interested don't scale; the site sends questions to email. Revisit for alpha test churches.
 - [ ] Email contact form for people who'd rather not call
 - [ ] Privacy-friendly analytics on which demo steps visitors use and where they leave
 
-**Done when:** at least 10 churches say they'd switch, and 3 pilot churches run 4 Sundays each with zero service-stopping failures.
+**Done when:** at least 10 churches say they'd switch, and 3 alpha test churches run 4 Sundays each with zero service-stopping failures. Then launch.
 
 ## Stage 3: Team features (6–8 weeks)
 
@@ -241,7 +243,7 @@ Add what makes Jivvy Live the place the whole team coordinates, not just the boo
 - [ ] Local HLS feed for lobby and nursery TVs
 - [ ] Importers: ProPresenter, EasyWorship, OpenLP/OpenLyrics, SongSelect files; CCLI usage report export
 
-**Done when:** pilot churches use share links for at least half their services without the tech lead re-entering anything by hand.
+**Done when:** alpha test churches use share links for at least half their services without the tech lead re-entering anything by hand.
 
 ## Stage 4: Roles, scheduling and integrations (6–8 weeks)
 
@@ -278,7 +280,7 @@ The features that wow in demos. They all run on the church computer, so they add
 - [ ] Auto sermon clips (30–60 seconds) cut from the local recording
 - [ ] 4K recording where hardware allows
 
-**Done when:** in pilot churches, volunteers using lyric follow miss fewer slide changes, and features run without dropping stream frames on mid-range laptops. Turn off any feature automatically on hardware that can't keep up.
+**Done when:** in alpha test churches, volunteers using lyric follow miss fewer slide changes, and features run without dropping stream frames on mid-range laptops. Turn off any feature automatically on hardware that can't keep up.
 
 ## Stage 6: Multi-campus and large churches (later)
 
@@ -315,7 +317,7 @@ Reliability comes from testing like it's Sunday every day, and from never shippi
 **Release**
 
 1. Internal build on the lab machines
-2. Beta ring (from Stage 2): pilot churches opt in and get it midweek
+2. Beta ring (from Stage 2): alpha test churches opt in and get it midweek
 3. Staged rollout: 10% of churches, then everyone a week later if crash reports stay clean
 4. Installs only happen outside each church's service windows
 5. One-tap rollback to the previous version, kept on disk
@@ -353,8 +355,8 @@ This plan is the source of truth for whoever (or whichever Claude session) is bu
 1. Stage 0 tech spike (daemon prototype: lyrics over camera, hardware encode, recording) — done
 2. `packages/protocol` and a simulated daemon — done
 3. Website on Cloudflare Pages — done
-4. Stage 1 (alpha) items, in order — next
-5. Stage 2: demo, outreach and pilots — only after the alpha is done
+4. Stage 1 items, in order — next
+5. Stage 2: alpha testing, demo and launch — only after Stage 1 is done
 
 ## Costs, pricing and business
 
@@ -434,28 +436,29 @@ Growth depends mostly on new sales, since renewals are small. That's the tradeof
 **Decisions to make**
 
 - [x] Critical streaming and security fixes for churches without Plus: free forever, delivered to everyone on the same build (see Licensing and updates)
-- [x] Build a complete alpha and test it in-house before contacting any church (Oct 6, 2026)
+- [x] Build a complete system and test it in-house before contacting any church (Oct 6, 2026)
+- [x] No calls for now: interested churches join an email waitlist for the alpha testing and launch announcements (Oct 6, 2026)
 - [x] What a license includes without Plus: every local feature released in its first 3 years, kept forever; no cloud features
 - [x] Cloud relay: Cloudflare Stream, Pro tier, Stage 4, with automatic fallback to direct streaming
 - [ ] Get a publisher quote for licensed Bible translations before promising them
-- [ ] Whether to offer a founding-church discount during pilots (Stage 2)
+- [ ] Whether to offer a founding-church discount during alpha testing (Stage 2)
 - [ ] Revenue split, if any, with MinistryBase for customers who come through their integration
 
 ## Risks and stop rules
 
-The biggest risk is a bad Sunday; the second is building for months before anyone uses it. Building the alpha before talking to churches makes the second risk bigger on purpose, so the waitlist and stop rules below are how we watch it.
+The biggest risk is a bad Sunday; the second is building for months before anyone uses it. Building the whole system before talking to churches makes the second risk bigger on purpose, so the waitlist and stop rules below are how we watch it.
 
 | Risk | What to do about it |
 | --- | --- |
-| A service fails because of the software | Reliability work comes first in every stage; pilots before public launch; fast incident write-ups |
+| A service fails because of the software | Reliability work comes first in every stage; alpha testing before public launch; fast incident write-ups |
 | Lyrics-over-video compositing is too slow on cheap laptops | Proved on the founder's laptop in the Stage 0 spike; repeat on the $300 lab laptop early in Stage 1; lower default resolution if needed |
-| Building something churches don't want | Keep the waitlist open the whole alpha and read every signup's answers; Stage 2's outreach tests demand with a finished product |
+| Building something churches don't want | Keep the waitlist open during Stage 1 and read every signup's answers; Stage 2's alpha testing tests demand with a finished product |
 | Song licensing | Never scrape or host other people's copyrighted lyrics; churches import what they're licensed for |
 | Free tools are "good enough" | Lead with what free tools lack: phone control, volunteer mode, streaming with alerts, reliability |
 | Switching is a hassle | Importers for ProPresenter, EasyWorship and OpenLP; offer to migrate a library for early churches |
-| Solo Sunday support | Clear status page, in-app troubleshooting, and a limited number of pilot churches until support scales |
+| Solo Sunday support | Clear status page, in-app troubleshooting, and a limited number of alpha test churches until support scales |
 | Platform changes (YouTube, Facebook, Windows, macOS) | Watch their developer announcements; keep the Plus renewal funding maintenance |
-| Scope creep | Finish the alpha (Stage 1) before anything else, and pilots (Stage 2) before anything in Stages 4–6 |
+| Scope creep | Finish Stage 1 before anything else, and alpha testing (Stage 2) before anything in Stages 4–6 |
 | Pro relay goes down on a Sunday | Automatic fallback to direct streaming, tested with the relay blocked; Pro only launches once Sunday mornings are covered |
 | Free-forever fixes outgrow the revenue that pays for them | New sales fund maintenance, with Plus renewals on top; the shutdown promise protects churches if that ever fails |
 

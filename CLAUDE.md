@@ -9,7 +9,7 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 4. Never break the command protocol: add fields, never rename/remove, keep the previous version working.
 5. Nothing during a service may depend on the cloud. If a change adds that dependency, stop and flag it.
 6. Keep secrets (stream keys, API keys) out of the repo and out of logs.
-7. No church outreach, pilots or surveys until the Stage 1 alpha is done (decided Oct 6, 2026).
+7. No church outreach, calls, pilots or surveys until Stage 1 is done; the waitlist gets no email until alpha testing opens (decided Oct 6, 2026).
 
 ## Layout
 - `apps/site` — live.jivvy.org (Astro, Cloudflare Pages + Pages Functions)

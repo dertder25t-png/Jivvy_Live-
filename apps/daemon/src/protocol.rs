@@ -31,6 +31,8 @@ pub enum Command {
     StateSubscribe,
     #[serde(rename = "media.levels")]
     MediaLevels(Levels),
+    #[serde(rename = "stream.report")]
+    StreamReport { status: StreamStatus },
 }
 
 /// Audio input levels in dBFS, one entry per channel.
@@ -91,6 +93,8 @@ pub struct StateSnapshot {
     pub slide_index: u64,
     pub black: bool,
     pub stream: StreamStatus,
+    /// The operator asked for the stream to be on (it may be reconnecting).
+    pub stream_wanted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -173,6 +177,12 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "stream.stop" => Command::StreamStop,
         "state.get" => Command::StateGet,
         "state.subscribe" => Command::StateSubscribe,
+        "stream.report" => match obj.get("status").and_then(Value::as_str) {
+            Some("off") => Command::StreamReport { status: StreamStatus::Off },
+            Some("live") => Command::StreamReport { status: StreamStatus::Live },
+            Some("reconnecting") => Command::StreamReport { status: StreamStatus::Reconnecting },
+            _ => return Err((ErrorCode::BadArguments, "stream.report needs status off, live or reconnecting")),
+        },
         "media.levels" => match (db_list(obj.get("peakDb")), db_list(obj.get("rmsDb"))) {
             (Some(peak_db), Some(rms_db)) if peak_db.len() == rms_db.len() => {
                 Command::MediaLevels(Levels { peak_db, rms_db })
@@ -253,16 +263,16 @@ mod tests {
 
     #[test]
     fn acks_serialize_like_the_typescript_ones() {
-        let state = StateSnapshot { slide_index: 2, black: false, stream: StreamStatus::Off };
+        let state = StateSnapshot { slide_index: 2, black: false, stream: StreamStatus::Off, stream_wanted: false };
         assert_eq!(
             serde_json::to_string(&ack("x", Some(state))).unwrap(),
-            r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":2,"black":false,"stream":"off"}}"#
+            r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":2,"black":false,"stream":"off","streamWanted":false}}"#
         );
         assert_eq!(serde_json::to_string(&ack("x", None)).unwrap(), r#"{"v":1,"id":"x","ok":true}"#);
-        let state = StateSnapshot { slide_index: 1, black: true, stream: StreamStatus::Off };
+        let state = StateSnapshot { slide_index: 1, black: true, stream: StreamStatus::Live, stream_wanted: true };
         assert_eq!(
             serde_json::to_string(&state_event(state)).unwrap(),
-            r#"{"v":1,"event":"state","state":{"slideIndex":1,"black":true,"stream":"off"}}"#
+            r#"{"v":1,"event":"state","state":{"slideIndex":1,"black":true,"stream":"live","streamWanted":true}}"#
         );
         assert_eq!(
             serde_json::to_string(&nack("x", ErrorCode::Unavailable, "no")).unwrap(),

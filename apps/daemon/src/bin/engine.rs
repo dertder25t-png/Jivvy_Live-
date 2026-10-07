@@ -68,6 +68,8 @@ fn heartbeat(engine: &Mutex<Engine>, hang_file: &std::path::Path) {
                 std::thread::sleep(Duration::from_secs(3600));
             }
         }
+        let mut guard = guard;
+        guard.tick(); // e.g. a stream report going stale reaches the screens
         drop(guard);
         if writeln!(out, "{HEARTBEAT_LINE}").and_then(|_| out.flush()).is_err() {
             std::process::exit(0); // watchdog closed our stdout

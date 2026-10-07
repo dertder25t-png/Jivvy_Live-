@@ -62,6 +62,25 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
 - **Cost on the founder's laptop:** the whole video process (camera, microphone, program on Media Foundation, plus a debug file) at **0.21 cores, 1.3% of the machine**, 29.8 fps, 6.4 Mbps.
 - Developer aid until the recording item lands: `JIVVY_DEBUG_PROGRAM_FILE=path.mkv` also writes the program to a file.
 
+## Streaming (RTMP / RTMPS)
+
+`program tee ─> taps ─┬─> destination A: own pipeline ─> flvmux ─> rtmp2sink`
+`                     └─> destination B: ...`
+
+- **Isolated from the program.** Each destination has its own small pipeline on its own thread, fed copies of the already-encoded packets. A network failure tears down and reconnects only that destination; the program (and the recording) never notice. A destination that can't keep up is disconnected and reconnects, never slowing the program.
+- **Comes back by itself.** Reconnects after 0.5 s, 1 s, 2 s, 3 s, then every 5 s, starting on the next keyframe with timestamps from zero. No data reaching the server for 5 s counts as dropped. On the founder's laptop the stream was live again **0.7 s** after a killed server came back, and **~6 s** after the video process itself was killed.
+- **Survives crashes.** `stream.start` / `stream.stop` set "wanted" in the engine, saved like the slide; a restarted engine or video process resumes streaming without anyone touching it.
+- **Status everyone can trust.** The video process reports `live` or `reconnecting` once a second (`stream.report`); screens see `live` only while those reports keep coming and every destination is live.
+- **Destinations** in `stream.json` (data directory):
+  ```json
+  { "version": 1, "destinations": [
+    { "id": "youtube", "name": "YouTube", "url": "rtmps://a.rtmps.youtube.com:443/live2", "key": "<stream key>" },
+    { "id": "facebook", "name": "Facebook", "url": "rtmps://live-api-s.facebook.com:443/rtmp", "key": "<stream key>" }
+  ] }
+  ```
+- **Keys stay secret:** they go only to the RTMP sink, never into a pipeline description, log line, status file or error message (errors are scrubbed, and a broken `stream.json` is reported by line number, never by content). The screen shows the reason in plain words ("Can't reach the streaming server…"); the log keeps the technical one.
+- Still to come in the streaming item: YouTube's HLS segment upload (with retries and catch-up), the bandwidth manager, and two-connection support.
+
 ## Command channel (for now)
 
 Newline-delimited JSON on `127.0.0.1:47800`, one protocol envelope per line and one ack per line. Every ok ack carries `state`. After `state.subscribe`, the connection also receives `state` events on every change and `levels` events for meters. The secure per-church WebSocket channel is a later Stage 1 item; the envelope and ack formats stay the same.
@@ -85,6 +104,12 @@ cargo test --release      # unit tests + chaos tests (about 3 minutes), without 
 
 CI runs the video tests on Linux; the Windows CI job builds without the `video` feature until GStreamer is installed there.
 
+The streaming tests need [MediaMTX](https://github.com/bluenviron/mediamtx) as a local RTMP server, in `apps/daemon/.tools/mediamtx/` (git-ignored) or at `$JIVVY_MEDIAMTX`. To get the same release CI uses (checksum checked):
+
+```bash
+mkdir -p .tools/mediamtx && cd .tools/mediamtx && gh release download v1.21.1 --repo bluenviron/mediamtx --pattern "mediamtx_v1.21.1_windows_amd64.zip" --pattern checksums.sha256 && grep windows_amd64.zip checksums.sha256 | sha256sum -c - && unzip -o mediamtx_v1.21.1_windows_amd64.zip
+```
+
 Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine crashes" row, part of "Corrupted settings", and the output windows (run with `--outputs-headless`, which reads monitors from `test-displays.json`):
 
 | Test | Result on the founder's laptop (Windows) |
@@ -101,5 +126,8 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | Program on test sources | Runs at > 25 fps, lyric layer follows slide changes and black |
 | Camera unplugged and microphone removed mid-program | Slate on, still ~30 fps (≥ 50 frames in 2 s), same encoder, never restarted; off the slate when the camera returns |
 | Change the program size mid-run (1080p → 720p) | Back running at the new size on the camera at full rate, no encoder failure, and the video process is not restarted |
+| Stream to MediaMTX, kill the server, bring it back | Screens see `reconnecting` (plain-words reason), the program stays at ~30 fps, and the stream is live again by itself (~0.7 s after the server returns); the video process never restarts |
+| Kill the video process while streaming, then stop | Stream resumes by itself (~6 s); after `stream.stop` the server stops receiving |
+| Stream to a port nothing listens on | `reconnecting` with "Can't reach the streaming server", retries counted, the key in no status or state file |
 
 On the founder's laptop with real devices: Laptop Camera at 30 fps, the microphone array reporting levels ten times a second, the speaker loopback and duplicate camera entries filtered out.

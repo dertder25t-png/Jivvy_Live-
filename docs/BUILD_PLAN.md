@@ -163,6 +163,7 @@ Everything a church needs to run a whole service, with every reliability feature
 - [x] Lyric layer composited over camera, hardware encode, one encode sent to stream and recording
   - Done (`jivvy-video` program feed): a clock-driven pacer feeds the program with the camera or a slate and the microphone or silence, so losing an input never stops it; lyric layer drawn in Rust on slide change and composited on the GPU; encoded once (Media Foundation, then x264, with automatic fallback) to a tee the recording and stream items attach to. 1080p30 at 0.21 cores on the founder's laptop.
 - [ ] Streaming per the Streaming design section: YouTube segment upload with retries, RTMPS for other platforms, bandwidth manager with Auto and Advanced modes, two-connection support. Build and test against a local RTMP/HLS test server; verify on a private YouTube event once the channel can go live
+  - In progress: RTMP/RTMPS destinations with automatic reconnect are done (each destination isolated from the program; `stream.start`/`stop` saved across crashes; live status on every screen; keys never logged), tested against a local MediaMTX server. Left: YouTube HLS segment upload, bandwidth manager, two connections, and the private YouTube event check.
 - [ ] Crash-safe local recording
 - [ ] Local secure command channel (per-church hostname + certificate); certificate renewal stays free forever for every church
 - [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all

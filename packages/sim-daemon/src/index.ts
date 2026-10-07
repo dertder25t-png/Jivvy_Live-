@@ -73,6 +73,7 @@ export class SimDaemon implements DaemonLike {
       case "state.get":
       case "state.subscribe": // in memory, subscribers use subscribe(); the ack is the same
       case "media.levels": // the simulated daemon has no audio input to relay
+      case "stream.report": // it simulates the stream itself (setUplink)
         break;
     }
     return ack(e.id, this.snapshotForUi());
@@ -81,7 +82,7 @@ export class SimDaemon implements DaemonLike {
   /** The protocol's view of the state, as the real daemon reports it. */
   snapshotForUi(): StateSnapshot {
     const { slideIndex, black, stream } = this.state;
-    return { slideIndex, black, stream };
+    return { slideIndex, black, stream, streamWanted: this.wantStream };
   }
 
   // ---- Failure injection (the demo's "failure buttons") ----

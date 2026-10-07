@@ -16,6 +16,7 @@ pub mod outputs;
 pub mod program;
 pub mod protocol;
 pub mod snapshot;
+pub mod stream;
 pub mod watchdog;
 
 use std::path::{Path, PathBuf};

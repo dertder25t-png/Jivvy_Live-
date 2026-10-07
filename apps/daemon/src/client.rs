@@ -15,6 +15,9 @@ use serde_json::Value;
 pub struct LiveState {
     pub slide_index: u64,
     pub black: bool,
+    /// The operator asked for the stream to be on. Older engines don't send it.
+    #[serde(default)]
+    pub stream_wanted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,11 +69,12 @@ pub fn follow(addr: &str, mut on: impl FnMut(Update)) -> ! {
     }
 }
 
-/// Sends audio levels to the engine from a background thread, reconnecting as needed, and
-/// reports whether the engine is actually acknowledging them. Reports are dropped (never
-/// queued up) while the engine is away: old levels are useless.
+/// Sends the video process's reports (audio levels, stream status) to the engine from a
+/// background thread, reconnecting as needed, and reports whether the engine is actually
+/// acknowledging them. Reports are dropped (never queued up) while the engine is away: old
+/// reports are useless, and fresh ones follow within a second.
 pub struct LevelsSender {
-    tx: std::sync::mpsc::SyncSender<(Vec<f64>, Vec<f64>)>,
+    tx: std::sync::mpsc::SyncSender<serde_json::Value>,
     delivered: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -80,16 +84,25 @@ impl LevelsSender {
     pub const KEEPALIVE: Duration = Duration::from_secs(1);
 
     pub fn start(addr: String) -> LevelsSender {
-        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d = delivered.clone();
         std::thread::spawn(move || send_levels(&addr, rx, &d));
         LevelsSender { tx, delivered }
     }
 
-    /// Queues one report; dropped if the sender is busy.
+    /// Queues one levels report; dropped if the sender is busy.
     pub fn send(&self, peak_db: Vec<f64>, rms_db: Vec<f64>) {
-        let _ = self.tx.try_send((peak_db, rms_db));
+        self.command(serde_json::json!({ "type": "media.levels", "peakDb": peak_db, "rmsDb": rms_db }));
+    }
+
+    /// Queues a stream status report ("off", "live" or "reconnecting").
+    pub fn report_stream(&self, status: &str) {
+        self.command(serde_json::json!({ "type": "stream.report", "status": status }));
+    }
+
+    fn command(&self, command: serde_json::Value) {
+        let _ = self.tx.try_send(serde_json::json!({ "v": 1, "id": "vp", "ts": 0, "command": command }));
     }
 
     /// True when the engine acknowledged the most recent report or check.
@@ -121,15 +134,14 @@ fn exchange(conn: &mut Conn, msg: &serde_json::Value) -> bool {
 
 fn send_levels(
     addr: &str,
-    rx: std::sync::mpsc::Receiver<(Vec<f64>, Vec<f64>)>,
+    rx: std::sync::mpsc::Receiver<serde_json::Value>,
     delivered: &std::sync::atomic::AtomicBool,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut conn: Option<Conn> = None;
     loop {
         let msg = match rx.recv_timeout(LevelsSender::KEEPALIVE) {
-            Ok((peak, rms)) => serde_json::json!({ "v": 1, "id": "lv", "ts": 0,
-                "command": { "type": "media.levels", "peakDb": peak, "rmsDb": rms } }),
+            Ok(msg) => msg,
             Err(RecvTimeoutError::Timeout) => {
                 serde_json::json!({ "v": 1, "id": "ka", "ts": 0, "command": { "type": "state.get" } })
             }
@@ -157,7 +169,7 @@ mod tests {
     #[test]
     fn reads_state_from_acks_and_events_and_ignores_the_rest() {
         let s = state_in(r#"{"v":1,"event":"state","state":{"slideIndex":4,"black":true,"stream":"off"}}"#);
-        assert_eq!(s, Some(LiveState { slide_index: 4, black: true }));
+        assert_eq!(s, Some(LiveState { slide_index: 4, black: true, stream_wanted: false }));
         assert!(state_in(r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":0,"black":false}}"#).is_some());
         assert_eq!(state_in(r#"{"v":1,"event":"something.new"}"#), None);
         assert_eq!(state_in("garbage"), None);
@@ -226,8 +238,8 @@ mod tests {
         std::thread::spawn(move || follow(&a, move |u| tx.send(u).unwrap()));
         let next = || rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(next(), Update::Connected);
-        assert_eq!(next(), Update::State(LiveState { slide_index: 0, black: false }));
+        assert_eq!(next(), Update::State(LiveState { slide_index: 0, black: false, stream_wanted: false }));
         engine.lock().unwrap().handle_line(r#"{"v":1,"id":"r","ts":1,"command":{"type":"slide.goto","index":7}}"#);
-        assert_eq!(next(), Update::State(LiveState { slide_index: 7, black: false }));
+        assert_eq!(next(), Update::State(LiveState { slide_index: 7, black: false, stream_wanted: false }));
     }
 }

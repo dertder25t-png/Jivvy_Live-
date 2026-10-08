@@ -18,6 +18,9 @@ use crate::snapshot::{Snapshot, Store};
 const MAX_LINE: usize = 16 * 1024;
 /// Messages queued for one connection before it counts as stuck and is disconnected.
 const OUTBOX_CAPACITY: usize = 256;
+/// A stream report older than this means the video process isn't reporting (crashed or
+/// restarting): screens see "reconnecting", never a stale "live".
+pub const STREAM_REPORT_STALE: Duration = Duration::from_secs(3);
 
 /// Where messages for one connection go. All writes to a socket go through its outbox so
 /// acks and events never interleave mid-line.
@@ -39,6 +42,10 @@ pub struct Engine {
     store: Store,
     slide_count: u64,
     subscribers: Vec<Outbox>,
+    /// The video process's latest report on the stream, and when it came.
+    stream_report: Option<(StreamStatus, Instant)>,
+    /// The view subscribers last received, so `tick` only sends real changes.
+    last_sent: Option<StateSnapshot>,
 }
 
 impl Engine {
@@ -47,7 +54,7 @@ impl Engine {
         let mut state = state;
         // A snapshot from a longer run sheet must not point past the end of this one.
         state.slide_index = state.slide_index.min(slide_count - 1);
-        Engine { state, store, slide_count, subscribers: Vec::new() }
+        Engine { state, store, slide_count, subscribers: Vec::new(), stream_report: None, last_sent: None }
     }
 
     pub fn state(&self) -> &Snapshot {
@@ -55,7 +62,37 @@ impl Engine {
     }
 
     pub fn view(&self) -> StateSnapshot {
-        StateSnapshot { slide_index: self.state.slide_index, black: self.state.black, stream: StreamStatus::Off }
+        self.view_at(Instant::now())
+    }
+
+    /// The state screens see. The stream is "off" unless asked for; when asked for, it is
+    /// "live" only while the video process keeps reporting that it is.
+    pub fn view_at(&self, now: Instant) -> StateSnapshot {
+        let stream = match (self.state.stream_wanted, self.stream_report) {
+            (false, _) => StreamStatus::Off,
+            (true, Some((StreamStatus::Live, at))) if now.saturating_duration_since(at) < STREAM_REPORT_STALE => {
+                StreamStatus::Live
+            }
+            (true, _) => StreamStatus::Reconnecting,
+        };
+        StateSnapshot {
+            slide_index: self.state.slide_index,
+            black: self.state.black,
+            stream,
+            stream_wanted: self.state.stream_wanted,
+        }
+    }
+
+    /// Called a few times a second: tells subscribers when the view changed by itself
+    /// (a stream report going stale).
+    pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    pub fn tick_at(&mut self, now: Instant) {
+        if self.last_sent.as_ref() != Some(&self.view_at(now)) {
+            self.broadcast_at(now);
+        }
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -85,8 +122,14 @@ impl Engine {
                 next.slide_index = index;
             }
             Command::OutputBlack { on } => next.black = on,
-            Command::StreamStart | Command::StreamStop => {
-                return protocol::nack(id, ErrorCode::Unavailable, "streaming is not built into this daemon yet");
+            // Saved like the slide, so a crash mid-service resumes streaming by itself.
+            Command::StreamStart => next.stream_wanted = true,
+            Command::StreamStop => next.stream_wanted = false,
+            Command::StreamReport { status } => {
+                // Live status, not saved: it only means anything while it keeps coming.
+                self.stream_report = Some((status, Instant::now()));
+                self.tick();
+                return protocol::ack(id, None);
             }
             Command::StateGet => {}
             Command::MediaLevels(levels) => {
@@ -118,9 +161,15 @@ impl Engine {
     /// whose queue is full is disconnected (it reconnects and resubscribes), and one whose
     /// connection is gone is dropped.
     fn broadcast(&mut self) {
-        if let Ok(line) = serde_json::to_vec(&protocol::state_event(self.view())) {
+        self.broadcast_at(Instant::now());
+    }
+
+    fn broadcast_at(&mut self, now: Instant) {
+        let view = self.view_at(now);
+        if let Ok(line) = serde_json::to_vec(&protocol::state_event(view.clone())) {
             self.send_to_subscribers(line);
         }
+        self.last_sent = Some(view);
     }
 
     fn send_to_subscribers(&mut self, mut line: Vec<u8>) {
@@ -274,7 +323,7 @@ mod tests {
     fn every_ack_reports_state_and_changes_are_saved_before_the_ack() {
         let (mut e, dir) = engine("save", 10);
         let r = send(&mut e, json!({ "type": "slide.goto", "index": 7 }));
-        assert_eq!(r["state"], json!({ "slideIndex": 7, "black": false, "stream": "off" }));
+        assert_eq!(r["state"], json!({ "slideIndex": 7, "black": false, "stream": "off", "streamWanted": false }));
         send(&mut e, json!({ "type": "output.black", "on": true }));
         let (snap, _) = Store::new(&dir).unwrap().load();
         assert_eq!((snap.slide_index, snap.black), (7, true));
@@ -302,9 +351,52 @@ mod tests {
     }
 
     #[test]
-    fn streaming_answers_unavailable_and_bad_input_is_nacked() {
-        let (mut e, _) = engine("stream", 3);
-        assert_eq!(send(&mut e, json!({ "type": "stream.start" }))["code"], json!("unavailable"));
+    fn the_stream_is_live_only_while_reports_keep_coming_and_wanted_survives_a_restart() {
+        let (mut e, dir) = engine("stream", 3);
+        let stream = |e: &mut Engine| send(e, json!({ "type": "state.get" }))["state"].clone();
+        assert_eq!(stream(&mut e)["stream"], json!("off"));
+        send(&mut e, json!({ "type": "stream.start" }));
+        let s = stream(&mut e);
+        assert_eq!((s["stream"].clone(), s["streamWanted"].clone()), (json!("reconnecting"), json!(true)));
+        send(&mut e, json!({ "type": "stream.report", "status": "live" }));
+        assert_eq!(stream(&mut e)["stream"], json!("live"));
+        let later = Instant::now() + STREAM_REPORT_STALE + Duration::from_millis(1);
+        assert_eq!(e.view_at(later).stream, StreamStatus::Reconnecting, "a silent video process is never shown live");
+        send(&mut e, json!({ "type": "stream.report", "status": "reconnecting" }));
+        assert_eq!(stream(&mut e)["stream"], json!("reconnecting"));
+
+        // Wanted is saved; the live report is not.
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut restarted = Engine::new(store, snap, 3);
+        assert!(restarted.view().stream_wanted);
+        assert_eq!(restarted.view().stream, StreamStatus::Reconnecting);
+        send(&mut restarted, json!({ "type": "stream.stop" }));
+        assert_eq!(restarted.view().stream, StreamStatus::Off);
+    }
+
+    #[test]
+    fn subscribers_hear_when_a_stream_report_goes_stale() {
+        let (mut e, _) = engine("stale", 3);
+        let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
+        e.handle_line_from(
+            r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#,
+            Some(&Outbox::new(tx, None)),
+        );
+        send(&mut e, json!({ "type": "stream.start" }));
+        send(&mut e, json!({ "type": "stream.report", "status": "live" }));
+        let events: Vec<Value> = rx.try_iter().map(|b| serde_json::from_slice(&b).unwrap()).collect();
+        assert_eq!(events.last().unwrap()["state"]["stream"], json!("live"));
+        e.tick(); // nothing changed: nothing sent
+        assert!(rx.try_recv().is_err());
+        e.tick_at(Instant::now() + STREAM_REPORT_STALE + Duration::from_millis(1));
+        let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(ev["state"]["stream"], json!("reconnecting"));
+    }
+
+    #[test]
+    fn bad_input_is_nacked() {
+        let (mut e, _) = engine("bad", 3);
         assert_eq!(serde_json::to_value(e.handle_line("{")).unwrap()["code"], json!("bad_message"));
         let r =
             serde_json::to_value(e.handle_line(r#"{"v":9,"id":"z","ts":1,"command":{"type":"slide.next"}}"#)).unwrap();
@@ -356,7 +448,7 @@ mod tests {
         let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(
             ev,
-            json!({ "v": 1, "event": "state", "state": { "slideIndex": 5, "black": false, "stream": "off" } })
+            json!({ "v": 1, "event": "state", "state": { "slideIndex": 5, "black": false, "stream": "off", "streamWanted": false } })
         );
         assert!(rx.try_recv().is_err());
 

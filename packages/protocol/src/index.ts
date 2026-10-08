@@ -29,7 +29,13 @@ export type Command =
    * sent about ten times a second by the daemon's video process. The daemon relays them to
    * subscribers as `levels` events; they are not part of the saved state.
    */
-  | { type: "media.levels"; peakDb: number[]; rmsDb: number[] };
+  | { type: "media.levels"; peakDb: number[]; rmsDb: number[] }
+  /**
+   * Added in v1 without a version bump. The daemon's video process reports whether the stream
+   * it was asked for is actually reaching the platforms, about once a second. UIs read the
+   * result as `stream` in the state; they never send this.
+   */
+  | { type: "stream.report"; status: StreamStatus };
 
 export type CommandType = Command["type"];
 
@@ -94,6 +100,10 @@ function parseCommand(raw: unknown): CommandResult {
         return { ok: false, code: "bad_arguments", message: `media.levels needs peakDb and rmsDb: 1-${MAX_CHANNELS} numbers each, same length` };
       return { ok: true, command: { type: "media.levels", peakDb, rmsDb } };
     }
+    case "stream.report":
+      if (raw.status !== "off" && raw.status !== "live" && raw.status !== "reconnecting")
+        return { ok: false, code: "bad_arguments", message: "stream.report needs status off, live or reconnecting" };
+      return { ok: true, command: { type: "stream.report", status: raw.status } };
     case "output.black":
       if (typeof raw.on !== "boolean")
         return { ok: false, code: "bad_arguments", message: "output.black needs boolean on" };
@@ -135,6 +145,8 @@ export interface StateSnapshot {
   slideIndex: number;
   black: boolean;
   stream: StreamStatus;
+  /** Added in v1: the operator asked for the stream to be on (it may be reconnecting). */
+  streamWanted?: boolean;
 }
 
 export type Ack =

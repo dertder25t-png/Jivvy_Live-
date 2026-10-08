@@ -27,8 +27,10 @@ pub struct Feed {
     /// Newest camera frame (NV12 at the program size) and when it arrived.
     pub frame: Mutex<Option<(Instant, gst::Buffer)>>,
     pub audio: Mutex<AudioFifo>,
-    /// The engine's state, for the lyric layer.
+    /// The engine's state, for the lyric layer and the stream.
     pub live: Mutex<Option<LiveState>>,
+    /// Encoded packets for the stream destinations.
+    pub taps: Arc<crate::stream::Taps>,
     frames_encoded: AtomicU64,
     bytes_encoded: AtomicU64,
     overlay_renders: AtomicU64,
@@ -121,10 +123,12 @@ fn description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
          ! {overlay} ! queue max-size-buffers=3 leaky=downstream ! {enc} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au ! tee name=vt allow-not-linked=true \
          vt. ! queue ! fakesink name=vmon sync=false async=false \
+         vt. ! queue leaky=downstream max-size-time=2000000000 ! appsink name=vtap sync=false async=false max-buffers=32 drop=true \
          appsrc name=asrc is-live=true format=time do-timestamp=false block=false \
            caps=audio/x-raw,format=S16LE,rate={AUDIO_RATE},channels={AUDIO_CHANNELS},layout=interleaved \
          ! audioconvert ! avenc_aac bitrate=128000 ! aacparse ! tee name=at allow-not-linked=true \
-         at. ! queue ! fakesink sync=false async=false",
+         at. ! queue ! fakesink sync=false async=false \
+         at. ! queue leaky=downstream max-size-time=2000000000 ! appsink name=atap sync=false async=false max-buffers=64 drop=true",
         enc = encoder_description(enc, cfg, gpu),
     );
     // Developer aid until the recording item lands: also write the program to a file.
@@ -267,6 +271,25 @@ impl Program {
                 gst::PadProbeReturn::Ok
             },
         );
+
+        // Encoded packets go to the stream destinations, never blocking the program.
+        for (name, video) in [("vtap", true), ("atap", false)] {
+            let feed = self.feed.clone();
+            get(name)?.downcast::<gst_app::AppSink>().map_err(|_| format!("{name} is not an appsink"))?.set_callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        let packet = if video {
+                            crate::stream::Packet::Video(sample)
+                        } else {
+                            crate::stream::Packet::Audio(sample)
+                        };
+                        feed.taps.publish(packet);
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+        }
 
         // Lyric layer: drawn only when the text changes, then reused for every frame.
         let (feed, font, w, h) = (self.feed.clone(), self.font, self.cfg.width, self.cfg.height);

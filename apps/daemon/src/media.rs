@@ -276,6 +276,7 @@ pub struct Status {
     /// The engine acknowledged the latest level report or check (at least once a second).
     pub connected: bool,
     pub program: crate::program::ProgramStatus,
+    pub stream: crate::stream::StreamStatus,
     pub problems: Vec<String>,
 }
 

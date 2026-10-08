@@ -9,3 +9,4 @@ dist/
 target/
 *.mkv
 .stream-key
+.tools/

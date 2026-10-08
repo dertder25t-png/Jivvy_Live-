@@ -3,7 +3,8 @@
 //! windows (run headless): screens never blank while the engine restarts, a killed outputs
 //! process comes back on the current slide, and monitors can come and go. With the `video`
 //! feature, also camera and audio input (GStreamer test sources): levels reach screens,
-//! survive a video crash, and a missing camera never stops the audio.
+//! survive a video crash, and a missing camera never stops the audio; and streaming to a
+//! local MediaMTX server (the reliability table's "Internet drops" row).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +19,8 @@ const RESTORE_TARGET: Duration = Duration::from_secs(3);
 
 struct Daemon {
     watchdog: Child,
+    /// Held while this daemon runs a video process (see `VIDEO_SLOTS`).
+    _video_slot: Option<VideoSlot>,
     engine_starts: Receiver<u32>,
     outputs_starts: Receiver<u32>,
     #[allow(dead_code)] // only read by the video tests
@@ -30,6 +33,33 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.watchdog.kill();
         let _ = self.watchdog.wait();
+    }
+}
+
+/// Daemons with a video process run one at a time. Each loads GStreamer's GPU plugins at
+/// start-up and encodes 1080p30 on the machine's one hardware encoder: two or three at once
+/// held the founder's laptop to ~20 fps, while a church computer only ever runs one.
+const VIDEO_SLOTS: u32 = 1;
+static VIDEO_IN_USE: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+static VIDEO_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+struct VideoSlot;
+
+impl VideoSlot {
+    fn take() -> VideoSlot {
+        let mut n = VIDEO_IN_USE.lock().unwrap_or_else(|p| p.into_inner());
+        while *n >= VIDEO_SLOTS {
+            n = VIDEO_FREED.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        *n += 1;
+        VideoSlot
+    }
+}
+
+impl Drop for VideoSlot {
+    fn drop(&mut self) {
+        *VIDEO_IN_USE.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+        VIDEO_FREED.notify_one();
     }
 }
 
@@ -55,6 +85,7 @@ fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
 }
 
 fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&str]) -> Daemon {
+    let video_slot = (!extra.contains(&"--no-video")).then(VideoSlot::take);
     let addr = format!("127.0.0.1:{}", free_port());
     let outputs_flag = if headless_outputs { "--outputs-headless" } else { "--no-outputs" };
     let mut watchdog = Command::new(env!("CARGO_BIN_EXE_jivvy-watchdog"))
@@ -86,7 +117,7 @@ fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&
             }
         }
     });
-    Daemon { watchdog, engine_starts, outputs_starts, video_starts, addr, data_dir }
+    Daemon { watchdog, _video_slot: video_slot, engine_starts, outputs_starts, video_starts, addr, data_dir }
 }
 
 impl Daemon {
@@ -521,5 +552,244 @@ mod video {
             program(&s)["outFps"].as_f64().unwrap() < 40.0,
             "the rate isn't inflated by the old pipeline's frames: {s}"
         );
+    }
+
+    /// A local MediaMTX server standing in for YouTube/Facebook's RTMP ingest.
+    struct MediaMtx {
+        child: Option<Child>,
+        config: PathBuf,
+        rtmp: u16,
+        api: u16,
+    }
+
+    fn mediamtx_exe() -> PathBuf {
+        if let Some(p) = std::env::var_os("JIVVY_MEDIAMTX") {
+            return p.into();
+        }
+        let exe = if cfg!(windows) { "mediamtx.exe" } else { "mediamtx" };
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tools/mediamtx").join(exe);
+        assert!(p.exists(), "MediaMTX not found at {}; see apps/daemon/README.md (Streaming tests)", p.display());
+        p
+    }
+
+    impl MediaMtx {
+        fn start(dir: &std::path::Path) -> MediaMtx {
+            let (rtmp, api) = (free_port(), free_port());
+            let config = dir.join("mediamtx.yml");
+            std::fs::write(
+                &config,
+                format!(
+                    "logLevel: warn\napi: true\napiAddress: 127.0.0.1:{api}\nrtmp: true\nrtmpAddress: 127.0.0.1:{rtmp}\n\
+                     rtsp: false\nhls: false\nwebrtc: false\nsrt: false\nmoq: false\nplayback: false\n\
+                     paths:\n  all_others:\n"
+                ),
+            )
+            .unwrap();
+            let mut m = MediaMtx { child: None, config, rtmp, api };
+            m.restart();
+            m
+        }
+
+        fn restart(&mut self) {
+            let child = std::fs::File::create(self.config.with_extension("log")).and_then(|log| {
+                let err = log.try_clone()?;
+                Command::new(mediamtx_exe()).arg(&self.config).stdout(log).stderr(err).spawn()
+            });
+            self.child = Some(child.expect("MediaMTX starts"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.get_paths().is_none() {
+                if Instant::now() > deadline {
+                    let log = std::fs::read_to_string(self.config.with_extension("log")).unwrap_or_default();
+                    panic!("MediaMTX API didn't come up; its log:\n{log}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn kill(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+
+        fn get_paths(&self) -> Option<Vec<Value>> {
+            let mut s = TcpStream::connect(("127.0.0.1", self.api)).ok()?;
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            s.write_all(b"GET /v3/paths/list HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").ok()?;
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut s, &mut body).ok()?;
+            let json = body.split_once("\r\n\r\n")?.1;
+            serde_json::from_str::<Value>(json).ok()?["items"].as_array().cloned()
+        }
+
+        /// Bytes received on a ready path, if the stream is arriving.
+        fn receiving(&self) -> Option<u64> {
+            let paths = self.get_paths()?;
+            paths.iter().find(|p| p["ready"] == true).and_then(|p| p["bytesReceived"].as_u64())
+        }
+
+        /// Waits until the stream arrives and keeps growing.
+        fn wait_receiving(&self, within: Duration) {
+            let deadline = Instant::now() + within;
+            let mut first = None;
+            while Instant::now() < deadline {
+                if let Some(b) = self.receiving() {
+                    match first {
+                        None => first = Some(b),
+                        Some(f) if b > f + 100_000 => return,
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("MediaMTX never received a growing stream; paths {:?}", self.get_paths());
+        }
+    }
+
+    impl Drop for MediaMtx {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    const TEST_KEY: &str = "secret-key-do-not-leak-7731";
+
+    /// A daemon streaming test sources to `server_port`, and its video process's pid.
+    fn start_streaming(name: &str, server_port: u16) -> (Daemon, u32) {
+        let dir = test_dir(name);
+        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
+            .unwrap();
+        std::fs::write(
+            dir.join("stream.json"),
+            format!(
+                r#"{{"version":1,"destinations":[{{"id":"local","name":"Local test","url":"rtmp://127.0.0.1:{server_port}/live","key":"{TEST_KEY}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
+        let video = d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        (d, video)
+    }
+
+    fn stream_state(d: &Daemon) -> Value {
+        d.send(json!({ "type": "state.get" }), Duration::from_secs(5))["state"]["stream"].clone()
+    }
+
+    fn wait_stream_state(d: &Daemon, want: &str, within: Duration) {
+        let deadline = Instant::now() + within;
+        while stream_state(d) != want {
+            assert!(
+                Instant::now() < deadline,
+                "stream never became {want}; status {:?}",
+                std::fs::read_to_string(d.data_dir.join("media-status.json"))
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn the_stream_comes_back_by_itself_after_the_server_drops_and_the_program_never_notices() {
+        let dir = test_dir("stream-drop-mtx");
+        let mut server = MediaMtx::start(&dir);
+        let (d, _) = start_streaming("stream-drop", server.rtmp);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        server.wait_receiving(Duration::from_secs(20));
+        wait_stream_state(&d, "live", Duration::from_secs(10));
+
+        // The internet drops.
+        server.kill();
+        wait_stream_state(&d, "reconnecting", Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(3), "program still at full rate", |s| {
+            program(s)["state"] == "running" && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        });
+        let detail = s["stream"]["destinations"][0]["detail"].as_str().unwrap().to_string();
+        assert!(!detail.is_empty() && !detail.contains("gst") && !detail.contains(TEST_KEY), "plain words: {detail}");
+
+        // It comes back: no one touches anything.
+        std::thread::sleep(Duration::from_secs(3));
+        let back_at = Instant::now();
+        server.restart();
+        server.wait_receiving(Duration::from_secs(20));
+        wait_stream_state(&d, "live", Duration::from_secs(10));
+        println!("stream live again {:?} after the server returned", back_at.elapsed());
+        assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
+    }
+
+    #[test]
+    fn a_video_crash_resumes_the_stream_and_stop_really_disconnects() {
+        let dir = test_dir("stream-crash-mtx");
+        let server = MediaMtx::start(&dir);
+        let (d, video) = start_streaming("stream-crash", server.rtmp);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        wait_stream_state(&d, "live", Duration::from_secs(20));
+
+        // The engine keeps "wanted", so a restarted video process resumes the stream.
+        kill_hard(video);
+        d.video_starts.recv_timeout(Duration::from_secs(5)).expect("video restarted");
+        let back = Instant::now();
+        server.wait_receiving(Duration::from_secs(25));
+        wait_stream_state(&d, "live", Duration::from_secs(10));
+        println!("stream live again {:?} after the video process restarted", back.elapsed());
+
+        d.send(json!({ "type": "stream.stop" }), Duration::from_secs(5));
+        wait_stream_state(&d, "off", Duration::from_secs(3));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while server.receiving().is_some() {
+            assert!(Instant::now() < deadline, "the server still receives after stop");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn an_unreachable_server_is_reported_in_plain_words_and_the_key_never_leaks() {
+        let unused = free_port();
+        let (d, _) = start_streaming("stream-unreachable", unused);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(15), "a few failed attempts", |s| {
+            s["stream"]["destinations"][0]["reconnects"].as_u64().unwrap_or(0) >= 2
+        });
+        let dest = &s["stream"]["destinations"][0];
+        assert_eq!(dest["state"], "reconnecting");
+        assert!(dest["detail"].as_str().unwrap().contains("Can't reach"), "{dest}");
+        assert_eq!(dest["server"], format!("rtmp://127.0.0.1:{unused}/live"));
+        assert_eq!(stream_state(&d), "reconnecting");
+        for f in ["media-status.json", "state.json", "outputs-status.json", "media-memory.json"] {
+            if let Ok(text) = std::fs::read_to_string(d.data_dir.join(f)) {
+                assert!(!text.contains(TEST_KEY), "{f} contains the stream key");
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_that_accepts_but_never_answers_is_never_shown_live() {
+        // Accepts TCP connections and then says nothing: buffers still reach the sink.
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in silent.incoming().flatten() {
+                held.push(conn);
+            }
+        });
+        let (d, _) = start_streaming("stream-silent", port);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(14);
+        let mut reconnected = false;
+        while Instant::now() < deadline {
+            assert_ne!(stream_state(&d), "live", "never live when nothing reaches the server");
+            if let Ok(t) = std::fs::read_to_string(d.data_dir.join("media-status.json"))
+                && let Ok(v) = serde_json::from_str::<Value>(&t)
+            {
+                let dest = &v["stream"]["destinations"][0];
+                assert_ne!(dest["state"], "live", "{dest}");
+                if dest["reconnects"].as_u64().unwrap_or(0) >= 1 {
+                    assert!(dest["detail"].as_str().unwrap().contains("Can't reach"), "{dest}");
+                    reconnected = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(reconnected, "gave up on the silent server and reconnected");
     }
 }

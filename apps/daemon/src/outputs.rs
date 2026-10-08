@@ -268,7 +268,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         m.write_status().unwrap();
         assert_eq!(std::fs::metadata(dir.join(STATUS_FILE)).unwrap().modified().unwrap(), written);
-        m.shown = Some(LiveState { slide_index: 2, black: false });
+        m.shown = Some(LiveState { slide_index: 2, black: false, stream_wanted: false });
         m.write_status().unwrap();
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(STATUS_FILE)).unwrap()).unwrap();
         assert_eq!(status["shown"]["slideIndex"], 2);

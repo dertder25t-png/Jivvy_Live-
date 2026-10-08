@@ -13,6 +13,7 @@
 //! It draws the lyric layer, encodes once, and is where recording and streaming attach.
 
 mod program;
+mod stream;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +29,7 @@ use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, R
 use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, ProgramConfig};
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
 use program::{Feed, Program};
+use stream::Streamer;
 
 const TICK: Duration = Duration::from_millis(250);
 /// Devices and config are re-checked, and failed inputs retried, every this many ticks.
@@ -282,6 +284,9 @@ struct Video {
     feed: Arc<Feed>,
     device_cache: DeviceCache,
     program: Option<Program>,
+    streamer: Streamer,
+    /// The stream status last reported to the engine, and when.
+    stream_reported: Option<(&'static str, Instant)>,
     inputs: [Input; 2],
     devices: Vec<DeviceInfo>,
     config: media::MediaConfig,
@@ -358,6 +363,7 @@ impl Video {
         if let (Some(p), Some(e)) = (self.program.as_mut(), elapsed) {
             p.measure(e);
         }
+        self.streamer.reconcile(&self.args.data_dir, &self.feed);
         let raw: Vec<RawDevice> = self.device_cache.lock().unwrap().iter().map(|(r, _)| r.clone()).collect();
         self.devices = media::devices(&raw);
         let remembered = self.memory.clone();
@@ -401,6 +407,13 @@ impl Video {
         if self.inputs[0].pipeline.is_none() {
             *self.feed.frame.lock().unwrap() = None; // slate right away, not after the stale timeout
         }
+        let wanted = self.feed.live.lock().unwrap().is_some_and(|s| s.stream_wanted);
+        let stream = self.streamer.status(wanted);
+        // Tell the engine on every change and once a second (it treats silence as trouble).
+        if self.stream_reported.is_none_or(|(s, at)| s != stream.status || at.elapsed() >= Duration::from_secs(1)) {
+            self.levels.report_stream(stream.status);
+            self.stream_reported = Some((stream.status, Instant::now()));
+        }
         let status = Status {
             devices: self.devices.clone(),
             camera: self.inputs[0].status(),
@@ -408,6 +421,7 @@ impl Video {
             peak_db: self.last_peak.clone(),
             connected: self.levels.delivering(),
             program: self.program.as_ref().map(|p| p.status()).unwrap_or_default(),
+            stream,
             problems: self.problems.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&status)
@@ -457,6 +471,8 @@ fn main() {
         feed,
         device_cache: Arc::default(),
         program: None,
+        streamer: Streamer::new(),
+        stream_reported: None,
         inputs: [Input::new(Kind::Camera), Input::new(Kind::Microphone)],
         devices: Vec::new(),
         config: media::MediaConfig::default(),

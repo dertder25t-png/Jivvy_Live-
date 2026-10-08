@@ -69,8 +69,10 @@ fn main() {
     match video {
         Some(exe) if exe.exists() => {
             let args = [shared, vec!["--connect".into(), listen]].concat();
-            // Opening a camera can take a few seconds the first time.
-            children.push(ChildSpec { name: "video", exe, args, hang_timeout, startup_grace: Duration::from_secs(10) });
+            // Start-up loads GStreamer's GPU, encoder and device plugins: about 5 s normally,
+            // much longer on a busy machine (e.g. Windows Update at boot). Killing it for a
+            // slow start would mean it never starts, so the first heartbeat gets 30 s.
+            children.push(ChildSpec { name: "video", exe, args, hang_timeout, startup_grace: Duration::from_secs(30) });
         }
         Some(exe) => {
             jivvy_daemon::log("watchdog", format!("{} not installed; running without camera and audio", exe.display()))

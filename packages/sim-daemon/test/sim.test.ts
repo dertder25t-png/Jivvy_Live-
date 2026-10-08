@@ -52,7 +52,7 @@ describe("SimDaemon", () => {
   it("reports state on every ack, including state.get", async () => {
     const { send } = setup();
     await send({ type: "slide.goto", index: 2 });
-    expect(await send({ type: "state.get" })).toMatchObject({ ok: true, state: { slideIndex: 2, black: false, stream: "off" } });
+    expect(await send({ type: "state.get" })).toMatchObject({ ok: true, state: { slideIndex: 2, black: false, stream: "off", streamWanted: false } });
   });
 
   it("notifies subscribers and supports unsubscribe", async () => {

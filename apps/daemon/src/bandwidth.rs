@@ -115,6 +115,8 @@ pub struct Manager {
     /// Estimated upload speed; None until the connection has shown a limit.
     capacity: Option<f64>,
     congested_since: Option<Instant>,
+    /// What the connection carried each second of the current congestion (kbps).
+    carried: Vec<f64>,
     calm_since: Instant,
     last_change: Instant,
     /// The last change was a step up that hasn't proved itself yet.
@@ -128,6 +130,7 @@ impl Manager {
         Manager {
             capacity: None,
             congested_since: None,
+            carried: Vec::new(),
             calm_since: now,
             last_change: now - SETTLE,
             probing: false,
@@ -155,6 +158,7 @@ impl Manager {
             self.observe(ladder, order, reports, now);
         } else {
             (self.congested_since, self.calm_since, self.probing) = (None, now, false);
+            self.carried.clear();
         }
         self.assigned = allocate(ladder, order, self.capacity);
         self.assigned.clone()
@@ -165,9 +169,11 @@ impl Manager {
         if reports.iter().any(|r| r.congested) {
             self.calm_since = now;
             let since = *self.congested_since.get_or_insert(now);
+            self.carried.push(reports.iter().map(|r| r.sent_kbps).sum());
             if now.duration_since(since) >= CONGESTED_FOR && settled {
-                // What the connection really carried, or a direct measurement if higher.
-                let carried: f64 = reports.iter().map(|r| r.sent_kbps).sum();
+                // What the connection really carried over the whole stretch (one second can
+                // show nothing while a blocked socket drains), or a direct measurement if higher.
+                let carried = self.carried.iter().sum::<f64>() / self.carried.len() as f64;
                 let measured = reports.iter().filter_map(|r| r.capacity_kbps).fold(carried, f64::max);
                 if self.probing {
                     self.probe_wait = (self.probe_wait * 2).min(PROBE_MAX);
@@ -176,10 +182,12 @@ impl Manager {
                 let current = self.capacity.unwrap_or(f64::INFINITY);
                 self.capacity = Some(measured.min(current * 0.9).max(1.0));
                 (self.probing, self.congested_since, self.last_change) = (false, None, now);
+                self.carried.clear();
             }
             return;
         }
         self.congested_since = None;
+        self.carried.clear();
         let calm = now.duration_since(self.calm_since);
         if self.probing && calm >= PROBE_AFTER {
             // The step up held.
@@ -203,14 +211,16 @@ fn next_step(ladder: &[Quality], order: &[String], c: f64) -> Option<f64> {
     if now == best {
         return None;
     }
-    let mut next = c;
-    for _ in 0..64 {
+    // Grows from any estimate, however low, until someone steps up (at the latest when the
+    // budget covers everyone at the best quality).
+    let everyone_best = ladder.first().map_or(0, |q| q.kbps()) as f64 * order.len() as f64 / SPEND;
+    let mut next = c.max(1.0);
+    loop {
         next *= 1.05;
-        if allocate(ladder, order, Some(next)) != now {
+        if allocate(ladder, order, Some(next)) != now || next > everyone_best {
             return Some(next);
         }
     }
-    None
 }
 
 /// Auto mode: fit `order` (highest priority first) into 70% of `capacity`.
@@ -352,6 +362,26 @@ mod tests {
         }
         assert_eq!(m.capacity_kbps(), Some(5_000.0));
         assert_eq!(m.assigned["youtube"], Some(Tier::P720), "3.5 Mbps to spend");
+    }
+
+    #[test]
+    fn a_second_when_the_socket_takes_nothing_doesnt_collapse_the_estimate() {
+        let (l, order) = (program(), ids(1));
+        let t0 = Instant::now();
+        let mut m = Manager::new(t0);
+        for (s, sent) in [(0, 1100.0), (1, 900.0), (2, 1000.0), (3, 0.0)] {
+            m.update(&l, &order, &[report("youtube", sent, true)], true, t0 + Duration::from_secs(s));
+        }
+        assert_eq!(m.capacity_kbps(), Some(750.0), "the average, not the last second's 0");
+    }
+
+    #[test]
+    fn steps_up_even_from_a_tiny_estimate() {
+        let (l, order) = (program(), ids(1));
+        assert!(
+            next_step(&l, &order, 1.0).is_some_and(|c| allocate(&l, &order, Some(c))["youtube"] == Some(Tier::P480))
+        );
+        assert_eq!(next_step(&l, &order, 100_000.0), None, "already at the best");
     }
 
     #[test]

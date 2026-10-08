@@ -107,7 +107,12 @@ fn start_with_env(
         .env("JIVVY_TEST_HOOKS", "1")
         .envs(envs.iter().copied())
         .stdout(Stdio::piped())
-        .stderr(if std::env::var_os("JIVVY_TEST_STDERR").is_some() { Stdio::inherit() } else { Stdio::null() })
+        // The daemon's log goes to a file in its data directory, shown when a check fails.
+        .stderr(if std::env::var_os("JIVVY_TEST_STDERR").is_some() {
+            Stdio::inherit()
+        } else {
+            std::fs::File::create(data_dir.join("daemon.log")).map(Stdio::from).unwrap_or(Stdio::null())
+        })
         .spawn()
         .unwrap();
     let (engine_tx, engine_starts) = channel();
@@ -133,6 +138,13 @@ fn start_with_env(
 }
 
 impl Daemon {
+    /// The last lines of the daemon's log, for a failure message.
+    fn log_tail(&self) -> String {
+        let log = std::fs::read_to_string(self.data_dir.join("daemon.log")).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        format!("daemon log (last 40 lines):\n{}", lines[lines.len().saturating_sub(40)..].join("\n"))
+    }
+
     /// Waits for the next "engine started" event and returns the engine's pid.
     fn next_engine_pid(&self, within: Duration) -> u32 {
         self.engine_starts.recv_timeout(within).expect("engine did not (re)start in time")
@@ -413,7 +425,7 @@ mod video {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            panic!("video never reached: {what}; last status {last}");
+            panic!("video never reached: {what}; last status {last}\n{}", self.log_tail());
         }
     }
 

@@ -169,11 +169,7 @@ impl Daemon {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!(
-            "outputs never reached: {what}; last status {last}
-{}",
-            self.log_tail()
-        );
+        panic!("outputs never reached: {what}; last status {last}\n{}", self.log_tail());
     }
 
     /// Sends one command, retrying the connection until the engine answers or time runs out.

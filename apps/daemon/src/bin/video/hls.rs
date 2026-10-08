@@ -18,7 +18,9 @@ use jivvy_daemon::stream::{Destination, DestinationStatus, reconnect_delay};
 use jivvy_daemon::{log, now_ms};
 
 use crate::program::Feed;
-use crate::stream::{Packet, restarted, retimed, running_time, set, wanted};
+use jivvy_daemon::bandwidth::{Quality, Tier};
+
+use crate::stream::{Link, PAUSED_DETAIL, Packet, lowered_detail, restarted, retimed, running_time, set, wanted};
 
 /// One destination's queue, shared by its segmenter and uploader.
 struct Shared {
@@ -84,6 +86,7 @@ pub fn run(
     feed: Arc<Feed>,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<DestinationStatus>>,
+    link: Arc<Link>,
     data_dir: PathBuf,
 ) {
     let name = spool_name(&dest.id);
@@ -111,9 +114,9 @@ pub fn run(
     }
     let done = Arc::new(AtomicBool::new(false));
     let uploader = {
-        let (dest, feed, shared, done, status) =
-            (dest.clone(), feed.clone(), shared.clone(), done.clone(), status.clone());
-        std::thread::spawn(move || upload(dest, feed, shared, done, status))
+        let (dest, feed, shared, done, status, link) =
+            (dest.clone(), feed.clone(), shared.clone(), done.clone(), status.clone(), link.clone());
+        std::thread::spawn(move || upload(dest, feed, shared, done, status, link))
     };
 
     let mut attempt = 0u32;
@@ -139,7 +142,22 @@ pub fn run(
             }
             Some(true) => reset = false,
         }
-        match segment(&feed, &stop, &shared) {
+        let Some(quality) = link.assigned() else {
+            // Paused for bandwidth: nothing new is cut; the uploader finishes what it has.
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        let result = segment(&feed, &stop, &shared, &link, quality);
+        // Stepped down: a backlog at the old bitrate would take far too long through the
+        // slow connection, so it's skipped (the segment on its way up finishes).
+        if link.assigned().is_none_or(|q| q.tier > quality.tier) {
+            let mut q = shared.queue.lock().unwrap();
+            for skipped in q.skip_backlog() {
+                let _ = std::fs::remove_file(shared.spool.join(&skipped.name));
+            }
+            shared.save(&mut q);
+        }
+        match result {
             Ok(()) => attempt = 0,
             Err(e) => {
                 attempt += 1;
@@ -159,13 +177,16 @@ pub fn run(
     set(&status, "off", String::new(), 0.0);
 }
 
-/// Cuts the program into segments until the stream isn't wanted (Ok) or something fails.
-fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared) -> Result<(), String> {
-    let sub = feed.taps.subscribe();
-    // Start on a keyframe (the program sends one every 2 s), with audio from then on.
-    let deadline = Instant::now() + Duration::from_secs(5);
+/// Cuts the program (at `quality`) into segments until the stream isn't wanted or the
+/// bandwidth manager picks another quality (Ok), or something fails.
+fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared, link: &Link, quality: Quality) -> Result<(), String> {
+    let sub = feed.taps.subscribe(quality.tier);
+    let still_wanted = || !stop.load(Ordering::Relaxed) && wanted(feed) && link.assigned() == Some(quality);
+    // Start on a keyframe (the program sends one every 2 s), with audio from then on. A
+    // lower quality's encode may need a few seconds to start.
+    let deadline = Instant::now() + Duration::from_secs(if quality.tier == Tier::Full { 5 } else { 10 });
     let first = loop {
-        if stop.load(Ordering::Relaxed) || !wanted(feed) {
+        if !still_wanted() {
             return Ok(());
         }
         match sub.rx.recv_timeout(Duration::from_millis(100)) {
@@ -226,7 +247,7 @@ fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared) -> Result<(), S
     let mut last_video = running_time(&first).map(|(t, _)| t);
     let mut opened_at: Option<u64> = None;
     let result = loop {
-        if stop.load(Ordering::Relaxed) || !wanted(feed) {
+        if !still_wanted() {
             break Ok(());
         }
         if sub.overflowed.load(Ordering::Relaxed) {
@@ -315,6 +336,7 @@ fn upload(
     shared: Arc<Shared>,
     done: Arc<AtomicBool>,
     status: Arc<Mutex<DestinationStatus>>,
+    link: Arc<Link>,
 ) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -328,20 +350,43 @@ fn upload(
     let mut confirmed_any = false;
     let mut last_error: Option<String> = None;
     let (mut sent, mut rate_from, mut kbps) = (0u64, Instant::now(), 0.0);
+    // How fast the last segment went up, and when: a direct measure of the upload speed.
+    let mut speed: Option<(f64, Instant)> = None;
+    let mut last_confirmed: Option<Instant> = None;
 
     while !done.load(Ordering::Relaxed) {
         // Status first, so it stays current while waiting.
         if wanted(&feed) {
-            let behind = shared.queue.lock().unwrap().behind();
-            let (state, detail) = hls::health(confirmed_any, last_error.as_deref(), behind);
+            let (behind, waiting) = {
+                let q = shared.queue.lock().unwrap();
+                (q.behind(), q.waiting.len())
+            };
             let elapsed = rate_from.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 kbps = sent as f64 * 8.0 / 1000.0 / elapsed.as_secs_f64();
                 (sent, rate_from) = (0, Instant::now());
+                // Congested: connected and sending, but video piles up faster than it goes
+                // (a dead connection isn't congestion: that's for reconnecting, not for a
+                // lower quality).
+                let flowing =
+                    last_error.is_none() && last_confirmed.is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+                let congested = flowing && behind > hls::LIVE_BEHIND;
+                let measured = speed.filter(|(_, at)| at.elapsed() < Duration::from_secs(10)).map(|(k, _)| k);
+                link.report(kbps, congested, measured);
+            }
+            let quality = link.assigned();
+            let (mut state, mut detail) = hls::health(confirmed_any, last_error.as_deref(), behind);
+            match quality {
+                None if waiting == 0 => (state, detail) = ("paused", PAUSED_DETAIL.into()),
+                Some(q) if state == "live" => detail = lowered_detail(&q),
+                _ => {}
             }
             set(&status, state, detail, kbps);
+            status.lock().unwrap().quality = quality.map(|q| q.label()).unwrap_or_default();
         } else {
             set(&status, "off", String::new(), 0.0);
+            status.lock().unwrap().quality.clear();
+            link.report(0.0, false, None);
             (attempt, retry_at, confirmed_any, last_error) = (0, None, false, None);
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -371,9 +416,13 @@ fn upload(
             Outcome::Unusable(e) => Outcome::Retry(format!("playlist: {e}")),
             Outcome::Confirmed => match std::fs::read(shared.spool.join(&segment.name)) {
                 Ok(bytes) => {
+                    let started = Instant::now();
                     let o = put(&agent, &dest.hls_url(&segment.name), "video/MP2T", &bytes);
                     if o == Outcome::Confirmed {
                         sent += (bytes.len() + playlist.len()) as u64;
+                        let secs = started.elapsed().as_secs_f64().max(0.001);
+                        speed = Some((bytes.len() as f64 * 8.0 / 1000.0 / secs, Instant::now()));
+                        last_confirmed = Some(Instant::now());
                     }
                     o
                 }

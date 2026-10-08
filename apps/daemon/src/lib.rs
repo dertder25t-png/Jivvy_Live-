@@ -8,6 +8,7 @@
 //! - `jivvy-outputs` shows the state fullscreen on the projector and other screens. It
 //!   follows the engine like any other device, so an engine restart never blanks a screen.
 
+pub mod bandwidth;
 pub mod client;
 pub mod engine;
 pub mod hls;

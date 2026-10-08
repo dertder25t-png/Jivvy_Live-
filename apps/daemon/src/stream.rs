@@ -294,18 +294,23 @@ pub struct DestinationStatus {
     pub id: String,
     pub name: String,
     pub server: String,
-    /// "off", "connecting", "live" or "reconnecting".
+    /// "off", "connecting", "live", "reconnecting", or "paused" (by the bandwidth manager:
+    /// the upload can't carry this platform too).
     pub state: &'static str,
     pub detail: String,
     pub kbps: f64,
     pub reconnects: u32,
+    /// What it sends: "1080p", "720p", ... (the bandwidth manager's choice), or "" when off.
+    pub quality: String,
 }
 
-/// What screens see: live only when every enabled destination is live.
+/// What screens see: live only when every destination is live, apart from ones the
+/// bandwidth manager paused (as long as one is still live).
 pub fn overall(wanted: bool, destinations: &[DestinationStatus]) -> &'static str {
+    let sending: Vec<&DestinationStatus> = destinations.iter().filter(|d| d.state != "paused").collect();
     if !wanted {
         "off"
-    } else if !destinations.is_empty() && destinations.iter().all(|d| d.state == "live") {
+    } else if !sending.is_empty() && sending.iter().all(|d| d.state == "live") {
         "live"
     } else {
         "reconnecting"
@@ -320,6 +325,20 @@ pub struct StreamStatus {
     pub status: &'static str,
     pub destinations: Vec<DestinationStatus>,
     pub problems: Vec<String>,
+    /// The upload speed the bandwidth manager is working with (kbps); None until the
+    /// connection has shown a limit.
+    pub upload_kbps: Option<f64>,
+    /// Lower-quality encodes running for stepped-down destinations.
+    pub encodes: Vec<EncodeStatus>,
+}
+
+/// One lower-quality encode.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeStatus {
+    pub quality: String,
+    pub encoder: String,
+    pub frames_encoded: u64,
 }
 
 #[cfg(test)]
@@ -522,8 +541,11 @@ mod tests {
             detail: String::new(),
             kbps: 0.0,
             reconnects: 0,
+            quality: String::new(),
         };
         assert_eq!(overall(false, &[d("live")]), "off");
+        assert_eq!(overall(true, &[d("live"), d("paused")]), "live", "paused for bandwidth");
+        assert_eq!(overall(true, &[d("paused")]), "reconnecting", "nothing going out");
         assert_eq!(overall(true, &[d("live"), d("live")]), "live");
         assert_eq!(overall(true, &[d("live"), d("reconnecting")]), "reconnecting");
         assert_eq!(overall(true, &[]), "reconnecting", "wanted but nowhere to send it");

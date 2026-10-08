@@ -81,7 +81,7 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
   ```
 - **Keys stay secret:** they go only to the RTMP sink, never into a pipeline description, log line, status file or error message (errors are scrubbed, and a broken `stream.json` is reported by line number, never by content). The screen shows the reason in plain words ("Can't reach the streaming server…"); the log keeps the technical one.
 - **Video and audio line up by running time,** not raw timestamps: the encoders shift video timestamps (Media Foundation by 1000 hours), and comparing raw ones dropped every audio packet. The tests check that the server gets both tracks.
-- Still to come in the streaming item: the bandwidth manager and two-connection support.
+- Still to come in the streaming item: Advanced mode for the bandwidth manager (below) and two-connection support.
 
 ## Streaming to YouTube (HLS segment upload)
 
@@ -100,6 +100,18 @@ A destination whose address is `https://` uses YouTube's HLS ingestion instead o
 - **Live** means YouTube has confirmed segments and no more than 6 s of video is waiting; otherwise `reconnecting`, with the reason or how far behind it is.
 - **Keys stay secret:** the key goes only into the upload address handed to the HTTP client; status shows `https://a.upload.youtube.com/http_upload_hls`, errors are scrubbed, and the queue file stores a hash to tell keys apart. Plain `http://` is accepted only for this computer (test servers).
 - Still to check: a private YouTube event, once the channel can go live.
+
+## Bandwidth manager (Auto mode)
+
+`program ─> raw tap (closed unless needed) ─> 720p / 480p / 360p encodes (each its own pipeline, only while used) ─> taps`
+
+- **The recording never gets worse.** The program is always encoded at full quality for the recording (and for destinations the upload can carry). A destination that has to step down gets a lower quality from its own extra encode: 720p (3 Mbps), 480p (1.5 Mbps) or 360p (0.5 Mbps), plus the program's audio (128 kbps). An extra encode starts only while a destination uses it, stops 10 s after the last one leaves, and fails over to the next encoder like the program does; the program's picture reaches them through a valve that is closed (free) otherwise.
+- **Measures the upload continuously** from what each connection really carries: for RTMP, bytes handed to the sink minus bytes the socket took (the RTMP sink keeps whatever it can't send, so a slow upload shows there, never as a failed connection); for YouTube HLS, how fast each segment goes up and whether video piles up on disk. A dead connection isn't congestion: it is retried, never answered with a lower quality.
+- **Spends about 70%** of the measured upload, keeping the rest to catch up after drops.
+- **Auto mode** (the default): destinations are in priority order, the first in `stream.json` being the main platform. The main platform gets the best quality that fits while keeping the lowest for everyone else; when even that doesn't fit, the lowest-priority platform is **paused** first. The main platform is never paused.
+- **Down quickly, up carefully.** 3 s of congestion steps down (to what fits the measured speed, possibly several steps at once); 20 s without congestion tries one step up; a step up that congests again doubles the wait before the next try (up to 160 s). Every change costs that platform a reconnect, so changes are at least 8 s apart. A YouTube destination that steps down skips its backlog at the old bitrate (it would take minutes through the slow connection), keeping its sequence numbers correct.
+- **Status** (`media-status.json` → `stream`): each destination's `quality` and a plain-words `detail` ("Lowered to 480p: the internet upload is slow. It goes back up by itself." / "Paused: …"), the `uploadKbps` estimate, and the extra `encodes` running. Screens see `live` while every platform that isn't paused is live.
+- Next: Advanced mode (the church ranks platforms, sets a top quality per platform, and picks lower quality, audio only or pause when short), the pre-flight summary ("YouTube 1080p + Facebook 720p"), and alerts when a platform is lowered or paused.
 
 ## Command channel (for now)
 
@@ -153,6 +165,8 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | YouTube HLS (fake ingest that enforces YouTube's rules): connection dead for 20 s | Segments keep being cut to disk; `reconnecting` in plain words; program at ~30 fps; every segment arrives in order once it's back, caught up and live ~4.7 s later; each segment decodes on its own with picture (2 s at 30 fps) and sound |
 | YouTube HLS: kill the video process, then stop and start again | Same playlist carried on (sequence numbers only grow, no name reused), live ~10.7 s after the kill; nothing sent after stop; the next start begins at sequence 0 |
 | YouTube HLS: key not accepted (401) | `reconnecting`, "The platform rejected the stream…", retries counted, the key in no status, state or queue file |
+| Slow upload: RTMP through a proxy throttled to 1 Mbps, then unthrottled | Live at 360p ~9.6 s after the drop ("Lowered to 360p…", upload estimate ~1 Mbps); the program stays 1080p30 at full bitrate; back up a step ~20 s after the upload returns; the video process never restarts |
+| Two platforms on one 1.2 Mbps upload (YouTube HLS first, Facebook RTMP second) | Facebook paused ("Paused: …"), YouTube live at 360p within YouTube's ingestion rules; screens show `live` |
 
 The video tests run one daemon at a time: a church computer runs one program, and several 1080p30 encodes sharing a laptop's hardware encoder held it to ~20 fps.
 

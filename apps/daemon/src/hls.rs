@@ -74,6 +74,11 @@ pub struct Queue {
     /// The server has accepted a playlist, so the numbers it listed are spoken for.
     #[serde(default)]
     pub playlist_accepted: bool,
+    /// Sequence numbers used up right after the first waiting segment by segments skipped
+    /// behind it (`skip_backlog`). Until it is confirmed or discarded, nothing after it is
+    /// listed; then the playlist starts after the gap.
+    #[serde(default)]
+    pub gap: u64,
     /// Where the last segment cut ends, in nanoseconds of stream time: the next segmenter
     /// run carries timestamps on from here.
     pub end_ns: u64,
@@ -133,11 +138,28 @@ impl Queue {
         if self.listed > 0 {
             self.listed -= 1;
             if self.playlist_accepted {
-                self.first_seq += self.confirmed.len() as u64 + 1;
+                self.first_seq += self.confirmed.len() as u64 + 1 + self.gap;
                 self.confirmed.clear();
             }
         }
+        self.gap = 0;
         true
+    }
+
+    /// Gives up on everything waiting behind the next segment (which may be on its way
+    /// up): after stepping down to a lower quality, a backlog at the old bitrate would
+    /// take far too long through the slow connection. Returns the skipped segments.
+    pub fn skip_backlog(&mut self) -> Vec<Segment> {
+        if self.waiting.len() <= 1 {
+            return Vec::new();
+        }
+        let skipped: Vec<Segment> = self.waiting.drain(1..).collect();
+        if self.playlist_accepted {
+            self.gap += self.listed.saturating_sub(1) as u64;
+        }
+        self.listed = self.listed.min(1);
+        self.skipped_secs += skipped.iter().map(|s| s.duration).sum::<f64>();
+        skipped
     }
 
     /// Adds a segment just cut, ending at `end_ns`. Returns segments skipped to keep the
@@ -162,7 +184,8 @@ impl Queue {
 
     /// The playlist to send before the next segment. Marks what it lists as listed.
     pub fn playlist(&mut self) -> String {
-        let n = self.waiting.len().min(OUTSTANDING);
+        // Numbers after the first waiting segment are used up: list nothing past it yet.
+        let n = self.waiting.len().min(if self.gap > 0 { 1 } else { OUTSTANDING });
         self.listed = self.listed.max(n);
         let listed: Vec<&Segment> = self.confirmed.iter().chain(self.waiting.iter().take(n)).collect();
         // Every segment, rounded, must fit the target duration, and it should never change.
@@ -195,6 +218,11 @@ impl Queue {
         if self.confirmed.len() > CONFIRMED_LISTED {
             self.confirmed.pop_front();
             self.first_seq += 1;
+        }
+        if self.gap > 0 {
+            // A playlist lists consecutive numbers: start after the gap.
+            self.first_seq += self.confirmed.len() as u64 + self.gap;
+            (self.confirmed, self.gap) = (VecDeque::new(), 0);
         }
         true
     }
@@ -391,6 +419,39 @@ mod tests {
         assert!(q.confirm("s7-00003.ts"));
         q.push(seg(4), 0);
         assert_eq!(listed(&q.playlist()), [(3, "s7-00003.ts".into()), (4, "s7-00004.ts".into())]);
+    }
+
+    #[test]
+    fn stepping_down_skips_the_backlog_but_never_reuses_a_number() {
+        let mut q = Queue::new(1);
+        q.push(seg(0), 0);
+        q.playlist();
+        q.accept_playlist();
+        q.confirm("s7-00000.ts");
+        for i in 1..=6 {
+            q.push(seg(i), 0);
+        }
+        q.playlist(); // lists 1..=5 (sequence 1..=5); 1 is being uploaded
+        let skipped = q.skip_backlog();
+        assert_eq!(skipped.len(), 5);
+        assert_eq!(q.waiting.len(), 1);
+        q.push(seg(7), 0);
+        assert_eq!(
+            listed(&q.playlist()),
+            [(0, "s7-00000.ts".into()), (1, "s7-00001.ts".into())],
+            "nothing past the gap while 1 is on its way"
+        );
+        assert!(q.confirm("s7-00001.ts"));
+        assert_eq!(listed(&q.playlist()), [(6, "s7-00007.ts".into())], "2-5 were listed: used up");
+
+        // The same when the segment on its way is then rejected.
+        q.push(seg(8), 0);
+        q.push(seg(9), 0);
+        q.playlist(); // 7, 8, 9 as 6, 7, 8
+        q.skip_backlog();
+        assert!(q.discard("s7-00007.ts"));
+        q.push(seg(10), 0);
+        assert_eq!(listed(&q.playlist()), [(9, "s7-00010.ts".into())]);
     }
 
     #[test]

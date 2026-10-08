@@ -360,6 +360,8 @@ fn upload(
     // How fast the last segment went up, and when: a direct measure of the upload speed.
     let mut speed: Option<(f64, Instant)> = None;
     let mut last_confirmed: Option<Instant> = None;
+    // Segments go up in bursts: while congested the report averages.
+    let mut sent_avg = crate::stream::Average::default();
     // The last segment that didn't fit through in time, how many tries, and when.
     let mut too_slow: Option<(String, u32, Instant)> = None;
 
@@ -384,7 +386,7 @@ fn upload(
                 let slow = too_slow.as_ref().is_some_and(|(_, _, at)| at.elapsed() < Duration::from_secs(20));
                 let congested = slow || (flowing && behind > hls::LIVE_BEHIND);
                 let measured = speed.filter(|(_, at)| at.elapsed() < Duration::from_secs(10)).map(|(k, _)| k);
-                link.report(kbps, congested, measured);
+                link.report(sent_avg.add(kbps, congested), congested, measured);
             }
             let Some(quality) = link.assigned() else {
                 // Paused for bandwidth: stop at once, so the connection goes to the platforms

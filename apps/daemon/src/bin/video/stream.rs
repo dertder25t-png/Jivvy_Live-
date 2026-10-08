@@ -130,6 +130,33 @@ impl Link {
     }
 }
 
+/// What a connection carried while congested: the mean of its one-second rates since the
+/// congestion began (at most the last 10), so one second when the socket took nothing
+/// doesn't read as no upload at all, and the faster seconds before it don't count.
+#[derive(Default)]
+pub(crate) struct Average {
+    rates: std::collections::VecDeque<f64>,
+    congested: bool,
+}
+
+impl Average {
+    /// Adds this second's rate and returns what to report.
+    pub(crate) fn add(&mut self, kbps: f64, congested: bool) -> f64 {
+        if congested && !self.congested {
+            self.rates.clear();
+        }
+        self.congested = congested;
+        if !congested {
+            return kbps;
+        }
+        self.rates.push_back(kbps);
+        if self.rates.len() > 10 {
+            self.rates.pop_front();
+        }
+        self.rates.iter().sum::<f64>() / self.rates.len() as f64
+    }
+}
+
 /// What a destination shows while live at `quality`.
 pub(crate) fn lowered_detail(quality: &Quality) -> String {
     if quality.tier == Tier::Full {
@@ -458,7 +485,11 @@ fn session(
     let mut last_pushed = 0u64;
     // When the socket last took bytes: congestion needs data still moving (on an overloaded
     // link it can take nothing for seconds at a time; a dead link takes nothing at all).
-    let mut last_moved = Instant::now();
+    let mut last_moved: Option<Instant> = None;
+    // The backlog over the last few seconds, and what the socket took each second (the
+    // report averages it: on a stalling link single seconds are often 0).
+    let mut backlogs: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut sent = Average::default();
 
     let mut audio_caps_set = false;
     let mut last_video = running_time(&first).map(|(t, _)| t);
@@ -546,12 +577,22 @@ fn session(
             }
             let behind = st.window > 0 && st.out_bytes.saturating_sub(st.acked) > 2 * st.window;
             if kbps > 32.0 {
-                last_moved = now;
+                last_moved = Some(now);
             }
-            let moving = now.duration_since(last_moved) < Duration::from_secs(10);
-            link.report(kbps, settled && moving && (backlog > second || behind), None);
+            // A connection that never sent anything is broken, not congested.
+            let moving = last_moved.is_some_and(|t| now.duration_since(t) < Duration::from_secs(10));
+            // Growing, not just above a level: a muxer holds a steady bit back (a tiny
+            // stream waits on its slow picture), and that's no reason to step down.
+            backlogs.push_back(backlog);
+            if backlogs.len() > 4 {
+                backlogs.pop_front();
+            }
+            let growing = backlogs.len() == 4 && backlog > backlogs[0] + second / 2;
+            let piling_up = backlog > second && growing;
+            let congested = settled && moving && (piling_up || behind);
+            link.report(sent.add(kbps, congested), congested, None);
             let mut s = status.lock().unwrap();
-            if delivery == Delivery::Live && backlog > 2 * second {
+            if delivery == Delivery::Live && piling_up {
                 // Connected, but the video goes out slower than it's made: viewers fall behind.
                 s.state = "reconnecting";
                 s.detail = "The internet upload is slower than the stream. Lowering the quality.".into();

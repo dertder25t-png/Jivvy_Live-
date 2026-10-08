@@ -293,7 +293,8 @@ fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared, link: &Link, qu
                             else {
                                 continue;
                             };
-                            let segment = Segment { name, duration: end.saturating_sub(start) as f64 / 1e9 };
+                            let duration = end.saturating_sub(start) as f64 / 1e9;
+                            let segment = Segment { name, duration, kbps: quality.kbps() };
                             let mut q = shared.queue.lock().unwrap();
                             for skipped in q.push(segment, end) {
                                 let _ = std::fs::remove_file(shared.spool.join(&skipped.name));
@@ -317,13 +318,19 @@ fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared, link: &Link, qu
 }
 
 /// Uploads one file. The URL holds the key: it goes only to the HTTP client.
-fn put(agent: &ureq::Agent, url: &str, content_type: &str, body: &[u8]) -> Outcome {
-    match agent.put(url).header("Content-Type", content_type).send(body) {
+fn put(agent: &ureq::Agent, url: &str, content_type: &str, body: &[u8], timeout: Duration) -> Outcome {
+    let request = agent.put(url).header("Content-Type", content_type).config().timeout_global(Some(timeout)).build();
+    match request.send(body) {
         Ok(resp) => {
             let status = resp.status().as_u16();
             // Read the (tiny) answer so the connection can be reused.
             let _ = resp.into_body().with_config().limit(64 * 1024).read_to_vec();
             hls::outcome(status)
+        }
+        // Connected and still sending when time ran out: too slow, not dead (a dead
+        // connection fails to connect, resolve or answer instead).
+        Err(ureq::Error::Timeout(ureq::Timeout::Global | ureq::Timeout::PerCall | ureq::Timeout::SendBody)) => {
+            Outcome::TooSlow
         }
         Err(e) => Outcome::Retry(e.to_string()),
     }
@@ -353,6 +360,8 @@ fn upload(
     // How fast the last segment went up, and when: a direct measure of the upload speed.
     let mut speed: Option<(f64, Instant)> = None;
     let mut last_confirmed: Option<Instant> = None;
+    // The last segment that didn't fit through in time, how many tries, and when.
+    let mut too_slow: Option<(String, u32, Instant)> = None;
 
     while !done.load(Ordering::Relaxed) {
         // Status first, so it stays current while waiting.
@@ -370,19 +379,37 @@ fn upload(
                 // lower quality).
                 let flowing =
                     last_error.is_none() && last_confirmed.is_some_and(|t| t.elapsed() < Duration::from_secs(10));
-                let congested = flowing && behind > hls::LIVE_BEHIND;
+                // A segment that didn't fit through in time is congestion too, even if
+                // nothing has gone up yet (a full-quality segment may never fit).
+                let slow = too_slow.as_ref().is_some_and(|(_, _, at)| at.elapsed() < Duration::from_secs(20));
+                let congested = slow || (flowing && behind > hls::LIVE_BEHIND);
                 let measured = speed.filter(|(_, at)| at.elapsed() < Duration::from_secs(10)).map(|(k, _)| k);
                 link.report(kbps, congested, measured);
             }
-            let quality = link.assigned();
-            let (mut state, mut detail) = hls::health(confirmed_any, last_error.as_deref(), behind);
-            match quality {
-                None if waiting == 0 => (state, detail) = ("paused", PAUSED_DETAIL.into()),
-                Some(q) if state == "live" => detail = lowered_detail(&q),
-                _ => {}
+            let Some(quality) = link.assigned() else {
+                // Paused for bandwidth: stop at once, so the connection goes to the platforms
+                // that matter more. What was waiting is skipped (numbers stay used up).
+                if waiting > 0 {
+                    let mut q = shared.queue.lock().unwrap();
+                    for s in q.waiting.iter() {
+                        let _ = std::fs::remove_file(shared.spool.join(&s.name));
+                    }
+                    q.skip_waiting();
+                    shared.save(&mut q);
+                }
+                set(&status, "paused", PAUSED_DETAIL.into(), 0.0);
+                status.lock().unwrap().quality.clear();
+                link.report(0.0, false, None);
+                (attempt, retry_at, last_error, too_slow) = (0, None, None, None);
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            let (state, mut detail) = hls::health(confirmed_any, last_error.as_deref(), behind);
+            if state == "live" {
+                detail = lowered_detail(&quality);
             }
             set(&status, state, detail, kbps);
-            status.lock().unwrap().quality = quality.map(|q| q.label()).unwrap_or_default();
+            status.lock().unwrap().quality = quality.label();
         } else {
             set(&status, "off", String::new(), 0.0);
             status.lock().unwrap().quality.clear();
@@ -405,7 +432,13 @@ fn upload(
             shared.save(&mut q);
             (playlist, segment)
         };
-        let listed = put(&agent, &dest.hls_url(hls::PLAYLIST), "application/vnd.apple.mpegurl", playlist.as_bytes());
+        let listed = put(
+            &agent,
+            &dest.hls_url(hls::PLAYLIST),
+            "application/vnd.apple.mpegurl",
+            playlist.as_bytes(),
+            hls::REQUEST_TIMEOUT,
+        );
         if listed == Outcome::Confirmed && !shared.queue.lock().unwrap().playlist_accepted {
             let mut q = shared.queue.lock().unwrap();
             q.accept_playlist();
@@ -414,10 +447,16 @@ fn upload(
         let outcome = match listed {
             // A playlist the server can't read is our mistake; retrying is all we can do.
             Outcome::Unusable(e) => Outcome::Retry(format!("playlist: {e}")),
+            // A playlist is tiny: not getting it up in time isn't about the stream's bitrate.
+            Outcome::TooSlow => Outcome::Retry("the playlist upload timed out".into()),
             Outcome::Confirmed => match std::fs::read(shared.spool.join(&segment.name)) {
                 Ok(bytes) => {
                     let started = Instant::now();
-                    let o = put(&agent, &dest.hls_url(&segment.name), "video/MP2T", &bytes);
+                    let timeout = hls::segment_timeout(segment.duration);
+                    let o = put(&agent, &dest.hls_url(&segment.name), "video/MP2T", &bytes, timeout);
+                    if o == Outcome::TooSlow {
+                        speed = Some((hls::too_slow_kbps(bytes.len(), timeout), Instant::now()));
+                    }
                     if o == Outcome::Confirmed {
                         sent += (bytes.len() + playlist.len()) as u64;
                         let secs = started.elapsed().as_secs_f64().max(0.001);
@@ -448,6 +487,29 @@ fn upload(
                 }
                 confirmed_any |= outcome == Outcome::Confirmed;
                 (attempt, retry_at, last_error) = (0, None, None);
+                if outcome == Outcome::Confirmed {
+                    too_slow = None;
+                }
+            }
+            Outcome::TooSlow => {
+                // Retried straight away (the connection works, it's just slow) while the
+                // bandwidth manager steps down; after a few tries this segment is skipped,
+                // since lower-quality ones are coming behind it.
+                let tries = match &too_slow {
+                    Some((name, n, _)) if *name == segment.name => n + 1,
+                    _ => 1,
+                };
+                status.lock().unwrap().reconnects += 1;
+                last_error = Some("the upload is too slow for this stream".into());
+                log("video", format!("stream {}: {} didn't go up in time (try {tries})", dest.id, segment.name));
+                if hls::give_up_too_slow(segment.kbps, link.assigned().map(|q| q.kbps()), tries) {
+                    let mut q = shared.queue.lock().unwrap();
+                    if q.discard(&segment.name) {
+                        let _ = std::fs::remove_file(shared.spool.join(&segment.name));
+                        shared.save(&mut q);
+                    }
+                }
+                too_slow = Some((segment.name.clone(), tries, Instant::now()));
             }
             Outcome::Retry(e) => {
                 attempt += 1;

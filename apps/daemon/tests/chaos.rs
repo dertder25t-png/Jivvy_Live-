@@ -653,6 +653,9 @@ mod video {
                 if let Some(b) = self.receiving() {
                     match first {
                         None => first = Some(b),
+                        // A new connection (e.g. the bandwidth manager trying a step up)
+                        // starts the count again.
+                        Some(f) if b < f => first = Some(b),
                         Some(f) if b > f + 100_000 => return,
                         _ => {}
                     }
@@ -1000,10 +1003,11 @@ mod video {
                     head.join(" ")
                 ));
             }
-            if i.segments.iter().any(|(s, _)| s == file) {
-                i.violations.push(format!("{file} sent again after it was confirmed"));
+            // Sent again (the answer didn't reach the client in time): harmless, PUT replaces
+            // it, but it counts once.
+            if !i.segments.iter().any(|(s, _)| s == file) {
+                i.segments.push((file.to_string(), body.len()));
             }
-            i.segments.push((file.to_string(), body.len()));
             i.last = body.to_vec();
             if i.names.values().any(|n| n == file) {
                 200
@@ -1256,6 +1260,15 @@ mod video {
         s["stream"]["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id).cloned().unwrap_or(Value::Null)
     }
 
+    /// What the program really sends (kbps). Throttles are set from it: Media Foundation
+    /// pads to the configured 6 Mbps, but x264 (CI) squeezes the test pattern far below.
+    fn program_kbps(d: &Daemon) -> f64 {
+        let s = d.media_status(Duration::from_secs(20), "program running", |s| {
+            program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0 && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
+        });
+        program(&s)["kbps"].as_f64().unwrap()
+    }
+
     #[test]
     fn a_slow_upload_steps_the_stream_down_and_back_up_while_the_program_stays_full() {
         let dir = test_dir("bw-slow-mtx");
@@ -1268,25 +1281,33 @@ mod video {
             destination(s, "local")["quality"] == "1080p"
         });
 
-        // The church's upload drops to 1 Mbps.
-        uplink.set(1000);
+        // The church's upload drops to 1 Mbps (or half the program, if that's less).
+        let full = program_kbps(&d);
+        let limit = (full / 2.0).min(1000.0);
+        uplink.set(limit as u64);
         let slowed = Instant::now();
         let s = d.media_status(Duration::from_secs(40), "stepped down to 360p and live", |s| {
             let dest = destination(s, "local");
             dest["quality"] == "360p" && dest["state"] == "live"
         });
-        println!("live at 360p {:?} after the upload dropped to 1 Mbps", slowed.elapsed());
+        println!("live at 360p {:?} after the upload dropped to {limit:.0} kbps", slowed.elapsed());
         let dest = destination(&s, "local");
         assert!(dest["detail"].as_str().unwrap().contains("Lowered to 360p"), "{dest}");
         let upload = s["stream"]["uploadKbps"].as_f64().expect("an upload estimate");
-        assert!((500.0..=1500.0).contains(&upload), "upload estimate {upload} kbps");
+        assert!(
+            (limit * 0.4..=limit * 1.5).contains(&upload),
+            "upload estimate {upload} kbps on a {limit:.0} kbps link"
+        );
         assert_eq!(s["stream"]["encodes"][0]["quality"], "360p", "{}", s["stream"]);
         // The program (and so the recording) never noticed: full size, full rate, full bitrate.
         let s = d.media_status(Duration::from_secs(5), "program untouched", |s| {
             program(s)["width"] == 1920 && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
         });
-        assert!(program(&s)["kbps"].as_f64().unwrap() > 4000.0, "program bitrate untouched: {}", program(&s));
-        server.wait_receiving(Duration::from_secs(10));
+        let kbps = program(&s)["kbps"].as_f64().unwrap();
+        assert!(kbps > full * 0.6, "program bitrate untouched: {kbps:.0} kbps, was {full:.0}");
+        // The server keeps getting it (a step up the manager tries and takes back meanwhile
+        // reconnects, so allow for one).
+        server.wait_receiving(Duration::from_secs(30));
 
         // The upload comes back: the stream steps back up by itself.
         uplink.set(0);
@@ -1320,10 +1341,11 @@ mod video {
             ),
         )
         .unwrap();
-        // 1.2 Mbps shared: 840 kbps to spend can't carry both even at 360p (~630 each).
-        uplink.set(1200);
         let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
         d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        // 1.2 Mbps shared (or less than one full stream): 840 kbps to spend can't carry both
+        // even at 360p (~630 each).
+        uplink.set((program_kbps(&d) * 0.6).min(1200.0) as u64);
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         let s = d.media_status(Duration::from_secs(90), "Facebook paused, YouTube live", |s| {
             destination(s, "facebook")["state"] == "paused" && destination(s, "youtube")["state"] == "live"
@@ -1334,6 +1356,68 @@ mod video {
         assert_eq!(stream_state(&d), "live", "screens: live, the paused platform aside");
         // YouTube keeps getting video, within the ingestion rules.
         yt.wait_segments(3, Duration::from_secs(20));
+        yt.assert_no_violations();
+    }
+
+    #[test]
+    fn youtube_on_a_link_too_slow_for_one_full_quality_segment_steps_down_and_goes_live() {
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        let port = throttled(uplink.clone(), yt.port);
+        let (d, _) = start_hls("bw-hls-slow", &format!("http://127.0.0.1:{port}/http_upload_hls"), TEST_KEY);
+        // A quarter of the program: a 2 s full-quality segment needs 8 s, more than the 6 s
+        // it gets, so nothing is ever confirmed at full quality; 360p fits.
+        let limit = program_kbps(&d) * 0.25;
+        uplink.set(limit as u64);
+        let started = Instant::now();
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(120), "YouTube live at 360p", |s| {
+            let dest = destination(s, "youtube");
+            dest["quality"] == "360p" && dest["state"] == "live"
+        });
+        println!("live at 360p {:?} after start on a {limit:.0} kbps link", started.elapsed());
+        assert!(destination(&s, "youtube")["detail"].as_str().unwrap().contains("Lowered to 360p"));
+        yt.wait_segments(3, Duration::from_secs(20));
+        yt.assert_no_violations();
+    }
+
+    #[test]
+    fn a_paused_youtube_destination_stops_uploading_at_once() {
+        let dir = test_dir("bw-pause-hls-mtx");
+        let server = MediaMtx::start(&dir);
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        let fb_port = throttled(uplink.clone(), server.rtmp);
+        let yt_port = throttled(uplink.clone(), yt.port);
+        let dir = test_dir("bw-pause-hls");
+        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
+            .unwrap();
+        // Facebook first this time: YouTube (HLS) is the one to pause.
+        std::fs::write(
+            dir.join("stream.json"),
+            format!(
+                r#"{{"version":1,"destinations":[
+                {{"id":"facebook","name":"Facebook","url":"rtmp://127.0.0.1:{fb_port}/live","key":"{TEST_KEY}"}},
+                {{"id":"youtube","name":"YouTube","url":"http://127.0.0.1:{yt_port}/http_upload_hls","key":"{TEST_KEY}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
+        d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        uplink.set((program_kbps(&d) * 0.6).min(1200.0) as u64);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        d.media_status(Duration::from_secs(90), "YouTube paused, Facebook live", |s| {
+            destination(s, "youtube")["state"] == "paused" && destination(s, "facebook")["state"] == "live"
+        });
+        assert_eq!(stream_state(&d), "live");
+        // Paused means paused: after any upload already on its way (a segment gets at most
+        // three times its length), nothing more reaches YouTube and nothing waits on disk.
+        // (Checked well inside the 20 s before the manager tries un-pausing it.)
+        std::thread::sleep(Duration::from_secs(6));
+        let before = yt.segments().len();
+        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(yt.segments().len(), before, "a paused destination keeps uploading");
+        assert_eq!(spool_files(&d), 0, "its backlog is skipped");
         yt.assert_no_violations();
     }
 }

@@ -187,7 +187,7 @@ pub fn plain_error(raw: &str) -> String {
         "unexpected eof",
     ]) {
         "Lost the connection to the streaming server. Reconnecting.".into()
-    } else if says(&["couldn't keep up"]) {
+    } else if says(&["couldn't keep up", "upload is too slow"]) {
         "The internet upload is too slow for this stream. Reconnecting.".into()
     } else if says(&["program changed"]) {
         "The stream settings changed. Reconnecting.".into()

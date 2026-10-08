@@ -106,8 +106,10 @@ pub(crate) fn encoder_description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: 
                 "{input}qsvh264enc bitrate={br} max-bitrate={br} rate-control=cbr gop-size={gop} b-frames=0 target-usage=7"
             )
         }
+        // Constant bitrate (padded), like Media Foundation's: platforms ask for it, and the
+        // bandwidth manager's budget must match what really goes out.
         EncoderChoice::X264 | EncoderChoice::Auto => format!(
-            "{to_system} ! x264enc bitrate={br} vbv-buf-capacity=1000 key-int-max={gop} bframes=0 \
+            "{to_system} ! x264enc bitrate={br} vbv-buf-capacity=1000 nal-hrd=cbr key-int-max={gop} bframes=0 \
              speed-preset=veryfast tune=zerolatency"
         ),
     }

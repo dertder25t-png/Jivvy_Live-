@@ -436,8 +436,7 @@ fn session(
         }
     };
     push(&vsrc, &first);
-    // One second of this stream, in bytes.
-    let second = quality.kbps() as u64 * 1000 / 8;
+    let mut last_pushed = 0u64;
 
     let mut audio_caps_set = false;
     let mut last_video = running_time(&first).map(|(t, _)| t);
@@ -499,6 +498,12 @@ fn session(
             let kbps = st.out_bytes.saturating_sub(rate_bytes) as f64 * 8.0
                 / 1000.0
                 / now.duration_since(last_rate_at).as_secs_f64();
+            // One second of this stream, in bytes, from what was really pushed (an encoder
+            // can send less than its nominal bitrate).
+            let pushed_now = pushed.get();
+            let push_rate = (pushed_now - last_pushed) as f64 / now.duration_since(last_rate_at).as_secs_f64();
+            let second = (push_rate as u64).max(16_000);
+            last_pushed = pushed_now;
             (rate_bytes, last_rate_at) = (st.out_bytes, now);
             // Congested: video waiting for the network (the sink can't take it fast
             // enough), or the server's confirmations falling behind.

@@ -40,9 +40,15 @@ pub const CONFIRMED_LISTED: usize = 2;
 pub const BACKLOG_LIMIT: Duration = Duration::from_secs(60);
 /// Up to this much video waiting still counts as live (one segment being cut, one sending).
 pub const LIVE_BEHIND: Duration = Duration::from_secs(6);
-/// An upload that hasn't finished in this long has failed (a 2 s segment at 6 Mbps is
-/// 1.5 MB, so this is under 1 Mbps).
+/// A playlist upload that hasn't finished in this long has failed.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a segment gets to go up: three times its own length (at least 5 s). Slower
+/// than that, the connection can't carry this stream live, and a 2 s segment that takes
+/// longer is no use to viewers anyway.
+pub fn segment_timeout(duration_secs: f64) -> Duration {
+    Duration::from_secs_f64((duration_secs * 3.0).max(5.0))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
@@ -50,6 +56,9 @@ pub struct Segment {
     pub name: String,
     /// Seconds.
     pub duration: f64,
+    /// The stream bitrate it was cut at (kbps; 0 if unknown).
+    #[serde(default)]
+    pub kbps: u32,
 }
 
 /// What still has to reach the server, and where the playlist is up to.
@@ -254,6 +263,24 @@ pub enum Outcome {
     /// Anything else: network errors, 401 (key not accepted, maybe fixed in a moment),
     /// 5xx. Wait and retry.
     Retry(String),
+    /// Connected and sending, but the upload didn't finish within `REQUEST_TIMEOUT`: the
+    /// connection is too slow for this segment. Congestion, not a dead connection.
+    TooSlow,
+}
+
+/// A segment that didn't fit through the connection this many times in a row is skipped:
+/// the same bytes won't go faster. One cut at a higher bitrate than the destination now
+/// sends is skipped on its first failure: lower-quality segments are coming behind it.
+pub const TOO_SLOW_TRIES: u32 = 2;
+
+/// An upper bound on the upload speed after `bytes` didn't go up within `timeout`.
+pub fn too_slow_kbps(bytes: usize, timeout: Duration) -> f64 {
+    bytes as f64 * 8.0 / 1000.0 / timeout.as_secs_f64()
+}
+
+/// Whether a segment that didn't go up in time should be skipped rather than retried.
+pub fn give_up_too_slow(segment_kbps: u32, now_kbps: Option<u32>, tries: u32) -> bool {
+    tries >= TOO_SLOW_TRIES || now_kbps.is_some_and(|k| segment_kbps > k)
 }
 
 pub fn outcome(status: u16) -> Outcome {
@@ -285,7 +312,7 @@ mod tests {
     use super::*;
 
     fn seg(i: u32) -> Segment {
-        Segment { name: segment_name(7, i), duration: 2.0 }
+        Segment { name: segment_name(7, i), duration: 2.0, kbps: 6128 }
     }
 
     /// (sequence, name) pairs a playlist lists.
@@ -484,6 +511,18 @@ mod tests {
         assert!(matches!(outcome(400), Outcome::Unusable(_)));
         assert!(matches!(outcome(401), Outcome::Retry(e) if e.contains("401")));
         assert!(matches!(outcome(500), Outcome::Retry(_)));
+    }
+
+    #[test]
+    fn a_segment_that_cant_go_up_in_time_bounds_the_speed_and_is_skipped_when_its_bitrate_is_gone() {
+        // A 2 s segment gets 6 s; at 6 Mbps (1.5 MB) not up by then means under 2 Mbps.
+        assert_eq!(segment_timeout(2.0), Duration::from_secs(6));
+        assert_eq!(segment_timeout(0.5), Duration::from_secs(5));
+        assert_eq!(too_slow_kbps(1_500_000, segment_timeout(2.0)).round(), 2000.0);
+        assert!(!give_up_too_slow(6128, Some(6128), 1), "same quality: one more try");
+        assert!(give_up_too_slow(6128, Some(6128), 2));
+        assert!(give_up_too_slow(6128, Some(628), 1), "stepped down since: skip it now");
+        assert!(!give_up_too_slow(6128, None, 1), "paused: the pause skips it");
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod engine;
+pub mod hls;
 pub mod lyrics;
 pub mod media;
 pub mod outputs;

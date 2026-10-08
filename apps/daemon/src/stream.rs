@@ -1,5 +1,5 @@
-//! Streaming to the platforms over RTMP/RTMPS. Pure logic here; the pipelines live in
-//! `jivvy-video`.
+//! Streaming to the platforms over RTMP/RTMPS, or to YouTube by HLS segment upload
+//! (`hls`). Pure logic here; the pipelines live in `jivvy-video`.
 //!
 //! Each destination gets its own small pipeline fed with the program's already-encoded
 //! video and audio, so a network failure only ever tears down and reconnects that
@@ -27,9 +27,10 @@ pub struct Destination {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    /// Server address without the key, e.g. `rtmps://a.rtmps.youtube.com:443/live2`.
+    /// Server address without the key, e.g. `rtmps://a.rtmps.youtube.com:443/live2`, or
+    /// YouTube's HLS ingestion address (`https://a.upload.youtube.com/http_upload_hls?...`).
     pub url: String,
-    /// Stream key, appended to the URL. Never logged or shown.
+    /// Stream key: appended to an RTMP URL, or the `cid` of an HLS one. Never logged or shown.
     #[serde(default)]
     pub key: String,
     #[serde(default = "enabled_by_default")]
@@ -48,6 +49,32 @@ pub struct StreamConfig {
 }
 
 impl Destination {
+    /// HTTP(S) addresses get YouTube's HLS segment upload; everything else RTMP.
+    pub fn is_hls(&self) -> bool {
+        let url = self.url.trim();
+        url.starts_with("https://") || url.starts_with("http://")
+    }
+
+    /// The upload address for one HLS file (playlist or segment), key included as `cid`.
+    /// Only ever handed to the HTTP client. A key in the `key` field wins over one already
+    /// in the address; `copy` (0 primary, 1 backup) is kept, defaulting to 0.
+    pub fn hls_url(&self, file: &str) -> String {
+        let url = self.url.trim();
+        let base = url.split('?').next().unwrap_or(url);
+        let key = match self.key.trim() {
+            "" => self.url_param("cid"),
+            k => k,
+        };
+        let copy = Some(self.url_param("copy")).filter(|c| !c.is_empty()).unwrap_or("0");
+        format!("{base}?cid={key}&copy={copy}&file={file}")
+    }
+
+    /// A query parameter of the address (e.g. an HLS key written in as `cid=...`), or "".
+    fn url_param(&self, name: &str) -> &str {
+        let query = self.url.trim().split_once('?').map(|(_, q)| q).unwrap_or("");
+        query.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))).unwrap_or("")
+    }
+
     /// The full publish URL, key included. Only ever handed to the RTMP sink.
     pub fn publish_url(&self) -> String {
         let base = self.url.trim().trim_end_matches('/');
@@ -62,18 +89,21 @@ impl Destination {
 
     /// Removes the key (and anything after the app path) from text such as an error message.
     pub fn scrub(&self, text: &str) -> String {
-        let key = self.key.trim();
         let full = self.publish_url();
         let mut out = text.replace(&full, &format!("{}/<key>", self.display_server()));
-        if key.len() >= 4 {
-            out = out.replace(key, "<key>");
+        for key in [self.key.trim(), self.url_param("cid")] {
+            if key.len() >= 4 {
+                out = out.replace(key, "<key>");
+            }
         }
         out
     }
 }
 
-/// `scheme://host[:port]/app` with any further path (where keys go) cut off.
+/// `scheme://host[:port]/app` with any further path (where RTMP keys go) and any query
+/// (where HLS keys go) cut off.
 pub fn redact_url(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or("");
     let Some((scheme, rest)) = url.split_once("://") else { return "<invalid url>".into() };
     let mut parts = rest.splitn(3, '/');
     let host = parts.next().unwrap_or("");
@@ -87,11 +117,29 @@ pub fn redact_url(url: &str) -> String {
 /// Problems that keep a destination from being used, in words a tech lead can act on.
 pub fn validate(d: &Destination) -> Result<(), String> {
     let url = d.url.trim();
-    if !(url.starts_with("rtmp://") || url.starts_with("rtmps://")) {
-        return Err(format!("{}: the server address must start with rtmp:// or rtmps://", d.id));
+    if !(url.starts_with("rtmp://") || url.starts_with("rtmps://") || d.is_hls()) {
+        return Err(format!("{}: the server address must start with rtmps://, rtmp:// or https://", d.id));
     }
-    if redact_url(url).split("://").nth(1).is_none_or(|h| h.is_empty() || h.starts_with('/')) {
+    let redacted = redact_url(url);
+    let host = redacted.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or("");
+    if host.is_empty() {
         return Err(format!("{}: the server address has no host", d.id));
+    }
+    if d.is_hls() {
+        // The key travels in the address: plain http only to this computer (test servers).
+        let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        if url.starts_with("http://") && !["127.0.0.1", "localhost", "[::1]"].contains(&name) {
+            return Err(format!("{}: the upload address must start with https://", d.id));
+        }
+        let (key, url_key) = (d.key.trim(), d.url_param("cid"));
+        if key.is_empty() && (url_key.is_empty() || url_key.starts_with('$')) {
+            return Err(format!("{}: no stream key", d.id));
+        }
+        // It goes into a query string unescaped, as YouTube's own examples do.
+        if !key.chars().chain(url_key.chars()).all(|c| c.is_ascii_alphanumeric() || "-_.$".contains(c)) {
+            return Err(format!("{}: the stream key has characters YouTube never uses", d.id));
+        }
+        return Ok(());
     }
     if d.key.trim().is_empty() && url.trim_end_matches('/').matches('/').count() < 4 {
         return Err(format!("{}: no stream key", d.id));
@@ -125,18 +173,25 @@ pub fn plain_error(raw: &str) -> String {
     let says = |words: &[&str]| words.iter().any(|w| r.contains(w));
     if says(&["refused", "could not connect", "failed to connect", "no route", "unreachable", "never answered"]) {
         "Can't reach the streaming server. Check the internet connection and the server address.".into()
-    } else if says(&["resolve", "name or service", "no such host", "dns"]) {
+    } else if says(&["resolve", "name or service", "no such host", "host not found", "dns"]) {
         "Can't find the streaming server. Check the server address and the internet connection.".into()
     } else if says(&["no data reached the server", "stopped confirming", "timed out", "timeout"]) {
         "The streaming server stopped responding. Reconnecting.".into()
-    } else if says(&["reset", "forcibly closed", "broken pipe", "error receiving data", "error sending data", "closed"])
-    {
+    } else if says(&[
+        "reset",
+        "forcibly closed",
+        "broken pipe",
+        "error receiving data",
+        "error sending data",
+        "closed",
+        "unexpected eof",
+    ]) {
         "Lost the connection to the streaming server. Reconnecting.".into()
     } else if says(&["couldn't keep up"]) {
         "The internet upload is too slow for this stream. Reconnecting.".into()
     } else if says(&["program changed"]) {
         "The stream settings changed. Reconnecting.".into()
-    } else if says(&["auth", "forbidden", "403", "rejected", "denied", "invalid key", "publish"]) {
+    } else if says(&["auth", "forbidden", "401", "403", "rejected", "denied", "invalid key", "publish"]) {
         "The platform rejected the stream. Check the stream key and that the event is ready to go live.".into()
     } else {
         "The stream was interrupted. Reconnecting.".into()
@@ -298,12 +353,54 @@ mod tests {
         assert_eq!(redact_url("rtmp://user:pass@host/app/key"), "rtmp://host/app");
         assert_eq!(redact_url("rtmp://host"), "rtmp://host");
         assert_eq!(redact_url("not a url"), "<invalid url>");
+        assert_eq!(
+            redact_url("https://a.upload.youtube.com/http_upload_hls?cid=secret&copy=0&file="),
+            "https://a.upload.youtube.com/http_upload_hls"
+        );
+    }
+
+    fn hls(url: &str, key: &str) -> Destination {
+        Destination { url: url.into(), ..yt(key) }
+    }
+
+    #[test]
+    fn hls_addresses_carry_the_key_as_cid_and_nowhere_else() {
+        let base = "https://a.upload.youtube.com/http_upload_hls";
+        // As YouTube Studio shows it, with the key in its own field.
+        let d = hls(&format!("{base}?cid=$STREAM_KEY&copy=0&file="), "abcd-efgh-ijkl-mnop");
+        assert!(d.is_hls() && !yt("k").is_hls());
+        assert_eq!(d.hls_url("live.m3u8"), format!("{base}?cid=abcd-efgh-ijkl-mnop&copy=0&file=live.m3u8"));
+        assert_eq!(d.display_server(), base);
+        // The key already in the address; the backup ingest keeps copy=1.
+        let d = hls("https://b.upload.youtube.com/http_upload_hls?cid=wxyz-1234&copy=1&file=", "");
+        assert_eq!(
+            d.hls_url("s1-00000.ts"),
+            "https://b.upload.youtube.com/http_upload_hls?cid=wxyz-1234&copy=1&file=s1-00000.ts"
+        );
+        let scrubbed = d.scrub(&format!("error sending to {}", d.hls_url("x.ts")));
+        assert!(!scrubbed.contains("wxyz-1234"), "{scrubbed}");
+        // Just the address and a key.
+        assert_eq!(hls(base, "k-1").hls_url("a.ts"), format!("{base}?cid=k-1&copy=0&file=a.ts"));
+    }
+
+    #[test]
+    fn hls_validation_catches_what_a_tech_lead_can_fix() {
+        let base = "https://a.upload.youtube.com/http_upload_hls";
+        assert!(validate(&hls(base, "abcd-efgh")).is_ok());
+        assert!(validate(&hls(&format!("{base}?cid=abcd&copy=0&file="), "")).is_ok());
+        let placeholder = hls(&format!("{base}?cid=$STREAM_KEY&copy=0&file="), "");
+        assert!(validate(&placeholder).unwrap_err().contains("no stream key"));
+        let plain = hls("http://a.upload.youtube.com/http_upload_hls", "k");
+        assert!(validate(&plain).unwrap_err().contains("https://"));
+        assert!(validate(&hls("http://127.0.0.1:8080/http_upload_hls", "k")).is_ok(), "local test servers");
+        assert!(validate(&hls(base, "a&copy=1")).unwrap_err().contains("characters"));
+        assert!(validate(&hls("https:///x", "k")).is_err());
     }
 
     #[test]
     fn validation_catches_what_a_tech_lead_can_fix() {
         assert!(validate(&yt("k")).is_ok());
-        assert!(validate(&Destination { url: "http://x/live".into(), ..yt("k") }).unwrap_err().contains("rtmp://"));
+        assert!(validate(&Destination { url: "ftp://x/live".into(), ..yt("k") }).unwrap_err().contains("rtmp://"));
         assert!(validate(&yt("")).unwrap_err().contains("no stream key"));
         // A key written straight into the URL is fine too.
         assert!(validate(&Destination { url: "rtmp://host:1935/live/inline-key".into(), ..yt("") }).is_ok());
@@ -339,6 +436,7 @@ mod tests {
             ("no data reached the server for 5 s", "stopped responding"),
             ("Error resolving 'a.rtmps.youtube.com': No such host is known", "Can't find"),
             ("the connection couldn't keep up", "too slow"),
+            ("the server answered 401", "rejected"),
             ("Internal data stream error.", "interrupted"),
         ];
         for (raw, expect) in cases {

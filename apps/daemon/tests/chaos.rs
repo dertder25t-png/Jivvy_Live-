@@ -4,7 +4,8 @@
 //! process comes back on the current slide, and monitors can come and go. With the `video`
 //! feature, also camera and audio input (GStreamer test sources): levels reach screens,
 //! survive a video crash, and a missing camera never stops the audio; and streaming to a
-//! local MediaMTX server (the reliability table's "Internet drops" row).
+//! local MediaMTX server and a fake YouTube HLS ingest (the reliability table's "Internet
+//! drops" row).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -629,6 +630,19 @@ mod video {
             paths.iter().find(|p| p["ready"] == true).and_then(|p| p["bytesReceived"].as_u64())
         }
 
+        /// The tracks (codecs) of the stream arriving, e.g. `["H264", "MPEG-4 Audio"]`.
+        fn tracks(&self) -> Vec<String> {
+            let paths = self.get_paths().unwrap_or_default();
+            let ready = paths.iter().find(|p| p["ready"] == true);
+            ready
+                .and_then(|p| p["tracks"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.as_str())
+                .map(String::from)
+                .collect()
+        }
+
         /// Waits until the stream arrives and keeps growing.
         fn wait_receiving(&self, within: Duration) {
             let deadline = Instant::now() + within;
@@ -696,6 +710,8 @@ mod video {
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         server.wait_receiving(Duration::from_secs(20));
         wait_stream_state(&d, "live", Duration::from_secs(10));
+        // Sound too: the encoders shift video timestamps, so a naive rebase drops all audio.
+        assert_eq!(server.tracks(), ["H264", "MPEG-4 Audio"]);
 
         // The internet drops.
         server.kill();
@@ -791,5 +807,384 @@ mod video {
             std::thread::sleep(Duration::from_millis(200));
         }
         assert!(reconnected, "gave up on the silent server and reconnected");
+    }
+
+    /// What a fake YouTube HLS ingest received, and every rule of YouTube's ingestion guide
+    /// the uploader broke.
+    #[derive(Default, Debug)]
+    struct Ingest {
+        /// Media sequence of the last playlist.
+        last_seq: Option<u64>,
+        /// Every sequence number ever listed, with the segment it named.
+        names: std::collections::HashMap<u64, String>,
+        /// Segments received in order, with their sizes.
+        segments: Vec<(String, usize)>,
+        /// Segments that arrived before a playlist listed them (answered 202).
+        early: usize,
+        /// The newest segment's bytes, to check it plays.
+        last: Vec<u8>,
+        violations: Vec<String>,
+    }
+
+    /// Stands in for YouTube's HLS ingestion (`http_upload_hls`) on a local port, checking
+    /// the uploader against the ingestion guide. While `up` is false it reads each request
+    /// and drops the connection without an answer, like a dead internet connection.
+    struct FakeYouTube {
+        port: u16,
+        up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ingest: std::sync::Arc<std::sync::Mutex<Ingest>>,
+    }
+
+    impl FakeYouTube {
+        fn start() -> FakeYouTube {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let ingest = std::sync::Arc::new(std::sync::Mutex::new(Ingest::default()));
+            let (u, i) = (up.clone(), ingest.clone());
+            std::thread::spawn(move || {
+                for conn in listener.incoming().flatten() {
+                    let (u, i) = (u.clone(), i.clone());
+                    std::thread::spawn(move || FakeYouTube::serve(conn, &u, &i));
+                }
+            });
+            FakeYouTube { port, up, ingest }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/http_upload_hls", self.port)
+        }
+
+        fn set_up(&self, up: bool) {
+            self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn segments(&self) -> Vec<(String, usize)> {
+            self.ingest.lock().unwrap().segments.clone()
+        }
+
+        /// A new broadcast on the same key: its first playlist must start at 0 again.
+        fn new_broadcast(&self) {
+            *self.ingest.lock().unwrap() = Ingest::default();
+        }
+
+        fn assert_no_violations(&self) {
+            let i = self.ingest.lock().unwrap();
+            assert!(i.violations.is_empty(), "broke YouTube's ingestion rules: {:#?}", i.violations);
+        }
+
+        /// Waits until `n` more segments arrive.
+        fn wait_segments(&self, n: usize, within: Duration) {
+            let start = self.segments().len();
+            let deadline = Instant::now() + within;
+            while self.segments().len() < start + n {
+                assert!(Instant::now() < deadline, "only {} new segments in {within:?}", self.segments().len() - start);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn serve(conn: TcpStream, up: &std::sync::atomic::AtomicBool, ingest: &std::sync::Mutex<Ingest>) -> Option<()> {
+            let mut reader = BufReader::new(conn.try_clone().ok()?);
+            let mut conn = conn;
+            loop {
+                let mut request = String::new();
+                reader.read_line(&mut request).ok().filter(|n| *n > 0)?;
+                let mut length = 0usize;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).ok().filter(|n| *n > 0)?;
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        length = v.trim().parse().ok()?;
+                    }
+                }
+                let mut body = vec![0u8; length];
+                std::io::Read::read_exact(&mut reader, &mut body).ok()?;
+                if !up.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None; // the connection dies without an answer
+                }
+                let status = FakeYouTube::handle(&request, &body, &mut ingest.lock().unwrap());
+                conn.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").as_bytes()).ok()?;
+            }
+        }
+
+        /// The ingestion guide's rules, as a status code.
+        fn handle(request: &str, body: &[u8], i: &mut Ingest) -> u16 {
+            let mut parts = request.split_whitespace();
+            let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            if method != "PUT" && method != "POST" {
+                i.violations.push(format!("method {method}"));
+                return 405;
+            }
+            let Some(query) = target.strip_prefix("/http_upload_hls?") else {
+                i.violations.push(format!("path {target}"));
+                return 400;
+            };
+            let param = |n: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{n}="))).unwrap_or("");
+            if param("cid") != TEST_KEY {
+                return 401;
+            }
+            if param("copy") != "0" {
+                i.violations.push(format!("copy={}", param("copy")));
+            }
+            let file = param("file");
+            if file.is_empty() || !file.chars().all(|c| c.is_ascii_alphanumeric() || "_/-.".contains(c)) {
+                i.violations.push(format!("file name {file:?}"));
+                return 400;
+            }
+            if file.ends_with(".m3u8") {
+                let text = String::from_utf8_lossy(body);
+                let tag = |t: &str| text.lines().find_map(|l| l.strip_prefix(t)).and_then(|v| v.parse::<u64>().ok());
+                let (Some(seq), Some(target)) = (tag("#EXT-X-MEDIA-SEQUENCE:"), tag("#EXT-X-TARGETDURATION:")) else {
+                    i.violations.push(format!("playlist without sequence or target duration: {text}"));
+                    return 400;
+                };
+                match i.last_seq {
+                    None if seq != 0 => i.violations.push(format!("first playlist starts at {seq}, not 0")),
+                    Some(last) if seq < last => i.violations.push(format!("media sequence went back {last} -> {seq}")),
+                    _ => {}
+                }
+                i.last_seq = Some(seq);
+                let mut outstanding = 0;
+                let mut lines = text.lines().peekable();
+                let mut n = seq;
+                while let Some(l) = lines.next() {
+                    let Some(d) = l.strip_prefix("#EXTINF:") else { continue };
+                    let d: f64 = d.trim_end_matches(',').parse().unwrap_or(99.0);
+                    if d > 5.0 || d.round() as u64 > target {
+                        i.violations.push(format!("segment of {d} s (target {target})"));
+                    }
+                    let name = lines.next().unwrap_or("").to_string();
+                    if let Some(before) = i.names.get(&n)
+                        && *before != name
+                    {
+                        i.violations.push(format!("sequence {n} was {before}, now {name}"));
+                    }
+                    if !i.segments.iter().any(|(s, _)| *s == name) {
+                        outstanding += 1;
+                    }
+                    i.names.insert(n, name);
+                    n += 1;
+                }
+                if outstanding > 5 {
+                    i.violations.push(format!("{outstanding} outstanding segments listed"));
+                }
+                return 200;
+            }
+            if !file.ends_with(".ts") {
+                i.violations.push(format!("file {file}"));
+                return 400;
+            }
+            // Self-initializing MPEG-TS: whole 188-byte packets, starting with the PAT and PMT.
+            let table = |p: usize| -> Option<u8> {
+                let pkt = body.get(p * 188..(p + 1) * 188)?;
+                // Skip the header and any adaptation field (padding), then the pointer field.
+                let start = 4 + if pkt[3] & 0x20 != 0 { 1 + usize::from(pkt[4]) } else { 0 };
+                pkt.get(start + 1 + usize::from(*pkt.get(start)?)).copied()
+            };
+            let pid =
+                |p: usize| body.get(p * 188 + 1..p * 188 + 3).map(|b| (u16::from(b[0] & 0x1f) << 8) | u16::from(b[1]));
+            let whole =
+                body.len() >= 376 && body.len().is_multiple_of(188) && body.iter().step_by(188).all(|b| *b == 0x47);
+            if !whole || pid(0) != Some(0) || table(0) != Some(0x00) || table(1) != Some(0x02) {
+                let head: Vec<String> = body.iter().take(12).map(|b| format!("{b:02x}")).collect();
+                i.violations.push(format!(
+                    "{file} isn't a self-initializing transport stream ({} bytes; starts {})",
+                    body.len(),
+                    head.join(" ")
+                ));
+            }
+            if i.segments.iter().any(|(s, _)| s == file) {
+                i.violations.push(format!("{file} sent again after it was confirmed"));
+            }
+            i.segments.push((file.to_string(), body.len()));
+            i.last = body.to_vec();
+            if i.names.values().any(|n| n == file) {
+                200
+            } else {
+                i.early += 1;
+                202
+            }
+        }
+    }
+
+    /// Decodes a segment on its own (as YouTube must, each one self-contained): video frames
+    /// and audio buffers decoded.
+    fn decode(segment: &[u8], dir: &std::path::Path) -> (u64, u64) {
+        use gstreamer as gst;
+        use gstreamer::prelude::*;
+        let path = dir.join("received.ts");
+        std::fs::write(&path, segment).unwrap();
+        gst::init().unwrap();
+        let p = gst::parse::launch(&format!(
+            "filesrc location=\"{}\" ! decodebin name=d \
+             d. ! queue ! videoconvert ! fakesink name=v sync=false \
+             d. ! queue ! audioconvert ! fakesink name=a sync=false",
+            path.to_string_lossy().replace('\\', "/")
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let counts: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>> = ["v", "a"]
+            .iter()
+            .map(|n| {
+                let c = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let c2 = c.clone();
+                p.by_name(n).unwrap().static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                });
+                c
+            })
+            .collect();
+        p.set_state(gst::State::Playing).unwrap();
+        let bus = p.bus().unwrap();
+        let msg =
+            bus.timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos, gst::MessageType::Error]);
+        let _ = p.set_state(gst::State::Null);
+        if let Some(m) = msg
+            && let gst::MessageView::Error(e) = m.view()
+        {
+            panic!("a received segment doesn't decode: {} ({:?})", e.error(), e.debug());
+        }
+        let n = |i: usize| counts[i].load(std::sync::atomic::Ordering::Relaxed);
+        (n(0), n(1))
+    }
+
+    /// A daemon streaming test sources to a fake YouTube HLS ingest, and its video pid.
+    fn start_hls(name: &str, url: &str, key: &str) -> (Daemon, u32) {
+        let dir = test_dir(name);
+        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
+            .unwrap();
+        std::fs::write(
+            dir.join("stream.json"),
+            format!(
+                r#"{{"version":1,"destinations":[{{"id":"youtube","name":"YouTube","url":"{url}","key":"{key}"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
+        let video = d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        (d, video)
+    }
+
+    /// Segment indexes per session (`s<session>-<index>.ts`), to check nothing was lost.
+    fn sessions(segments: &[(String, usize)]) -> Vec<(String, Vec<u32>)> {
+        let mut out: Vec<(String, Vec<u32>)> = Vec::new();
+        for (name, _) in segments {
+            let (session, index) = name.trim_end_matches(".ts").rsplit_once('-').unwrap();
+            let index: u32 = index.parse().unwrap();
+            match out.iter_mut().find(|(s, _)| s == session) {
+                Some((_, v)) => v.push(index),
+                None => out.push((session.to_string(), vec![index])),
+            }
+        }
+        out
+    }
+
+    fn spool_files(d: &Daemon) -> usize {
+        std::fs::read_dir(d.data_dir.join("stream-spool").join("youtube"))
+            .map(|r| r.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".ts")).count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn youtube_hls_keeps_every_second_through_an_outage_and_catches_up() {
+        let yt = FakeYouTube::start();
+        let (d, _) = start_hls("hls-outage", &yt.url(), TEST_KEY);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        wait_stream_state(&d, "live", Duration::from_secs(20));
+        yt.wait_segments(2, Duration::from_secs(10));
+
+        // The internet drops for 20 s: segments keep being cut to disk.
+        yt.set_up(false);
+        wait_stream_state(&d, "reconnecting", Duration::from_secs(10));
+        let s = d.media_status(Duration::from_secs(3), "program still at full rate", |s| {
+            program(s)["state"] == "running" && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        });
+        let detail = s["stream"]["destinations"][0]["detail"].as_str().unwrap().to_string();
+        assert!(!detail.is_empty() && !detail.contains(TEST_KEY), "plain words: {detail}");
+        std::thread::sleep(Duration::from_secs(17));
+        assert!(spool_files(&d) >= 8, "the outage's video waits on disk ({} files)", spool_files(&d));
+
+        // It comes back: the backlog goes out faster than real time, then it's live again.
+        let back = Instant::now();
+        yt.set_up(true);
+        wait_stream_state(&d, "live", Duration::from_secs(20));
+        println!("caught up and live {:?} after the connection returned", back.elapsed());
+        assert!(back.elapsed() < Duration::from_secs(15), "caught up in {:?}", back.elapsed());
+        yt.wait_segments(1, Duration::from_secs(5));
+        yt.assert_no_violations();
+        let sessions = sessions(&yt.segments());
+        assert_eq!(sessions.len(), 1, "one segmenter run throughout: {sessions:?}");
+        let indexes = &sessions[0].1;
+        assert!(indexes.windows(2).all(|w| w[1] == w[0] + 1), "no segment lost or reordered: {indexes:?}");
+        assert!(indexes.len() >= 14, "the outage's 20 s arrived: {} segments", indexes.len());
+        assert!(spool_files(&d) <= 2, "confirmed segments are deleted ({} left)", spool_files(&d));
+        // Each segment plays on its own, picture and sound: 2 s at 30 fps.
+        let (frames, audio) = decode(&yt.ingest.lock().unwrap().last.clone(), &d.data_dir);
+        assert!((55..=65).contains(&frames), "{frames} video frames in a segment");
+        assert!(audio >= 50, "{audio} audio buffers in a segment (2 s of AAC is ~94)");
+        assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
+    }
+
+    #[test]
+    fn a_video_crash_carries_the_youtube_playlist_on_and_a_new_broadcast_starts_at_zero() {
+        let yt = FakeYouTube::start();
+        let (d, video) = start_hls("hls-crash", &yt.url(), TEST_KEY);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        wait_stream_state(&d, "live", Duration::from_secs(20));
+        yt.wait_segments(3, Duration::from_secs(10));
+
+        // Same playlist after the crash: sequence numbers keep counting up (checked by the
+        // fake), segment names never repeat.
+        kill_hard(video);
+        d.video_starts.recv_timeout(Duration::from_secs(5)).expect("video restarted");
+        let back = Instant::now();
+        yt.wait_segments(3, Duration::from_secs(30));
+        wait_stream_state(&d, "live", Duration::from_secs(10));
+        println!("stream live again {:?} after the video process restarted", back.elapsed());
+        yt.assert_no_violations();
+        assert_eq!(sessions(&yt.segments()).len(), 2, "a second segmenter run after the crash");
+
+        // Stopped, then started again: a new broadcast, from sequence 0.
+        d.send(json!({ "type": "stream.stop" }), Duration::from_secs(5));
+        wait_stream_state(&d, "off", Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(3));
+        let after_stop = yt.segments().len();
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(yt.segments().len(), after_stop, "nothing is sent after stop");
+        assert!(spool_files(&d) == 0, "stop clears what was waiting");
+        yt.new_broadcast();
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        wait_stream_state(&d, "live", Duration::from_secs(20));
+        yt.wait_segments(2, Duration::from_secs(10));
+        yt.assert_no_violations();
+    }
+
+    #[test]
+    fn a_youtube_key_that_is_not_accepted_is_reported_in_plain_words_and_never_leaks() {
+        let yt = FakeYouTube::start();
+        let wrong = "wrong-key-do-not-leak-4410";
+        let (d, _) = start_hls("hls-badkey", &yt.url(), wrong);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(20), "a few rejected attempts", |s| {
+            s["stream"]["destinations"][0]["reconnects"].as_u64().unwrap_or(0) >= 2
+        });
+        let dest = &s["stream"]["destinations"][0];
+        assert_eq!(dest["state"], "reconnecting");
+        assert!(dest["detail"].as_str().unwrap().contains("rejected"), "{dest}");
+        assert_eq!(dest["server"], yt.url());
+        assert_eq!(stream_state(&d), "reconnecting");
+        assert!(yt.segments().is_empty());
+        for f in ["media-status.json", "state.json", "stream-spool/youtube/queue.json"] {
+            if let Ok(text) = std::fs::read_to_string(d.data_dir.join(f)) {
+                assert!(!text.contains(wrong), "{f} contains the stream key");
+            }
+        }
     }
 }

@@ -445,6 +445,7 @@ fn session(
     let mut tracker = DeliveryTracker::new(Instant::now());
     let (mut rate_bytes, mut last_rate_at) = (0u64, Instant::now());
     let mut connected_at: Option<Instant> = None;
+    let mut backlog_base: Option<u64> = None;
     let result = loop {
         if !still_wanted() {
             break Ok(());
@@ -506,17 +507,22 @@ fn session(
             last_pushed = pushed_now;
             (rate_bytes, last_rate_at) = (st.out_bytes, now);
             // Congested: video waiting for the network (the sink can't take it fast
-            // enough), or the server's confirmations falling behind.
-            // Only once connected for a while: data queues normally while connecting.
-            let backlog = pushed.get().saturating_sub(st.out_bytes);
-            if backlog > 10 * second {
-                break Err("the connection couldn't keep up".into());
-            }
-            let behind = st.window > 0 && st.out_bytes.saturating_sub(st.acked) > 2 * st.window;
+            // enough), or the server's confirmations falling behind. The backlog is
+            // counted from 3 s after connecting: before that, data queues normally, and the
+            // input drops what waits over 3 s (never sent, but counted as pushed).
             if connected_at.is_none() && st.in_bytes > 0 {
                 connected_at = Some(now);
             }
             let settled = connected_at.is_some_and(|t| now.duration_since(t) > Duration::from_secs(3));
+            let raw_backlog = pushed.get().saturating_sub(st.out_bytes);
+            if settled && backlog_base.is_none() {
+                backlog_base = Some(raw_backlog);
+            }
+            let backlog = backlog_base.map_or(0, |b| raw_backlog.saturating_sub(b));
+            if backlog > 10 * second {
+                break Err("the connection couldn't keep up".into());
+            }
+            let behind = st.window > 0 && st.out_bytes.saturating_sub(st.acked) > 2 * st.window;
             link.report(kbps, settled && (backlog > second || behind), None);
             let mut s = status.lock().unwrap();
             if delivery == Delivery::Live && backlog > 2 * second {

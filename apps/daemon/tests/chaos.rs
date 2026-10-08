@@ -86,6 +86,16 @@ fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
 }
 
 fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&str]) -> Daemon {
+    start_with_env(data_dir, slides, headless_outputs, extra, &[])
+}
+
+fn start_with_env(
+    data_dir: PathBuf,
+    slides: u64,
+    headless_outputs: bool,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> Daemon {
     let video_slot = (!extra.contains(&"--no-video")).then(VideoSlot::take);
     let addr = format!("127.0.0.1:{}", free_port());
     let outputs_flag = if headless_outputs { "--outputs-headless" } else { "--no-outputs" };
@@ -95,6 +105,7 @@ fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&
         .arg(outputs_flag)
         .args(extra)
         .env("JIVVY_TEST_HOOKS", "1")
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(if std::env::var_os("JIVVY_TEST_STDERR").is_some() { Stdio::inherit() } else { Stdio::null() })
         .spawn()
@@ -1260,8 +1271,34 @@ mod video {
         s["stream"]["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id).cloned().unwrap_or(Value::Null)
     }
 
-    /// What the program really sends (kbps). Throttles are set from it: Media Foundation
-    /// pads to the configured 6 Mbps, but x264 (CI) squeezes the test pattern far below.
+    /// A daemon for the bandwidth tests, streaming to `destinations` (JSON). The test
+    /// picture is noise, like a camera's, so every encoder really spends its bitrate (x264
+    /// squeezes the usual test pattern to almost nothing), at 720p and 3 Mbps so x264 keeps
+    /// up on a CI runner. Lower qualities: 480p and 360p.
+    fn start_bandwidth(name: &str, destinations: &str) -> Daemon {
+        let dir = test_dir(name);
+        std::fs::write(
+            dir.join("media.json"),
+            r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"},
+                "program":{"width":1280,"height":720,"bitrateKbps":3000}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("stream.json"), format!(r#"{{"version":1,"destinations":[{destinations}]}}"#)).unwrap();
+        let video = env!("CARGO_BIN_EXE_jivvy-video");
+        let d = start_with_env(dir, 10, false, &["--video", video], &[("JIVVY_TEST_PATTERN", "snow")]);
+        d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        d
+    }
+
+    fn rtmp_destination(id: &str, port: u16) -> String {
+        format!(r#"{{"id":"{id}","name":"{id}","url":"rtmp://127.0.0.1:{port}/live","key":"{TEST_KEY}"}}"#)
+    }
+
+    fn hls_destination(id: &str, port: u16) -> String {
+        format!(r#"{{"id":"{id}","name":"{id}","url":"http://127.0.0.1:{port}/http_upload_hls","key":"{TEST_KEY}"}}"#)
+    }
+
+    /// What the program really sends (kbps).
     fn program_kbps(d: &Daemon) -> f64 {
         let s = d.media_status(Duration::from_secs(20), "program running", |s| {
             program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0 && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
@@ -1274,16 +1311,16 @@ mod video {
         let dir = test_dir("bw-slow-mtx");
         let server = MediaMtx::start(&dir);
         let uplink = std::sync::Arc::new(Uplink::default());
-        let (d, _) = start_streaming("bw-slow", throttled(uplink.clone(), server.rtmp));
+        let d = start_bandwidth("bw-slow", &rtmp_destination("local", throttled(uplink.clone(), server.rtmp)));
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         wait_stream_state(&d, "live", Duration::from_secs(20));
         d.media_status(Duration::from_secs(5), "live at full quality", |s| {
-            destination(s, "local")["quality"] == "1080p"
+            destination(s, "local")["quality"] == "720p"
         });
 
-        // The church's upload drops to 1 Mbps (or half the program, if that's less).
+        // The church's upload drops to 1 Mbps.
         let full = program_kbps(&d);
-        let limit = (full / 2.0).min(1000.0);
+        let limit = 1000.0;
         uplink.set(limit as u64);
         let slowed = Instant::now();
         let s = d.media_status(Duration::from_secs(40), "stepped down to 360p and live", |s| {
@@ -1301,7 +1338,7 @@ mod video {
         assert_eq!(s["stream"]["encodes"][0]["quality"], "360p", "{}", s["stream"]);
         // The program (and so the recording) never noticed: full size, full rate, full bitrate.
         let s = d.media_status(Duration::from_secs(5), "program untouched", |s| {
-            program(s)["width"] == 1920 && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+            program(s)["width"] == 1280 && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
         });
         let kbps = program(&s)["kbps"].as_f64().unwrap();
         assert!(kbps > full * 0.6, "program bitrate untouched: {kbps:.0} kbps, was {full:.0}");
@@ -1326,26 +1363,15 @@ mod video {
         let server = MediaMtx::start(&dir);
         let yt = FakeYouTube::start();
         let uplink = std::sync::Arc::new(Uplink::default());
-        let yt_port = throttled(uplink.clone(), yt.port);
-        let fb_port = throttled(uplink.clone(), server.rtmp);
-        let dir = test_dir("bw-share");
-        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
-            .unwrap();
         // YouTube first: the main platform.
-        std::fs::write(
-            dir.join("stream.json"),
-            format!(
-                r#"{{"version":1,"destinations":[
-                {{"id":"youtube","name":"YouTube","url":"http://127.0.0.1:{yt_port}/http_upload_hls","key":"{TEST_KEY}"}},
-                {{"id":"facebook","name":"Facebook","url":"rtmp://127.0.0.1:{fb_port}/live","key":"{TEST_KEY}"}}]}}"#
-            ),
-        )
-        .unwrap();
-        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
-        d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
-        // 1.2 Mbps shared (or less than one full stream): 840 kbps to spend can't carry both
-        // even at 360p (~630 each).
-        uplink.set((program_kbps(&d) * 0.6).min(1200.0) as u64);
+        let destinations = format!(
+            "{},{}",
+            hls_destination("youtube", throttled(uplink.clone(), yt.port)),
+            rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp))
+        );
+        let d = start_bandwidth("bw-share", &destinations);
+        // 1.2 Mbps shared: 840 kbps to spend can't carry both even at 360p (~630 each).
+        uplink.set(1200);
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         let s = d.media_status(Duration::from_secs(90), "Facebook paused, YouTube live", |s| {
             destination(s, "facebook")["state"] == "paused" && destination(s, "youtube")["state"] == "live"
@@ -1364,10 +1390,10 @@ mod video {
         let yt = FakeYouTube::start();
         let uplink = std::sync::Arc::new(Uplink::default());
         let port = throttled(uplink.clone(), yt.port);
-        let (d, _) = start_hls("bw-hls-slow", &format!("http://127.0.0.1:{port}/http_upload_hls"), TEST_KEY);
-        // A quarter of the program: a 2 s full-quality segment needs 8 s, more than the 6 s
-        // it gets, so nothing is ever confirmed at full quality; 360p fits.
-        let limit = program_kbps(&d) * 0.25;
+        let d = start_bandwidth("bw-hls-slow", &hls_destination("youtube", port));
+        // 900 kbps: a 2 s full-quality segment (3 Mbps, ~750 kB) needs ~6.7 s, more than the
+        // 6 s it gets, so nothing is ever confirmed at full quality; 360p (~630 kbps) fits.
+        let limit = 900.0;
         uplink.set(limit as u64);
         let started = Instant::now();
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
@@ -1387,24 +1413,14 @@ mod video {
         let server = MediaMtx::start(&dir);
         let yt = FakeYouTube::start();
         let uplink = std::sync::Arc::new(Uplink::default());
-        let fb_port = throttled(uplink.clone(), server.rtmp);
-        let yt_port = throttled(uplink.clone(), yt.port);
-        let dir = test_dir("bw-pause-hls");
-        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
-            .unwrap();
         // Facebook first this time: YouTube (HLS) is the one to pause.
-        std::fs::write(
-            dir.join("stream.json"),
-            format!(
-                r#"{{"version":1,"destinations":[
-                {{"id":"facebook","name":"Facebook","url":"rtmp://127.0.0.1:{fb_port}/live","key":"{TEST_KEY}"}},
-                {{"id":"youtube","name":"YouTube","url":"http://127.0.0.1:{yt_port}/http_upload_hls","key":"{TEST_KEY}"}}]}}"#
-            ),
-        )
-        .unwrap();
-        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
-        d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
-        uplink.set((program_kbps(&d) * 0.6).min(1200.0) as u64);
+        let destinations = format!(
+            "{},{}",
+            rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp)),
+            hls_destination("youtube", throttled(uplink.clone(), yt.port))
+        );
+        let d = start_bandwidth("bw-pause-hls", &destinations);
+        uplink.set(1200);
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         d.media_status(Duration::from_secs(90), "YouTube paused, Facebook live", |s| {
             destination(s, "youtube")["state"] == "paused" && destination(s, "facebook")["state"] == "live"

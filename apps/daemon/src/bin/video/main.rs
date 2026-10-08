@@ -180,7 +180,10 @@ fn start(input: &mut Input, devices: &DeviceCache, feed: &Arc<Feed>, cfg: &Progr
         Choice::Test if input.kind == Kind::Camera => {
             let s = make("videotestsrc")?;
             s.set_property("is-live", true);
-            s.set_property_from_str("pattern", "ball");
+            // Tests can ask for a noisier picture (e.g. "snow") so an encoder really spends
+            // its bitrate, as it does on a camera.
+            let pattern = std::env::var("JIVVY_TEST_PATTERN").unwrap_or_else(|_| "ball".into());
+            s.set_property_from_str("pattern", &pattern);
             s
         }
         Choice::Test => {

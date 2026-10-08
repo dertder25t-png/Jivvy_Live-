@@ -57,7 +57,6 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
 - **Never stops because an input does.** The capture pipelines hand frames and audio to a clock-driven pacer that pushes exactly 30 frames a second (configurable) into the program: the newest camera frame, or a black slate when the camera is missing or has sent nothing for 500 ms, and a steady run of audio (the microphone, padded with silence; never more than 200 ms of backlog). Unplugging the camera mid-service switches to the slate without a dropped frame.
 - **Lyric layer** drawn natively in Rust (from the spike) only when the text changes, composited on the GPU (Direct3D 12) where available, on the CPU otherwise. Shows "Slide N" until run sheets reach the engine; nothing while the screen is black.
 - **Encoded once:** H.264 + AAC, then a tee the recording and the stream will branch from. Encoder order: the configured one first, then Media Foundation, then x264. Each gets 4 seconds to produce a frame; a failure mid-service restarts from the preferred one. Quick Sync only when asked for by name (it crashed in the spike).
-- **Constant bitrate** on every encoder (x264 pads like Media Foundation does), as the platforms ask, so the bandwidth manager's budget matches what really goes out.
 - **Settings** in `media.json` (all optional): `"program": { "width": 1920, "height": 1080, "fps": 30, "bitrateKbps": 6000, "encoder": "auto" }` (`auto`, `mf`, `qsv`, `x264`).
 - **Status** in `media-status.json` → `program`: encoder, frames per second out, bitrate, whether the slate is on, and the lyric text on screen.
 - **Cost on the founder's laptop:** the whole video process (camera, microphone, program on Media Foundation, plus a debug file) at **0.21 cores, 1.3% of the machine**, 29.8 fps, 6.4 Mbps.
@@ -167,10 +166,12 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | YouTube HLS (fake ingest that enforces YouTube's rules): connection dead for 20 s | Segments keep being cut to disk; `reconnecting` in plain words; program at ~30 fps; every segment arrives in order once it's back, caught up and live ~4.7 s later; each segment decodes on its own with picture (2 s at 30 fps) and sound |
 | YouTube HLS: kill the video process, then stop and start again | Same playlist carried on (sequence numbers only grow, no name reused), live ~10.7 s after the kill; nothing sent after stop; the next start begins at sequence 0 |
 | YouTube HLS: key not accepted (401) | `reconnecting`, "The platform rejected the stream…", retries counted, the key in no status, state or queue file |
-| Slow upload: RTMP through a proxy throttled to 1 Mbps, then unthrottled | Live at 360p ~9.6 s after the drop ("Lowered to 360p…", upload estimate ~1 Mbps); the program stays 1080p30 at full bitrate; back up a step ~20 s after the upload returns; the video process never restarts |
+| Slow upload: RTMP through a proxy throttled to 1 Mbps, then unthrottled | Live at 360p ~10 s after the drop ("Lowered to 360p…", upload estimate ~1 Mbps); the program stays at full size, rate and bitrate; back up a step ~20 s after the upload returns; the video process never restarts |
 | Two platforms on one 1.2 Mbps upload (YouTube HLS first, Facebook RTMP second) | Facebook paused ("Paused: …"), YouTube live at 360p within YouTube's ingestion rules; screens show `live` |
-| YouTube only, on a link too slow for one full-quality segment in time (a quarter of the program's bitrate) | Steps down before anything is confirmed and is live at 360p ~21–23 s after starting; within YouTube's ingestion rules |
-| Facebook first, YouTube (HLS) second on a shared slow upload | YouTube paused; nothing more is uploaded and nothing waits on disk |
+| YouTube only, on a 900 kbps link: a full-quality segment can't go up in the 6 s it gets | Steps down before anything is confirmed and is live at 360p ~27 s after starting; within YouTube's ingestion rules |
+| Facebook first, YouTube (HLS) second on a shared 1.2 Mbps upload | YouTube paused; nothing more is uploaded and nothing waits on disk |
+
+The bandwidth tests stream a 720p, 3 Mbps program of a noisy test picture (`JIVVY_TEST_PATTERN=snow`), so every encoder really spends its bitrate as on a camera; x264 squeezes the usual test pattern to almost nothing.
 
 The video tests run one daemon at a time: a church computer runs one program, and several 1080p30 encodes sharing a laptop's hardware encoder held it to ~20 fps.
 

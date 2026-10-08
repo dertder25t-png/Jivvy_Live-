@@ -1237,7 +1237,14 @@ mod video {
     /// A TCP proxy to `target` whose upload (towards the server) goes through `uplink`,
     /// like the church's internet connection. Returns its port.
     fn throttled(uplink: std::sync::Arc<Uplink>, target: u16) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // A small receive buffer, so the sender feels the limit through TCP flow control as
+        // it would on a real slow link. Without it Linux's auto-tuned loopback buffers soak
+        // up megabytes first and hide the congestion for tens of seconds.
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        socket.listen(16).unwrap();
+        let listener: TcpListener = socket.into();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {

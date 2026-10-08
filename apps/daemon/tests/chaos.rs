@@ -181,7 +181,9 @@ fn kill_hard(pid: u32) {
     } else {
         Command::new("kill").args(["-9", &pid.to_string()]).status()
     };
-    assert!(status.unwrap().success(), "could not kill engine {pid}");
+    // Already gone is fine: on a slow machine the watchdog may have killed it as hung first
+    // (and restarted it, which the callers check).
+    assert!(status.unwrap().success() || !pid_alive(pid), "could not kill engine {pid}");
 }
 
 fn pid_alive(pid: u32) -> bool {

@@ -18,7 +18,10 @@ pub const CONFIG_FILE: &str = "stream.json";
 pub const CONFIG_VERSION: u32 = 1;
 /// No bytes reaching the server for this long (with the connection still open) counts as
 /// a dropped connection: tear down and reconnect rather than wait on a dead socket.
-pub const STALL: Duration = Duration::from_secs(5);
+/// Generous: a socket on an overloaded link can take nothing for several seconds at a time
+/// (Linux drains a large send buffer in big steps), and that is a slow connection to step
+/// down, not a dead one to reconnect. Screens stop showing live within 2 s regardless.
+pub const STALL: Duration = Duration::from_secs(15);
 /// Encoded packets queued for one destination before it counts as stuck.
 pub const QUEUE_PACKETS: usize = 600;
 
@@ -268,7 +271,7 @@ impl DeliveryTracker {
             (self.last_out, self.last_out_at) = (s.out_bytes, Some(now));
             self.flowing_since.get_or_insert(now);
         } else if now.duration_since(self.last_out_at.unwrap_or(connected_at)) > STALL {
-            return Delivery::Failed("no data reached the server for 5 s");
+            return Delivery::Failed("no data reached the server for 15 s");
         }
         let unacked = s.out_bytes.saturating_sub(s.acked);
         if s.window > 0 && unacked > 3 * s.window {
@@ -452,7 +455,7 @@ mod tests {
                 "Connection error: Error receiving data: An existing connection was forcibly closed",
                 "Lost the connection",
             ),
-            ("no data reached the server for 5 s", "stopped responding"),
+            ("no data reached the server for 15 s", "stopped responding"),
             ("Error resolving 'a.rtmps.youtube.com': No such host is known", "Can't find"),
             ("the connection couldn't keep up", "too slow"),
             ("the server answered 401", "rejected"),
@@ -515,10 +518,11 @@ mod tests {
         // The socket stops taking bytes at all.
         let mut d = DeliveryTracker::new(t0);
         d.update(stats(394, 1_000_000, 0), at(t0, 0));
-        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 4_900)), Delivery::Starting);
+        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 2_500)), Delivery::Starting, "not live, not dead");
+        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 14_900)), Delivery::Starting);
         assert_eq!(
-            d.update(stats(394, 1_000_000, 0), at(t0, 5_100)),
-            Delivery::Failed("no data reached the server for 5 s")
+            d.update(stats(394, 1_000_000, 0), at(t0, 15_100)),
+            Delivery::Failed("no data reached the server for 15 s")
         );
     }
 

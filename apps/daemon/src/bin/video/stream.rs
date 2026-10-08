@@ -426,7 +426,7 @@ fn session(
 
     let pipeline = gst::parse::launch(
         // The muxer's pads are named: the appsrcs get their caps only once packets arrive.
-        "flvmux name=mux streamable=true ! rtmp2sink name=out async-connect=true timeout=5 \
+        "flvmux name=mux streamable=true ! rtmp2sink name=out async-connect=true timeout=20 \
          appsrc name=v is-live=true format=time leaky-type=downstream max-time=3000000000 ! queue ! mux.video \
          appsrc name=a is-live=true format=time leaky-type=downstream max-time=3000000000 ! queue ! mux.audio",
     )
@@ -456,8 +456,9 @@ fn session(
     };
     push(&vsrc, &first);
     let mut last_pushed = 0u64;
-    // What the socket took over the last few seconds: congestion needs data still moving.
-    let mut recent_kbps: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+    // When the socket last took bytes: congestion needs data still moving (on an overloaded
+    // link it can take nothing for seconds at a time; a dead link takes nothing at all).
+    let mut last_moved = Instant::now();
 
     let mut audio_caps_set = false;
     let mut last_video = running_time(&first).map(|(t, _)| t);
@@ -544,11 +545,10 @@ fn session(
                 break Err("the connection couldn't keep up".into());
             }
             let behind = st.window > 0 && st.out_bytes.saturating_sub(st.acked) > 2 * st.window;
-            recent_kbps.push_back(kbps);
-            if recent_kbps.len() > 3 {
-                recent_kbps.pop_front();
+            if kbps > 32.0 {
+                last_moved = now;
             }
-            let moving = recent_kbps.iter().sum::<f64>() / recent_kbps.len() as f64 > 32.0;
+            let moving = now.duration_since(last_moved) < Duration::from_secs(10);
             link.report(kbps, settled && moving && (backlog > second || behind), None);
             let mut s = status.lock().unwrap();
             if delivery == Delivery::Live && backlog > 2 * second {

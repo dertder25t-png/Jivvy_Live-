@@ -93,12 +93,26 @@ pub(crate) struct Link {
     /// What to send: a quality, or None (paused for bandwidth).
     assigned: Mutex<Option<Quality>>,
     /// The worker's latest measurements.
-    report: Mutex<Report>,
+    report: Mutex<(Report, Instant)>,
 }
+
+/// A report older than this (its worker is reconnecting) no longer counts.
+const REPORT_STALE: Duration = Duration::from_secs(10);
 
 impl Link {
     fn new(id: &str, full: Quality) -> Link {
-        Link { assigned: Mutex::new(Some(full)), report: Mutex::new(Report { id: id.into(), ..Report::default() }) }
+        let report = (Report { id: id.into(), ..Report::default() }, Instant::now());
+        Link { assigned: Mutex::new(Some(full)), report: Mutex::new(report) }
+    }
+
+    /// The latest report, or an empty one if it's stale.
+    fn current(&self) -> Report {
+        let (r, at) = self.report.lock().unwrap().clone();
+        if at.elapsed() < REPORT_STALE { r } else { Report { id: r.id, ..Report::default() } }
+    }
+
+    fn congested(&self) -> bool {
+        self.report.lock().unwrap().0.congested
     }
 
     pub(crate) fn assigned(&self) -> Option<Quality> {
@@ -108,7 +122,7 @@ impl Link {
     /// Called about once a second by the worker. Never call while holding `status`.
     pub(crate) fn report(&self, sent_kbps: f64, congested: bool, capacity_kbps: Option<f64>) {
         let mut r = self.report.lock().unwrap();
-        (r.sent_kbps, r.congested, r.capacity_kbps) = (sent_kbps, congested, capacity_kbps);
+        (r.0.sent_kbps, r.0.congested, r.0.capacity_kbps, r.1) = (sent_kbps, congested, capacity_kbps, Instant::now());
     }
 
     fn clear(&self) {
@@ -231,7 +245,7 @@ impl Streamer {
         }
 
         let reports: Vec<Report> =
-            order.iter().filter_map(|id| self.workers.get(id)).map(|w| w.link.report.lock().unwrap().clone()).collect();
+            order.iter().filter_map(|id| self.workers.get(id)).map(|w| w.link.current()).collect();
         let assignments = self.manager.update(&self.ladder, &order, &reports, wanted(feed), Instant::now());
         for (id, a) in assignments {
             if let Some(w) = self.workers.get(&id) {
@@ -304,7 +318,12 @@ fn run(
             Ok(()) => attempt = 0,
             Err(e) => {
                 attempt += 1;
-                link.clear(); // a dead connection isn't congestion
+                // A dead connection isn't congestion; but one that gave up while data was
+                // still moving and piling up (e.g. a write timing out on an overloaded link)
+                // is, and the manager needs that to step it down.
+                if !link.congested() {
+                    link.clear();
+                }
                 // The log keeps the technical reason (key removed); the screen gets plain words.
                 log(
                     "video",
@@ -437,6 +456,8 @@ fn session(
     };
     push(&vsrc, &first);
     let mut last_pushed = 0u64;
+    // What the socket took over the last few seconds: congestion needs data still moving.
+    let mut recent_kbps: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
 
     let mut audio_caps_set = false;
     let mut last_video = running_time(&first).map(|(t, _)| t);
@@ -523,7 +544,12 @@ fn session(
                 break Err("the connection couldn't keep up".into());
             }
             let behind = st.window > 0 && st.out_bytes.saturating_sub(st.acked) > 2 * st.window;
-            link.report(kbps, settled && (backlog > second || behind), None);
+            recent_kbps.push_back(kbps);
+            if recent_kbps.len() > 3 {
+                recent_kbps.pop_front();
+            }
+            let moving = recent_kbps.iter().sum::<f64>() / recent_kbps.len() as f64 > 32.0;
+            link.report(kbps, settled && moving && (backlog > second || behind), None);
             let mut s = status.lock().unwrap();
             if delivery == Delivery::Live && backlog > 2 * second {
                 // Connected, but the video goes out slower than it's made: viewers fall behind.

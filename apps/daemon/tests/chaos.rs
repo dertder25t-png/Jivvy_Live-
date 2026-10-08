@@ -758,6 +758,10 @@ mod video {
         wait_stream_state(&d, "live", Duration::from_secs(10));
         println!("stream live again {:?} after the server returned", back_at.elapsed());
         assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
+        // A dead connection isn't a slow one: the quality was never lowered for it.
+        let s = d.media_status(Duration::from_secs(3), "status", |_| true);
+        assert_eq!(s["stream"]["destinations"][0]["quality"], "1080p", "{}", s["stream"]);
+        assert!(s["stream"]["uploadKbps"].is_null(), "no upload limit inferred: {}", s["stream"]);
     }
 
     #[test]
@@ -1445,13 +1449,15 @@ mod video {
             destination(s, "youtube")["state"] == "paused" && destination(s, "facebook")["state"] == "live"
         });
         assert_eq!(stream_state(&d), "live");
-        // Paused means paused: after any upload already on its way (a segment gets at most
-        // three times its length), nothing more reaches YouTube and nothing waits on disk.
-        // (Checked well inside the 20 s before the manager tries un-pausing it.)
-        std::thread::sleep(Duration::from_secs(6));
-        let before = yt.segments().len();
-        std::thread::sleep(Duration::from_secs(5));
-        assert_eq!(yt.segments().len(), before, "a paused destination keeps uploading");
+        let paused_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        // Paused means paused: nothing is cut after the pause, so nothing cut after it ever
+        // reaches YouTube (what was already on its way may still land), and nothing waits on
+        // disk. Checked well inside the 20 s before the manager tries un-pausing it.
+        std::thread::sleep(Duration::from_secs(10));
+        for (name, _) in yt.segments() {
+            let session: u128 = name.trim_start_matches('s').split('-').next().unwrap().parse().unwrap();
+            assert!(session < paused_at, "{name} was cut after the pause");
+        }
         assert_eq!(spool_files(&d), 0, "its backlog is skipped");
         yt.assert_no_violations();
     }

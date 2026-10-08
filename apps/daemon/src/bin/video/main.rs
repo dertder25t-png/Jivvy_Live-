@@ -12,6 +12,7 @@
 //! because an input does: a missing camera becomes a slate, a missing microphone silence.
 //! It draws the lyric layer, encodes once, and is where recording and streaming attach.
 
+mod hls;
 mod program;
 mod stream;
 

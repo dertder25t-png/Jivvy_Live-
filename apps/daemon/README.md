@@ -9,7 +9,7 @@ The church-computer side of Jivvy Live. See `docs/BUILD_PLAN.md` (Stage 1, Daemo
 - **`jivvy-outputs`** shows the state fullscreen on the projector and TVs. It follows the engine over the command channel like any other device, so **an engine restart never blanks a screen**: windows keep the last slide until the engine is back.
 - **`jivvy-video`** (built with `--features video`; needs GStreamer) captures the camera or capture card and the audio input, sends audio levels to the engine for live meters, and builds the **program feed**: lyrics composited over the camera and encoded once, for the recording and the stream. Skipped by the watchdog when not installed.
 
-Video, recording and streaming plug into the engine in later Stage 1 items. Until streaming lands, `stream.start` and `stream.stop` answer `unavailable`.
+Recording plugs into the engine in a later Stage 1 item.
 
 ## Output windows
 
@@ -80,7 +80,26 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
   ] }
   ```
 - **Keys stay secret:** they go only to the RTMP sink, never into a pipeline description, log line, status file or error message (errors are scrubbed, and a broken `stream.json` is reported by line number, never by content). The screen shows the reason in plain words ("Can't reach the streaming server…"); the log keeps the technical one.
-- Still to come in the streaming item: YouTube's HLS segment upload (with retries and catch-up), the bandwidth manager, and two-connection support.
+- **Video and audio line up by running time,** not raw timestamps: the encoders shift video timestamps (Media Foundation by 1000 hours), and comparing raw ones dropped every audio packet. The tests check that the server gets both tracks.
+- Still to come in the streaming item: the bandwidth manager and two-connection support.
+
+## Streaming to YouTube (HLS segment upload)
+
+`program tee ─> taps ─> segmenter (own pipeline) ─> 2 s .ts files on disk ─> uploader (HTTPS, retries) ─> YouTube`
+
+A destination whose address is `https://` uses YouTube's HLS ingestion instead of RTMP. Paste the address from YouTube Studio (HLS ingestion) and the key:
+
+```json
+{ "id": "youtube", "name": "YouTube", "url": "https://a.upload.youtube.com/http_upload_hls?cid=$STREAM_KEY&copy=0&file=", "key": "<stream key>" }
+```
+
+- **A drop never loses video.** The segmenter cuts the program into self-contained MPEG-TS segments (one per 2 s keyframe interval: PAT/PMT first, SPS/PPS on the keyframe) on its own thread, whatever the network does. The uploader sends them in order, each after a playlist that lists it, and retries until YouTube confirms (200, or 202 for a segment ahead of its playlist). After a drop the backlog goes out as fast as the connection allows. On the founder's laptop, after a 20 s outage, every segment arrived in order and the stream was live again **~4.7 s** after the connection returned (most of that is the 5 s retry interval).
+- **YouTube's ingestion rules** are followed and checked by the tests: the first playlist starts at sequence 0 and sequence numbers only grow; no more than 5 unconfirmed segments listed, plus the last 2 confirmed; segment names unique across restarts (`s<start time>-<n>.ts`); 400 means a file it can't use (skipped, logged), 401 the key wasn't accepted (shown in plain words, retried in case the key is fixed).
+- **Survives crashes.** The queue (`stream-spool/<id>/queue.json`, with the waiting segments beside it) is saved after every change. A restarted video process carries on the same playlist with its backlog, timestamps continuing where they stopped. Live again **~10.7 s** after the video process was killed (start-up, then one whole segment has to be cut before it can go). `stream.stop` clears the queue, so the next start is a new broadcast from sequence 0; so does a new key.
+- **Never fills the disk.** At most 60 s of video waits (about 45 MB at 6 Mbps); after a longer outage the oldest waiting video is skipped so viewers aren't left minutes behind (the local recording still has it). Confirmed segments are deleted at once.
+- **Live** means YouTube has confirmed segments and no more than 6 s of video is waiting; otherwise `reconnecting`, with the reason or how far behind it is.
+- **Keys stay secret:** the key goes only into the upload address handed to the HTTP client; status shows `https://a.upload.youtube.com/http_upload_hls`, errors are scrubbed, and the queue file stores a hash to tell keys apart. Plain `http://` is accepted only for this computer (test servers).
+- Still to check: a private YouTube event, once the channel can go live.
 
 ## Command channel (for now)
 
@@ -131,6 +150,9 @@ Chaos tests (`tests/chaos.rs`), covering the reliability table's "Video engine c
 | Kill the video process while streaming, then stop | Stream resumes by itself (~6 s); after `stream.stop` the server stops receiving |
 | Stream to a port nothing listens on | `reconnecting` with "Can't reach the streaming server", retries counted, the key in no status or state file |
 | Stream to a server that accepts the connection but never answers | Never shown live; gives up after 10 s with "Can't reach the streaming server" and keeps retrying |
+| YouTube HLS (fake ingest that enforces YouTube's rules): connection dead for 20 s | Segments keep being cut to disk; `reconnecting` in plain words; program at ~30 fps; every segment arrives in order once it's back, caught up and live ~4.7 s later; each segment decodes on its own with picture (2 s at 30 fps) and sound |
+| YouTube HLS: kill the video process, then stop and start again | Same playlist carried on (sequence numbers only grow, no name reused), live ~10.7 s after the kill; nothing sent after stop; the next start begins at sequence 0 |
+| YouTube HLS: key not accepted (401) | `reconnecting`, "The platform rejected the stream…", retries counted, the key in no status, state or queue file |
 
 The video tests run one daemon at a time: a church computer runs one program, and several 1080p30 encodes sharing a laptop's hardware encoder held it to ~20 fps.
 

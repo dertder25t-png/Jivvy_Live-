@@ -1,5 +1,6 @@
-//! RTMP/RTMPS destinations: each runs on its own thread with its own small pipeline, fed
-//! copies of the program's encoded packets. See `jivvy_daemon::stream`.
+//! Stream destinations: each runs on its own thread with its own small pipeline, fed
+//! copies of the program's encoded packets. RTMP/RTMPS here (see `jivvy_daemon::stream`);
+//! YouTube's HLS segment upload in `hls.rs`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,7 +54,7 @@ impl Taps {
         });
     }
 
-    fn subscribe(self: &Arc<Self>) -> Subscription {
+    pub(crate) fn subscribe(self: &Arc<Self>) -> Subscription {
         let (tx, rx) = sync_channel(QUEUE_PACKETS);
         let overflowed = Arc::new(AtomicBool::new(false));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -62,11 +63,11 @@ impl Taps {
     }
 }
 
-struct Subscription {
+pub(crate) struct Subscription {
     taps: Arc<Taps>,
     id: u64,
-    rx: Receiver<Packet>,
-    overflowed: Arc<AtomicBool>,
+    pub(crate) rx: Receiver<Packet>,
+    pub(crate) overflowed: Arc<AtomicBool>,
 }
 
 impl Drop for Subscription {
@@ -132,7 +133,12 @@ impl Streamer {
                 reconnects: 0,
             }));
             let (dest, f, s, st) = (d.clone(), feed.clone(), stop.clone(), status.clone());
-            std::thread::spawn(move || run(dest, f, s, st));
+            if d.is_hls() {
+                let dir = dir.to_path_buf();
+                std::thread::spawn(move || crate::hls::run(dest, f, s, st, dir));
+            } else {
+                std::thread::spawn(move || run(dest, f, s, st));
+            }
             self.workers.insert(id, Worker { destination: d, stop, status });
         }
     }
@@ -150,12 +156,12 @@ impl Streamer {
     }
 }
 
-fn wanted(feed: &Feed) -> bool {
+pub(crate) fn wanted(feed: &Feed) -> bool {
     feed.live.lock().unwrap().is_some_and(|s| s.stream_wanted)
 }
 
 /// Sets a destination's state. Never call with an argument that locks `status` itself.
-fn set(status: &Mutex<DestinationStatus>, state: &'static str, detail: String, kbps: f64) {
+pub(crate) fn set(status: &Mutex<DestinationStatus>, state: &'static str, detail: String, kbps: f64) {
     let mut s = status.lock().unwrap();
     (s.state, s.detail, s.kbps) = (state, detail, kbps);
 }
@@ -198,6 +204,43 @@ fn run(dest: Destination, feed: Arc<Feed>, stop: Arc<AtomicBool>, status: Arc<Mu
     set(&status, "off", String::new(), 0.0);
 }
 
+/// A packet's timestamps (presentation, decode) as running time: the one clock video and
+/// audio share. Encoders may shift their own timestamps (Media Foundation's by 1000 hours,
+/// to keep decode times positive) and correct for it in their segment, so raw timestamps
+/// of video and audio can't be compared; running times can.
+pub(crate) fn running_time(sample: &gst::Sample) -> Option<(gst::ClockTime, gst::ClockTime)> {
+    let buf = sample.buffer()?;
+    let pts = buf.pts()?;
+    let rt = sample.segment()?.downcast_ref::<gst::ClockTime>()?.to_running_time(pts)?;
+    // The decode time moves by the same amount; without one it's the presentation time.
+    let dts = buf.dts().and_then(|d| (d + rt).checked_sub(pts)).unwrap_or(rt);
+    Some((rt, dts))
+}
+
+/// True when the program was rebuilt under us (e.g. after an encoder failure) with the
+/// same caps: its timestamps start again from zero, so video jumps back in time. Packets
+/// from then on can't be timed against the old start, so the destination starts over.
+pub(crate) fn restarted(last: &mut Option<gst::ClockTime>, sample: &gst::Sample) -> bool {
+    let Some((now, _)) = running_time(sample) else { return false };
+    let back = last.is_some_and(|l| now + gst::ClockTime::from_seconds(1) < l);
+    *last = Some(now);
+    back
+}
+
+/// The packet's buffer (sharing its data) with timestamps counted from `base` (the first
+/// keyframe's running time) and carried on from `offset`. None for packets from before
+/// `base`.
+pub(crate) fn retimed(sample: &gst::Sample, base: gst::ClockTime, offset: gst::ClockTime) -> Option<gst::Buffer> {
+    let (pts, dts) = running_time(sample)?;
+    let pts = pts.checked_sub(base)? + offset;
+    let dts = dts.checked_sub(base).map_or(pts, |d| d + offset);
+    let mut b = sample.buffer()?.copy();
+    let m = b.get_mut()?;
+    m.set_pts(pts);
+    m.set_dts(dts);
+    Some(b)
+}
+
 /// The RTMP sink's connection counters.
 fn rtmp_stats(sink: &gst::Element) -> RtmpStats {
     let Ok(st) = sink.property_value("stats").get::<gst::Structure>() else { return RtmpStats::default() };
@@ -237,7 +280,7 @@ fn session(
             Err(RecvTimeoutError::Disconnected) => return Err("program taps closed".into()),
         }
     };
-    let base = first.buffer().and_then(|b| b.pts()).unwrap_or(gst::ClockTime::ZERO);
+    let base = running_time(&first).ok_or("the first keyframe has no timestamp")?.0;
     let video_caps = first.caps_owned().ok_or("no video caps")?;
 
     let pipeline = gst::parse::launch(
@@ -261,20 +304,15 @@ fn session(
     };
     pipeline.set_state(gst::State::Playing).map_err(|_| "the stream pipeline would not start")?;
 
-    let rebase = |b: &gst::BufferRef| b.pts().and_then(|p| p.checked_sub(base));
     let push = |src: &gst_app::AppSrc, sample: &gst::Sample| {
-        let Some(buf) = sample.buffer() else { return };
-        let Some(pts) = rebase(buf) else { return }; // from before our first keyframe
-        let mut b = buf.copy(); // shares the data; new timestamps only
-        if let Some(m) = b.get_mut() {
-            m.set_pts(pts);
-            m.set_dts(buf.dts().and_then(|d| d.checked_sub(base)).or(Some(pts)));
+        if let Some(b) = retimed(sample, base, gst::ClockTime::ZERO) {
+            let _ = src.push_buffer(b);
         }
-        let _ = src.push_buffer(b);
     };
     push(&vsrc, &first);
 
     let mut audio_caps_set = false;
+    let mut last_video = running_time(&first).map(|(t, _)| t);
     // Delivery is judged from the sink's connection counters, never from buffers reaching
     // the sink (those are accepted before the connection even exists).
     let mut tracker = DeliveryTracker::new(Instant::now());
@@ -290,6 +328,9 @@ fn session(
             Ok(Packet::Video(s)) => {
                 if s.caps().is_some_and(|c| !c.is_strictly_equal(&video_caps)) {
                     break Err("the program changed (size or encoder)".into());
+                }
+                if restarted(&mut last_video, &s) {
+                    break Err("the program changed (it restarted)".into());
                 }
                 push(&vsrc, &s);
             }
@@ -344,4 +385,45 @@ fn session(
     };
     stop_pipeline(&pipeline);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packet as the program's taps hand it over: its timestamp, and the segment its
+    /// encoder sent (`start` shifted the way Media Foundation shifts video, by 1000 h).
+    fn packet(pts_ms: u64, start: gst::ClockTime) -> gst::Sample {
+        gst::init().unwrap();
+        let mut buf = gst::Buffer::new();
+        buf.get_mut().unwrap().set_pts(start + gst::ClockTime::from_mseconds(pts_ms));
+        let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        segment.set_start(start);
+        gst::Sample::builder().buffer(&buf).segment(&segment).build()
+    }
+
+    const SHIFT: gst::ClockTime = gst::ClockTime::from_seconds(3_600_000);
+
+    #[test]
+    fn video_and_audio_line_up_whatever_the_encoder_did_to_its_timestamps() {
+        let video = packet(2_000, SHIFT); // raw pts 1000 h + 2 s
+        let audio = packet(2_100, gst::ClockTime::ZERO); // raw pts 2.1 s
+        let base = running_time(&video).unwrap().0;
+        assert_eq!(base, gst::ClockTime::from_seconds(2));
+        let a = retimed(&audio, base, gst::ClockTime::ZERO).expect("audio after the keyframe is kept");
+        assert_eq!(a.pts(), Some(gst::ClockTime::from_mseconds(100)));
+        let offset = gst::ClockTime::from_seconds(60);
+        assert_eq!(retimed(&video, base, offset).unwrap().pts(), Some(offset), "carried on from an earlier run");
+        assert!(retimed(&packet(1_900, gst::ClockTime::ZERO), base, offset).is_none(), "before the keyframe");
+    }
+
+    #[test]
+    fn a_rebuilt_program_is_noticed() {
+        let mut last = None;
+        for ms in [10_000, 10_033, 10_066] {
+            assert!(!restarted(&mut last, &packet(ms, SHIFT)));
+        }
+        assert!(!restarted(&mut last, &packet(10_000, SHIFT)), "small jitter isn't a restart");
+        assert!(restarted(&mut last, &packet(0, SHIFT)), "timestamps from zero again");
+    }
 }

@@ -63,13 +63,17 @@ pub struct Queue {
     /// Sequence number of the first segment listed: the oldest kept confirmed one, or the
     /// first waiting one when none is kept.
     pub first_seq: u64,
-    /// Confirmed and still listed (their files are already deleted).
+    /// Confirmed by the server (200/202) and still listed; their files are already deleted.
+    /// Only ever segments the server has: skipped ones are never kept here.
     pub confirmed: VecDeque<Segment>,
     /// Cut and on disk, waiting for the server to confirm them, oldest first.
     pub waiting: VecDeque<Segment>,
     /// How many of `waiting` have been in a playlist sent to the server. Their sequence
-    /// numbers are taken, so they're never skipped.
+    /// numbers are taken: never reused, even if the segment itself is skipped.
     pub listed: usize,
+    /// The server has accepted a playlist, so the numbers it listed are spoken for.
+    #[serde(default)]
+    pub playlist_accepted: bool,
     /// Where the last segment cut ends, in nanoseconds of stream time: the next segmenter
     /// run carries timestamps on from here.
     pub end_ns: u64,
@@ -105,18 +109,35 @@ impl Queue {
         crate::write_atomic(&dir.join(QUEUE_FILE), &bytes)
     }
 
-    /// Gives up on everything waiting. Listed segments keep their sequence numbers (they
-    /// slide out of the playlist like confirmed ones), so numbering stays consistent.
+    /// Gives up on everything waiting (see `discard`).
     pub fn skip_waiting(&mut self) {
-        while let Some(s) = self.waiting.front() {
-            self.skipped_secs += s.duration;
-            if self.listed > 0 {
-                let name = s.name.clone();
-                self.confirm(&name);
-            } else {
-                self.waiting.pop_front();
+        while let Some(name) = self.waiting.front().map(|s| s.name.clone()) {
+            self.discard(&name);
+        }
+    }
+
+    /// Gives up on the next waiting segment without it reaching the server (it was
+    /// rejected, or is too old to send). False if `name` isn't the next one.
+    ///
+    /// It never joins the confirmed ones: playlists only ever list media the server has.
+    /// If it was listed, its sequence number stays used up; a playlist lists consecutive
+    /// numbers, so the confirmed ones before it leave the playlist too and the next one
+    /// starts after it. Before the server has accepted any playlist nothing is spoken for,
+    /// and numbering starts over where it was (so the first playlist it sees is at 0).
+    pub fn discard(&mut self, name: &str) -> bool {
+        if self.waiting.front().is_none_or(|s| s.name != name) {
+            return false;
+        }
+        let s = self.waiting.pop_front().expect("checked");
+        self.skipped_secs += s.duration;
+        if self.listed > 0 {
+            self.listed -= 1;
+            if self.playlist_accepted {
+                self.first_seq += self.confirmed.len() as u64 + 1;
+                self.confirmed.clear();
             }
         }
+        true
     }
 
     /// Adds a segment just cut, ending at `end_ns`. Returns segments skipped to keep the
@@ -155,6 +176,11 @@ impl Queue {
             m3u8.push_str(&format!("#EXTINF:{:.3},\n{}\n", s.duration, s.name));
         }
         m3u8
+    }
+
+    /// The server accepted a playlist.
+    pub fn accept_playlist(&mut self) {
+        self.playlist_accepted = true;
     }
 
     /// The server confirmed `name`. False if it isn't the next waiting segment (the queue
@@ -328,22 +354,53 @@ mod tests {
             q.push(seg(i), (i as u64 + 1) * 2_000_000_000);
         }
         q.playlist();
+        q.accept_playlist();
         q.confirm("s7-00000.ts");
         q.save(&dir, 1_000_000).unwrap();
         assert_eq!(Queue::load(&dir, 42, 1_005_000), q);
         assert_eq!(Queue::load(&dir, 43, 1_005_000), Queue::new(43));
 
-        // Saved long ago: the old video is skipped, but numbering carries on.
-        let stale = Queue::load(&dir, 42, 1_000_000 + 61_000);
-        assert!(stale.waiting.is_empty());
+        // Saved long ago: the old video is skipped, but numbering carries on, and the
+        // skipped segments (never confirmed) are never listed again.
+        let mut stale = Queue::load(&dir, 42, 1_000_000 + 61_000);
+        assert!(stale.waiting.is_empty() && stale.confirmed.is_empty());
         assert_eq!(stale.end_ns, q.end_ns);
-        let mut stale = stale;
         stale.push(seg(9), 0);
         let l = listed(&stale.playlist());
-        assert_eq!(l.last().unwrap(), &(4, "s7-00009.ts".into()), "0-3 were taken: {l:?}");
+        assert_eq!(l, [(4, "s7-00009.ts".into())], "0-3 were taken");
 
         std::fs::write(dir.join(QUEUE_FILE), b"{broken").unwrap();
         assert_eq!(Queue::load(&dir, 42, 1_005_000), Queue::new(42));
+    }
+
+    #[test]
+    fn a_rejected_segment_is_never_listed_as_confirmed_and_its_number_stays_used() {
+        let mut q = Queue::new(1);
+        for i in 0..4 {
+            q.push(seg(i), 0);
+        }
+        q.playlist();
+        q.accept_playlist();
+        assert!(q.confirm("s7-00000.ts"));
+        assert!(q.confirm("s7-00001.ts"));
+        // The server answers 400 for segment 2.
+        assert!(!q.discard("s7-00003.ts"), "only the next one");
+        assert!(q.discard("s7-00002.ts"));
+        let l = listed(&q.playlist());
+        assert_eq!(l, [(3, "s7-00003.ts".into())], "0 and 1 can't be listed past the gap at 2");
+        assert!(q.confirm("s7-00003.ts"));
+        q.push(seg(4), 0);
+        assert_eq!(listed(&q.playlist()), [(3, "s7-00003.ts".into()), (4, "s7-00004.ts".into())]);
+    }
+
+    #[test]
+    fn before_any_playlist_is_accepted_numbering_starts_over_at_zero() {
+        let mut q = Queue::new(1);
+        q.push(seg(0), 0);
+        q.push(seg(1), 0);
+        q.playlist(); // sent, but never accepted
+        assert!(q.discard("s7-00000.ts"));
+        assert_eq!(listed(&q.playlist()), [(0, "s7-00001.ts".into())]);
     }
 
     #[test]

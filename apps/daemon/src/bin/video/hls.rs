@@ -18,7 +18,7 @@ use jivvy_daemon::stream::{Destination, DestinationStatus, reconnect_delay};
 use jivvy_daemon::{log, now_ms};
 
 use crate::program::Feed;
-use crate::stream::{Packet, retimed, running_time, set, wanted};
+use crate::stream::{Packet, restarted, retimed, running_time, set, wanted};
 
 /// One destination's queue, shared by its segmenter and uploader.
 struct Shared {
@@ -48,16 +48,28 @@ impl Shared {
     }
 }
 
-/// Only one worker per destination uses its spool at a time: a worker replaced after a
-/// config change finishes before the new one starts.
-fn spool_lock(id: &str) -> Arc<Mutex<()>> {
+/// The spool folder name for a destination id: anything but lowercase a-z, digits, `-`
+/// and `_` is written as `~XX` (hex bytes). One-to-one, so two ids never share a folder,
+/// even on a filesystem that ignores case.
+fn spool_name(id: &str) -> String {
+    id.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => char::from(b).to_string(),
+            _ => format!("~{b:02X}"),
+        })
+        .collect()
+}
+
+/// Only one worker per spool folder uses it at a time: a worker replaced after a config
+/// change finishes before the new one starts.
+fn spool_lock(name: &str) -> Arc<Mutex<()>> {
     static LOCKS: Mutex<Vec<(String, Arc<Mutex<()>>)>> = Mutex::new(Vec::new());
     let mut locks = LOCKS.lock().unwrap();
-    if let Some((_, l)) = locks.iter().find(|(i, _)| i == id) {
+    if let Some((_, l)) = locks.iter().find(|(n, _)| n == name) {
         return l.clone();
     }
     let l = Arc::new(Mutex::new(()));
-    locks.push((id.to_string(), l.clone()));
+    locks.push((name.to_string(), l.clone()));
     l
 }
 
@@ -74,11 +86,10 @@ pub fn run(
     status: Arc<Mutex<DestinationStatus>>,
     data_dir: PathBuf,
 ) {
-    let lock = spool_lock(&dest.id);
+    let name = spool_name(&dest.id);
+    let lock = spool_lock(&name);
     let _spool = lock.lock().unwrap_or_else(|p| p.into_inner());
-    let safe_id: String =
-        dest.id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    let spool = data_dir.join(hls::SPOOL_DIR).join(safe_id);
+    let spool = data_dir.join(hls::SPOOL_DIR).join(name);
     while let Err(e) = std::fs::create_dir_all(&spool) {
         log("video", format!("stream {}: can't create {}: {e}", dest.id, spool.display()));
         set(&status, "reconnecting", "Can't save the stream to disk. Check the disk space.".into(), 0.0);
@@ -212,6 +223,7 @@ fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared) -> Result<(), S
     push(&vsrc, &first);
 
     let mut audio_caps_set = false;
+    let mut last_video = running_time(&first).map(|(t, _)| t);
     let mut opened_at: Option<u64> = None;
     let result = loop {
         if stop.load(Ordering::Relaxed) || !wanted(feed) {
@@ -224,6 +236,9 @@ fn segment(feed: &Arc<Feed>, stop: &AtomicBool, shared: &Shared) -> Result<(), S
             Ok(Packet::Video(s)) => {
                 if s.caps().is_some_and(|c| !c.is_strictly_equal(&video_caps)) {
                     break Err("the program changed (size or encoder)".into());
+                }
+                if restarted(&mut last_video, &s) {
+                    break Err("the program changed (it restarted)".into());
                 }
                 push(&vsrc, &s);
             }
@@ -345,29 +360,40 @@ fn upload(
             shared.save(&mut q);
             (playlist, segment)
         };
-        let outcome =
-            match put(&agent, &dest.hls_url(hls::PLAYLIST), "application/vnd.apple.mpegurl", playlist.as_bytes()) {
-                // A playlist the server can't read is our mistake; retrying is all we can do.
-                Outcome::Unusable(e) => Outcome::Retry(format!("playlist: {e}")),
-                Outcome::Confirmed => match std::fs::read(shared.spool.join(&segment.name)) {
-                    Ok(bytes) => {
-                        let o = put(&agent, &dest.hls_url(&segment.name), "video/MP2T", &bytes);
-                        if o == Outcome::Confirmed {
-                            sent += (bytes.len() + playlist.len()) as u64;
-                        }
-                        o
+        let listed = put(&agent, &dest.hls_url(hls::PLAYLIST), "application/vnd.apple.mpegurl", playlist.as_bytes());
+        if listed == Outcome::Confirmed && !shared.queue.lock().unwrap().playlist_accepted {
+            let mut q = shared.queue.lock().unwrap();
+            q.accept_playlist();
+            shared.save(&mut q);
+        }
+        let outcome = match listed {
+            // A playlist the server can't read is our mistake; retrying is all we can do.
+            Outcome::Unusable(e) => Outcome::Retry(format!("playlist: {e}")),
+            Outcome::Confirmed => match std::fs::read(shared.spool.join(&segment.name)) {
+                Ok(bytes) => {
+                    let o = put(&agent, &dest.hls_url(&segment.name), "video/MP2T", &bytes);
+                    if o == Outcome::Confirmed {
+                        sent += (bytes.len() + playlist.len()) as u64;
                     }
-                    Err(e) => Outcome::Unusable(format!("can't read the segment: {e}")),
-                },
-                retry => retry,
-            };
+                    o
+                }
+                Err(e) => Outcome::Unusable(format!("can't read the segment: {e}")),
+            },
+            retry => retry,
+        };
         match outcome {
             Outcome::Confirmed | Outcome::Unusable(_) => {
-                if let Outcome::Unusable(e) = &outcome {
-                    log("video", format!("stream {}: skipping {}: {}", dest.id, segment.name, dest.scrub(e)));
-                }
                 let mut q = shared.queue.lock().unwrap();
-                if q.confirm(&segment.name) {
+                // A segment the server can't use (or we can't read) is skipped, never
+                // listed as if the server had it.
+                let done = match &outcome {
+                    Outcome::Unusable(e) => {
+                        log("video", format!("stream {}: skipping {}: {}", dest.id, segment.name, dest.scrub(e)));
+                        q.discard(&segment.name)
+                    }
+                    _ => q.confirm(&segment.name),
+                };
+                if done {
                     let _ = std::fs::remove_file(shared.spool.join(&segment.name));
                     shared.save(&mut q);
                 }
@@ -383,5 +409,19 @@ fn upload(
                 last_error = Some(e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spool_folders_never_collide() {
+        assert_eq!(spool_name("youtube"), "youtube");
+        let ids = ["a/b", "a_b", "a~2Fb", "YouTube", "youtube", "a b", "a.b"];
+        let names: std::collections::HashSet<String> = ids.iter().map(|i| spool_name(i).to_lowercase()).collect();
+        assert_eq!(names.len(), ids.len(), "{names:?}");
+        assert!(names.iter().all(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || "-_~".contains(c))));
     }
 }

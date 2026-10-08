@@ -217,6 +217,16 @@ pub(crate) fn running_time(sample: &gst::Sample) -> Option<(gst::ClockTime, gst:
     Some((rt, dts))
 }
 
+/// True when the program was rebuilt under us (e.g. after an encoder failure) with the
+/// same caps: its timestamps start again from zero, so video jumps back in time. Packets
+/// from then on can't be timed against the old start, so the destination starts over.
+pub(crate) fn restarted(last: &mut Option<gst::ClockTime>, sample: &gst::Sample) -> bool {
+    let Some((now, _)) = running_time(sample) else { return false };
+    let back = last.is_some_and(|l| now + gst::ClockTime::from_seconds(1) < l);
+    *last = Some(now);
+    back
+}
+
 /// The packet's buffer (sharing its data) with timestamps counted from `base` (the first
 /// keyframe's running time) and carried on from `offset`. None for packets from before
 /// `base`.
@@ -302,6 +312,7 @@ fn session(
     push(&vsrc, &first);
 
     let mut audio_caps_set = false;
+    let mut last_video = running_time(&first).map(|(t, _)| t);
     // Delivery is judged from the sink's connection counters, never from buffers reaching
     // the sink (those are accepted before the connection even exists).
     let mut tracker = DeliveryTracker::new(Instant::now());
@@ -317,6 +328,9 @@ fn session(
             Ok(Packet::Video(s)) => {
                 if s.caps().is_some_and(|c| !c.is_strictly_equal(&video_caps)) {
                     break Err("the program changed (size or encoder)".into());
+                }
+                if restarted(&mut last_video, &s) {
+                    break Err("the program changed (it restarted)".into());
                 }
                 push(&vsrc, &s);
             }
@@ -371,4 +385,45 @@ fn session(
     };
     stop_pipeline(&pipeline);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A packet as the program's taps hand it over: its timestamp, and the segment its
+    /// encoder sent (`start` shifted the way Media Foundation shifts video, by 1000 h).
+    fn packet(pts_ms: u64, start: gst::ClockTime) -> gst::Sample {
+        gst::init().unwrap();
+        let mut buf = gst::Buffer::new();
+        buf.get_mut().unwrap().set_pts(start + gst::ClockTime::from_mseconds(pts_ms));
+        let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        segment.set_start(start);
+        gst::Sample::builder().buffer(&buf).segment(&segment).build()
+    }
+
+    const SHIFT: gst::ClockTime = gst::ClockTime::from_seconds(3_600_000);
+
+    #[test]
+    fn video_and_audio_line_up_whatever_the_encoder_did_to_its_timestamps() {
+        let video = packet(2_000, SHIFT); // raw pts 1000 h + 2 s
+        let audio = packet(2_100, gst::ClockTime::ZERO); // raw pts 2.1 s
+        let base = running_time(&video).unwrap().0;
+        assert_eq!(base, gst::ClockTime::from_seconds(2));
+        let a = retimed(&audio, base, gst::ClockTime::ZERO).expect("audio after the keyframe is kept");
+        assert_eq!(a.pts(), Some(gst::ClockTime::from_mseconds(100)));
+        let offset = gst::ClockTime::from_seconds(60);
+        assert_eq!(retimed(&video, base, offset).unwrap().pts(), Some(offset), "carried on from an earlier run");
+        assert!(retimed(&packet(1_900, gst::ClockTime::ZERO), base, offset).is_none(), "before the keyframe");
+    }
+
+    #[test]
+    fn a_rebuilt_program_is_noticed() {
+        let mut last = None;
+        for ms in [10_000, 10_033, 10_066] {
+            assert!(!restarted(&mut last, &packet(ms, SHIFT)));
+        }
+        assert!(!restarted(&mut last, &packet(10_000, SHIFT)), "small jitter isn't a restart");
+        assert!(restarted(&mut last, &packet(0, SHIFT)), "timestamps from zero again");
+    }
 }

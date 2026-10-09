@@ -20,7 +20,7 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 
 ## Commands
 `npm install`, `npm test`, `npm run typecheck`, `npm run build`, `npm run dev:site`
-Daemon: `cargo test --release` in `apps/daemon` (includes chaos tests, ~3 min); `.\dev.ps1 test` adds the camera/audio and streaming tests (needs GStreamer, and MediaMTX in `apps/daemon/.tools/`; see the daemon README); `cargo fmt` and `cargo clippy` must be clean
+Daemon (in `apps/daemon`): `.\dev.ps1 fast` (unit + chaos tests without video, engine killed 10 times, no GStreamer); `.\dev.ps1 slow` (video and streaming tests) before PRs touching video, stream, bandwidth, HLS or tiers; `.\dev.ps1 test` runs everything with the full 100 kills and the camera/audio and streaming tests (needs GStreamer, and MediaMTX in `apps/daemon/.tools/`; see the daemon README); `cargo fmt` and `cargo clippy` must be clean
 
 ## Brand
 Navy #10224F, Paper #F4F1EA, Jivvy blue #2E6BFF, On-air orange #FF7A1A (small accents only, never large areas).

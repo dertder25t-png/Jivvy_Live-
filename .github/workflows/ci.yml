@@ -3,6 +3,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly, so the slow tier (video and streaming) runs even on quiet days.
+  schedule:
+    - cron: "0 7 * * *"
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -60,4 +63,7 @@ jobs:
       - run: cargo clippy --release --all-targets ${{ matrix.features }} -- -D warnings
       # Includes the chaos tests: engine kills, hangs and corruption, output windows run
       # headless, and (with video) camera/audio on GStreamer test sources.
+      # Full strength: the engine is killed 100 times (the default in CI; set explicitly here).
       - run: cargo test --release ${{ matrix.features }}
+        env:
+          JIVVY_CHAOS_ITERATIONS: 100

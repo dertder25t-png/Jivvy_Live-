@@ -43,3 +43,7 @@ wry = "0.57"
 
 [dev-dependencies]
 socket2 = "0.6"
+
+# The chaos tests put themselves in a job object so a killed test run can't leave daemons behind.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

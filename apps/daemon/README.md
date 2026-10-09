@@ -139,6 +139,8 @@ cargo test --release      # unit tests + chaos tests without camera/audio
 
 The kill test kills the engine `JIVVY_CHAOS_ITERATIONS` times: 10 by default locally, 100 in CI (GitHub sets `CI`), in `.\dev.ps1 test` and before releases. Use the fast tier while iterating. A fast pass never covers video: run `.\dev.ps1 slow` before any PR that touches video, stream, bandwidth, HLS or tiers code (CI runs it on every PR and nightly either way).
 
+Each chaos test works in `%TEMP%\jivvy-chaos-<test>-<pid>`: deleted when the test passes, kept (path printed) when it fails, with the daemon's log in `daemon.log`. Test ports come from 20000-32767, below the ephemeral range, and a daemon or MediaMTX whose port is taken is started again on another. On Windows the test process puts itself in a job object, so killing it outright (an IDE's stop button, Task Manager) also ends every daemon and MediaMTX it started.
+
 CI runs the video tests on Linux; the Windows CI job builds without the `video` feature until GStreamer is installed there.
 
 The streaming tests need [MediaMTX](https://github.com/bluenviron/mediamtx) as a local RTMP server, in `apps/daemon/.tools/mediamtx/` (git-ignored) or at `$JIVVY_MEDIAMTX`. To get the same release CI uses (checksum checked):

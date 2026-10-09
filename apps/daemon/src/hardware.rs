@@ -82,15 +82,44 @@ fn is_real_adapter(name: &str) -> bool {
     !(n.contains("virtual display") || n.contains("remote display"))
 }
 
-/// Everything that could change which setting keeps up: the OS and architecture, the number of
-/// processor cores, GStreamer's version (its plugins and encoders), and the graphics adapters
-/// with their driver versions, in any order. Equal fingerprints mean the old measurement still
-/// applies; a different one means measure again.
-pub fn fingerprint(os: &str, arch: &str, cpus: usize, gstreamer: &str, adapters: &[String]) -> String {
-    let mut adapters: Vec<&str> =
-        adapters.iter().map(|a| a.trim()).filter(|a| !a.is_empty() && is_real_adapter(a)).collect();
-    adapters.sort_unstable();
-    format!("{os}/{arch}; {cpus} cores; {gstreamer}; graphics: {}", adapters.join(" | "))
+/// What the fingerprint is made of.
+#[derive(Debug, Clone, Copy)]
+pub struct Machine<'a> {
+    pub os: &'a str,
+    pub arch: &'a str,
+    /// The processor model, e.g. "Intel(R) Core(TM) i5-8250U"; empty if unknown.
+    pub cpu: &'a str,
+    pub cores: usize,
+    /// GStreamer's core version.
+    pub gstreamer: &'a str,
+    /// `element=plugin version` (or `element=missing`) for each element the check measures with.
+    pub plugins: &'a [String],
+    /// Graphics adapters with their driver versions.
+    pub adapters: &'a [String],
+}
+
+/// Everything that could change which setting keeps up: the OS and architecture, the processor
+/// model and core count, GStreamer's version and the version of each plugin the check measures
+/// with (installing, removing or updating one changes what can run without changing GStreamer's
+/// core), and the graphics adapters with their driver versions. Lists are compared in any
+/// order. Equal fingerprints mean the old measurement still applies; a different one means
+/// measure again.
+pub fn fingerprint(m: &Machine) -> String {
+    let sorted = |items: &[String], keep: fn(&str) -> bool| {
+        let mut v: Vec<&str> = items.iter().map(|a| a.trim()).filter(|a| !a.is_empty() && keep(a)).collect();
+        v.sort_unstable();
+        v.join(" | ")
+    };
+    format!(
+        "{}/{}; {} ({} cores); {}; plugins: {}; graphics: {}",
+        m.os,
+        m.arch,
+        m.cpu.trim(),
+        m.cores,
+        m.gstreamer,
+        sorted(m.plugins, |_| true),
+        sorted(m.adapters, is_real_adapter)
+    )
 }
 
 /// Whether the saved report no longer fits this machine (or predates fingerprints).
@@ -320,57 +349,81 @@ mod tests {
 
     #[test]
     fn a_new_driver_card_or_computer_means_measure_again() {
-        let gpus = |g: &[&str]| g.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let base = fingerprint(
-            "windows",
-            "x86_64",
-            4,
-            "1.28.6",
-            &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]),
-        );
-        // A virtual display (Parsec, Remote Desktop) appearing isn't a hardware change.
-        let with_virtual = fingerprint(
-            "windows",
-            "x86_64",
-            4,
-            "1.28.6",
-            &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045", "Parsec Virtual Display Adapter 0.45.0.0"]),
-        );
-        assert_eq!(base, with_virtual);
-        // The same machine, the adapters listed the other way round and with stray spaces.
-        let same = fingerprint(
-            "windows",
-            "x86_64",
-            4,
-            "1.28.6",
-            &gpus(&[" AMD RX 6700 XT 32.0.21045", "Intel UHD 32.0.101.8860 ", ""]),
-        );
-        assert_eq!(base, same);
-        for changed in [
-            fingerprint(
-                "windows",
-                "x86_64",
-                4,
-                "1.28.6",
-                &gpus(&["Intel UHD 32.0.101.9999", "AMD RX 6700 XT 32.0.21045"]),
-            ),
-            fingerprint("windows", "x86_64", 4, "1.28.6", &gpus(&["Intel UHD 32.0.101.8860"])),
-            fingerprint(
-                "windows",
-                "x86_64",
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let plugins = v(&["x264enc=1.28.6", "mfh264enc=1.28.6", "d3d12upload=1.28.6"]);
+        let adapters = v(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]);
+        let machine =
+            |cpu: &'static str, cores, gst: &'static str, plugins: &'static [String], adapters: &'static [String]| {
+                fingerprint(&Machine { os: "windows", arch: "x86_64", cpu, cores, gstreamer: gst, plugins, adapters })
+            };
+        let (plugins, adapters): (&'static [String], &'static [String]) =
+            (Box::leak(plugins.into_boxed_slice()), Box::leak(adapters.into_boxed_slice()));
+        let base = machine("Intel(R) Core(TM) i5-8250U", 8, "1.28.6", plugins, adapters);
+
+        // The same machine: lists in another order, stray spaces, a virtual display (Parsec,
+        // Remote Desktop) appearing or not: none of that is a hardware change.
+        let reordered = v(&["d3d12upload=1.28.6", "x264enc=1.28.6 ", "mfh264enc=1.28.6"]);
+        let adapters2 = v(&[
+            " AMD RX 6700 XT 32.0.21045",
+            "Parsec Virtual Display Adapter 0.45.0.0",
+            "Intel UHD 32.0.101.8860 ",
+            "",
+        ]);
+        assert_eq!(
+            base,
+            machine(
+                "Intel(R) Core(TM) i5-8250U ",
                 8,
                 "1.28.6",
-                &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]),
+                Box::leak(reordered.into_boxed_slice()),
+                Box::leak(adapters2.into_boxed_slice())
+            )
+        );
+
+        let leak = |items: &[&str]| -> &'static [String] { Box::leak(v(items).into_boxed_slice()) };
+        for (what, changed) in [
+            (
+                "another processor with the same core count",
+                machine("Intel(R) Core(TM) i3-7100U", 8, "1.28.6", plugins, adapters),
             ),
-            fingerprint(
-                "windows",
-                "x86_64",
-                4,
-                "1.29.0",
-                &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]),
+            ("a different number of cores", machine("Intel(R) Core(TM) i5-8250U", 4, "1.28.6", plugins, adapters)),
+            ("GStreamer updated", machine("Intel(R) Core(TM) i5-8250U", 8, "1.29.0", plugins, adapters)),
+            (
+                "a plugin updated on its own",
+                machine(
+                    "Intel(R) Core(TM) i5-8250U",
+                    8,
+                    "1.28.6",
+                    leak(&["x264enc=1.28.7", "mfh264enc=1.28.6", "d3d12upload=1.28.6"]),
+                    adapters,
+                ),
+            ),
+            (
+                "a plugin removed",
+                machine(
+                    "Intel(R) Core(TM) i5-8250U",
+                    8,
+                    "1.28.6",
+                    leak(&["x264enc=1.28.6", "mfh264enc=missing", "d3d12upload=1.28.6"]),
+                    adapters,
+                ),
+            ),
+            (
+                "a graphics driver updated",
+                machine(
+                    "Intel(R) Core(TM) i5-8250U",
+                    8,
+                    "1.28.6",
+                    plugins,
+                    leak(&["Intel UHD 32.0.101.9999", "AMD RX 6700 XT 32.0.21045"]),
+                ),
+            ),
+            (
+                "a graphics card removed",
+                machine("Intel(R) Core(TM) i5-8250U", 8, "1.28.6", plugins, leak(&["Intel UHD 32.0.101.8860"])),
             ),
         ] {
-            assert_ne!(base, changed);
+            assert_ne!(base, changed, "{what} must count as a change");
         }
         let mut r = Report {
             version: REPORT_VERSION,

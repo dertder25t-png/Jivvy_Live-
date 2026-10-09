@@ -32,42 +32,94 @@ struct Seen {
     count: u64,
 }
 
-/// The graphics adapters and their driver versions, one line each; empty if they can't be listed
-/// (then the fingerprint just doesn't notice a driver change, and the rest still applies).
-fn adapters() -> Vec<String> {
+/// What this computer is: the processor model and the graphics adapters with their driver
+/// versions. Either may be empty if it can't be read (then the fingerprint just doesn't notice
+/// that part changing, and the rest still applies).
+struct Machine {
+    cpu: String,
+    adapters: Vec<String>,
+}
+
+fn machine() -> Machine {
     #[cfg(windows)]
-    let lines = tool_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + ' ' + $_.DriverVersion }",
-        ],
-    );
+    {
+        // One PowerShell start-up for both: it's the slow part.
+        let lines = tool_output(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "'CPU ' + (Get-CimInstance Win32_Processor | Select-Object -First 1).Name;                  Get-CimInstance Win32_VideoController | ForEach-Object { 'GPU ' + $_.Name + ' ' + $_.DriverVersion }",
+            ],
+        );
+        let tagged = |tag: &str| -> Vec<String> {
+            lines.iter().filter_map(|l| l.trim().strip_prefix(tag).map(str::to_string)).collect()
+        };
+        Machine { cpu: tagged("CPU ").into_iter().next().unwrap_or_default(), adapters: tagged("GPU ") }
+    }
     #[cfg(target_os = "macos")]
-    let lines = tool_output("system_profiler", &["SPDisplaysDataType"])
-        .into_iter()
-        .filter(|l| l.trim_start().starts_with("Chipset Model:") || l.trim_start().starts_with("Metal"))
-        .collect();
+    {
+        let cpu = tool_output("sysctl", &["-n", "machdep.cpu.brand_string"]).into_iter().next().unwrap_or_default();
+        let adapters = tool_output("system_profiler", &["SPDisplaysDataType"])
+            .into_iter()
+            .filter(|l| l.trim_start().starts_with("Chipset Model:") || l.trim_start().starts_with("Metal"))
+            .collect();
+        Machine { cpu, adapters }
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
-    let lines = {
-        let mut lines = Vec::new();
+    {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let cpu = ["model name", "Model", "Hardware"]
+            .iter()
+            .find_map(|key| {
+                cpuinfo.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    (k.trim() == *key).then(|| v.trim().to_string())
+                })
+            })
+            .unwrap_or_default();
+        let mut adapters = Vec::new();
         if let Ok(cards) = std::fs::read_dir("/sys/class/drm") {
             for card in cards.flatten() {
                 let dir = card.path().join("device");
                 let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default().trim().to_string();
                 let (vendor, device) = (read("vendor"), read("device"));
                 if !vendor.is_empty() {
-                    lines.push(format!("{} {vendor}:{device}", card.file_name().to_string_lossy()));
+                    adapters.push(format!("{} {vendor}:{device}", card.file_name().to_string_lossy()));
                 }
             }
         }
         // The graphics driver ships with the kernel.
-        lines.push(std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
-        lines
-    };
-    lines
+        adapters.push(std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default());
+        Machine { cpu, adapters }
+    }
+}
+
+/// The GStreamer elements the check measures with, and the version of the plugin each comes
+/// from (or `missing`): installing, removing or updating one of these changes what can run and
+/// how fast, without changing GStreamer's core version.
+fn plugins() -> Vec<String> {
+    let mut elements = vec![
+        "overlaycomposition",
+        "videoconvert",
+        "d3d12upload",
+        "d3d12overlaycompositor",
+        "d3d12download",
+        EncoderChoice::Mf.element(),
+        EncoderChoice::X264.element(),
+    ];
+    elements.dedup();
+    elements
+        .into_iter()
+        .map(|name| {
+            let version = gst::ElementFactory::find(name)
+                .and_then(|f| f.plugin())
+                .map(|p| p.version().to_string())
+                .unwrap_or_else(|| "missing".into());
+            format!("{name}={version}")
+        })
+        .collect()
 }
 
 /// Runs a tool and returns its output lines; nothing if it can't run or takes over 10 s.
@@ -102,13 +154,16 @@ fn tool_output(program: &str, args: &[&str]) -> Vec<String> {
 
 /// What could change the answer on this machine right now (`hardware::fingerprint`).
 pub fn fingerprint_now() -> String {
-    hardware::fingerprint(
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-        &gst::version_string(),
-        &adapters(),
-    )
+    let m = machine();
+    hardware::fingerprint(&hardware::Machine {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        cpu: &m.cpu,
+        cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        gstreamer: &gst::version_string(),
+        plugins: &plugins(),
+        adapters: &m.adapters,
+    })
 }
 
 fn has(element: &str) -> bool {

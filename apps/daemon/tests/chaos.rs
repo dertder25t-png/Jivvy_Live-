@@ -540,6 +540,11 @@ fn jivvy_ctl_drives_a_running_daemon_in_one_line() {
     assert_eq!(state(&["black"])["black"], true);
     assert_eq!(state(&["black", "off"])["black"], false);
     assert_eq!(state(&["state"])["slideIndex"], 7);
+    // `localhost` usually resolves to IPv6 first while the daemon listens on IPv4 only.
+    let port = d.addr.rsplit(':').next().unwrap();
+    let (code, out, err) = ctl(&["--connect", &format!("localhost:{port}"), "state"]);
+    assert_eq!(code, 0, "every address of a name is tried: {err}");
+    assert!(out.contains("\"slideIndex\":7"), "{out}");
 
     let (code, out, err) = ctl(&[&at[..], &["goto", "99"]].concat());
     assert_eq!(code, 1, "a refused command exits 1: {out}");

@@ -2,7 +2,7 @@
 //! Built only with the `video` feature (it needs GStreamer installed).
 //!
 //! jivvy-video [--data-dir DIR] [--connect ADDR] [--supervised] [--test-sources]
-//! jivvy-video --hardware-check [--data-dir DIR]
+//! jivvy-video --hardware-check [--if-changed] [--data-dir DIR]
 //!
 //! `--test-sources` (or `JIVVY_TEST_SOURCES=1`) uses a test pattern and tone for every
 //! camera and microphone, whatever `media.json` names: no devices needed.
@@ -10,6 +10,8 @@
 //! `--hardware-check` measures each picture path and encoder on this machine, writes
 //! `hardware.json` with the setting to use and why (see `hwcheck.rs`), prints it and exits:
 //! 0 when a setting keeps up, 1 when nothing does, 2 when the report can't be saved.
+//! `--if-changed` measures only when there's no report or the machine differs from the one
+//! it was made on (a new graphics card or driver, another computer); otherwise it exits 0.
 //!
 //! Camera and microphone run as separate pipelines, so one device failing never stops the
 //! other. A device that is unplugged or fails is retried every second and picked up again
@@ -53,6 +55,8 @@ struct Args {
     supervised: bool,
     test_sources: bool,
     hardware_check: bool,
+    /// With `--hardware-check`: only measure if there's no report or it no longer fits this machine.
+    if_changed: bool,
     /// Test hook `JIVVY_TEST_ENCODER=x264|mf`: the encoder to use, whatever `media.json` says.
     /// CI's Windows runners have no GPU, where Media Foundation is a software encoder too slow
     /// for 1080p30.
@@ -74,6 +78,7 @@ fn parse_args() -> Args {
         supervised: false,
         test_sources: media::test_sources_from_env(),
         hardware_check: false,
+        if_changed: false,
         test_encoder: test_encoder_from_env(),
     };
     let mut it = std::env::args().skip(1);
@@ -85,6 +90,7 @@ fn parse_args() -> Args {
             "--supervised" => a.supervised = true,
             "--test-sources" => a.test_sources = true,
             "--hardware-check" => a.hardware_check = true,
+            "--if-changed" => a.if_changed = true,
             other => fail(&format!("unknown flag {other}")),
         }
     }
@@ -507,6 +513,13 @@ fn main() {
         exit_when_orphaned("video");
     }
     if args.hardware_check {
+        if args.if_changed
+            && let Some(report) = hardware::load(&args.data_dir)
+            && !hardware::needs_recheck(&report, &hwcheck::fingerprint_now())
+        {
+            log("video", "hardware check: this machine is unchanged since the last one; keeping its report");
+            std::process::exit(0);
+        }
         let font = jivvy_daemon::lyrics::load_font(None).unwrap_or_else(|e| fail(&format!("lyric layer: {e}")));
         let (report, saved) = hwcheck::run(&args.data_dir, args.test_encoder, &font);
         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());

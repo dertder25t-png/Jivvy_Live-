@@ -69,6 +69,33 @@ pub struct Report {
     pub chosen: Option<Chosen>,
     /// The choice in plain words, for the tech lead.
     pub reason: String,
+    /// What could change the answer (see `fingerprint`), so a new graphics card or driver, or a
+    /// different computer, is noticed. Empty in reports written before it existed.
+    #[serde(default)]
+    pub fingerprint: String,
+}
+
+/// Virtual and remote display adapters (Parsec, Remote Desktop) come and go without any change
+/// to the graphics hardware, so they're left out of the fingerprint.
+fn is_real_adapter(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !(n.contains("virtual display") || n.contains("remote display"))
+}
+
+/// Everything that could change which setting keeps up: the OS and architecture, the number of
+/// processor cores, GStreamer's version (its plugins and encoders), and the graphics adapters
+/// with their driver versions, in any order. Equal fingerprints mean the old measurement still
+/// applies; a different one means measure again.
+pub fn fingerprint(os: &str, arch: &str, cpus: usize, gstreamer: &str, adapters: &[String]) -> String {
+    let mut adapters: Vec<&str> =
+        adapters.iter().map(|a| a.trim()).filter(|a| !a.is_empty() && is_real_adapter(a)).collect();
+    adapters.sort_unstable();
+    format!("{os}/{arch}; {cpus} cores; {gstreamer}; graphics: {}", adapters.join(" | "))
+}
+
+/// Whether the saved report no longer fits this machine (or predates fingerprints).
+pub fn needs_recheck(report: &Report, current: &str) -> bool {
+    report.fingerprint != current
 }
 
 /// The settings to try at each quality, in order of preference: the graphics chip before the
@@ -292,6 +319,78 @@ mod tests {
     }
 
     #[test]
+    fn a_new_driver_card_or_computer_means_measure_again() {
+        let gpus = |g: &[&str]| g.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = fingerprint(
+            "windows",
+            "x86_64",
+            4,
+            "1.28.6",
+            &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]),
+        );
+        // A virtual display (Parsec, Remote Desktop) appearing isn't a hardware change.
+        let with_virtual = fingerprint(
+            "windows",
+            "x86_64",
+            4,
+            "1.28.6",
+            &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045", "Parsec Virtual Display Adapter 0.45.0.0"]),
+        );
+        assert_eq!(base, with_virtual);
+        // The same machine, the adapters listed the other way round and with stray spaces.
+        let same = fingerprint(
+            "windows",
+            "x86_64",
+            4,
+            "1.28.6",
+            &gpus(&[" AMD RX 6700 XT 32.0.21045", "Intel UHD 32.0.101.8860 ", ""]),
+        );
+        assert_eq!(base, same);
+        for changed in [
+            fingerprint(
+                "windows",
+                "x86_64",
+                4,
+                "1.28.6",
+                &gpus(&["Intel UHD 32.0.101.9999", "AMD RX 6700 XT 32.0.21045"]),
+            ),
+            fingerprint("windows", "x86_64", 4, "1.28.6", &gpus(&["Intel UHD 32.0.101.8860"])),
+            fingerprint(
+                "windows",
+                "x86_64",
+                8,
+                "1.28.6",
+                &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]),
+            ),
+            fingerprint(
+                "windows",
+                "x86_64",
+                4,
+                "1.29.0",
+                &gpus(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]),
+            ),
+        ] {
+            assert_ne!(base, changed);
+        }
+        let mut r = Report {
+            version: REPORT_VERSION,
+            checked_at_ms: 1,
+            os: "windows".into(),
+            cpus: 4,
+            trials: vec![],
+            chosen: None,
+            reason: String::new(),
+            fingerprint: base.clone(),
+        };
+        assert!(!needs_recheck(&r, &base));
+        assert!(needs_recheck(&r, "another machine"));
+        r.fingerprint.clear(); // a report from before fingerprints: measured once more, then it has one
+        assert!(needs_recheck(&r, &base));
+        let old = r#"{"version":1,"checkedAtMs":1,"os":"windows","cpus":4,"trials":[],"chosen":null,"reason":""}"#;
+        assert_eq!(serde_json::from_str::<Report>(old).unwrap().fingerprint, "");
+    }
+
+    #[test]
     fn the_report_round_trips_as_json() {
         let trials = vec![trial(Path::Cpu, X264, 0, Some(60.0))];
         let chosen = choose(&trials, &candidates(false, &[X264]));
@@ -303,6 +402,7 @@ mod tests {
             reason: reason(&trials, chosen),
             trials,
             chosen,
+            fingerprint: "test".into(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"capacityFps\":60.0") && json.contains("\"path\":\"cpu\""), "{json}");

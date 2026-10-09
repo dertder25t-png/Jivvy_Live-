@@ -269,6 +269,8 @@ fn spawn_watchdog(data_dir: &Path, addr: &str, args: &DaemonArgs) -> (Child, [Re
         .args(["--data-dir", data_dir.to_str().unwrap(), "--listen", addr, "--slides", &args.slides.to_string()])
         .arg(outputs_flag)
         .args(args.extra)
+        // A daemon given a report skips the check at start, which would hold video back.
+        .args((args.seed_hardware && args.extra.contains(&"--video")).then_some("--no-hardware-check"))
         .env("JIVVY_TEST_HOOKS", "1")
         .envs(args.envs.iter().copied())
         .stdout(Stdio::piped())
@@ -956,6 +958,42 @@ mod video {
             assert!(t["capacityFps"].as_f64().unwrap_or(0.0) < 1.5 * t["fps"].as_f64().unwrap(), "{t}");
         }
         assert!(report["reason"].as_str().unwrap().starts_with("Using "), "{}", report["reason"]);
+    }
+
+    #[test]
+    fn a_report_that_still_fits_is_kept_and_one_from_another_machine_is_measured_again() {
+        let (bytes, _) = shared_hardware_check();
+        let video_args = ["--video", env!("CARGO_BIN_EXE_jivvy-video")];
+        let media = r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#;
+        let args =
+            DaemonArgs { slides: 10, headless_outputs: false, extra: &video_args, envs: &[], seed_hardware: false };
+        let report = |d: &Daemon| -> Value {
+            serde_json::from_slice(&std::fs::read(d.data_dir.join("hardware.json")).unwrap()).unwrap()
+        };
+
+        // This machine, same as when the report was made: no new measurement.
+        let dir = test_dir("recheck-same");
+        std::fs::write(dir.join("media.json"), media).unwrap();
+        std::fs::write(dir.join("hardware.json"), bytes).unwrap();
+        let d = start_at(free_port(), dir, &args);
+        d.video_starts.recv_timeout(Duration::from_secs(60)).expect("video started");
+        assert_eq!(std::fs::read(d.data_dir.join("hardware.json")).unwrap(), *bytes, "the report is left alone");
+        let first_checked = report(&d)["checkedAtMs"].clone();
+        drop(d);
+
+        // The same report, but it says it was made on another machine (a different driver, say):
+        // measured again before video starts, and saved with this machine's fingerprint.
+        let mut other: Value = serde_json::from_slice(bytes).unwrap();
+        let this_machine = other["fingerprint"].clone();
+        other["fingerprint"] = json!("another machine");
+        let dir = test_dir("recheck-changed");
+        std::fs::write(dir.join("media.json"), media).unwrap();
+        std::fs::write(dir.join("hardware.json"), other.to_string()).unwrap();
+        let d = start_at(free_port(), dir, &args);
+        d.video_starts.recv_timeout(Duration::from_secs(300)).expect("video started after the new check");
+        let now = report(&d);
+        assert_eq!(now["fingerprint"], this_machine, "saved with this machine's fingerprint");
+        assert_ne!(now["checkedAtMs"], first_checked, "measured again");
     }
 
     #[test]

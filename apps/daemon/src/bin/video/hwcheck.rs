@@ -11,15 +11,18 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 
 use jivvy_daemon::hardware::{self, Path, QUALITIES, Report, Trial};
+use jivvy_daemon::lyrics;
 use jivvy_daemon::program::{EncoderChoice, ProgramConfig, encoder_order};
 use jivvy_daemon::{log, now_ms, write_atomic};
 
-use crate::program::encoder_description;
+use crate::program::{encoder_description, to_composition};
 
 /// Frames per trial: five seconds of video at the target rate.
 const SECONDS_PER_TRIAL: u32 = 5;
 /// A trial that hasn't finished by now has failed (a hung driver, say).
 const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A two-line lyric on every frame, as on Sunday, so the blending costs what it really does.
+const LYRICS: [&str; 2] = ["Amazing grace, how sweet the sound", "That saved a wretch like me"];
 
 /// Encoded frames seen at the end of a trial: the first and last arrival, and how many.
 #[derive(Default, Clone, Copy)]
@@ -33,10 +36,11 @@ fn has(element: &str) -> bool {
     gst::ElementFactory::find(element).is_some()
 }
 
-/// Runs the check and writes the report. The test hooks narrow what is tried, so a machine
-/// with a flaky GPU can still be checked safely: `JIVVY_TEST_NO_GPU=1` skips the graphics
-/// chip, `JIVVY_TEST_ENCODER` tries only that encoder.
-pub fn run(data_dir: &FsPath, only_encoder: Option<EncoderChoice>) -> Report {
+/// Runs the check and writes the report; the error says why the report couldn't be saved.
+/// The test hooks narrow what is tried, so a machine with a flaky GPU can still be checked
+/// safely: `JIVVY_TEST_NO_GPU=1` skips the graphics chip, `JIVVY_TEST_ENCODER` tries only that
+/// encoder.
+pub fn run(data_dir: &FsPath, only_encoder: Option<EncoderChoice>, font: &[u8]) -> (Report, Result<(), String>) {
     let no_gpu = std::env::var("JIVVY_TEST_NO_GPU").is_ok_and(|v| v.trim() == "1");
     let gpu = !no_gpu && has("d3d12upload") && has("d3d12overlaycompositor") && has("d3d12download");
     let mut encoders = encoder_order(EncoderChoice::Auto, has);
@@ -47,7 +51,7 @@ pub fn run(data_dir: &FsPath, only_encoder: Option<EncoderChoice>) -> Report {
     let mut trials = Vec::new();
     for &(width, height, fps) in &QUALITIES {
         for &(path, encoder) in &order {
-            let t = measure(path, encoder, width, height, fps);
+            let t = measure(path, encoder, width, height, fps, font);
             log(
                 "video",
                 format!(
@@ -72,21 +76,17 @@ pub fn run(data_dir: &FsPath, only_encoder: Option<EncoderChoice>) -> Report {
         trials,
         chosen,
     };
-    match serde_json::to_vec_pretty(&report) {
-        Ok(bytes) => {
-            if let Err(e) = write_atomic(&data_dir.join(hardware::REPORT_FILE), &bytes) {
-                log("video", format!("hardware check: can't write {}: {e}", hardware::REPORT_FILE));
-            }
-        }
-        Err(e) => log("video", format!("hardware check: {e}")),
-    }
     log("video", format!("hardware check: {}", report.reason));
-    report
+    let saved = serde_json::to_vec_pretty(&report)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| write_atomic(&data_dir.join(hardware::REPORT_FILE), &bytes).map_err(|e| e.to_string()))
+        .map_err(|e| format!("can't save {}: {e}", hardware::REPORT_FILE));
+    (report, saved)
 }
 
 /// Pushes a moving test picture through the path's conversion and lyric-layer blending and the
 /// encoder as fast as they go, and counts what comes out.
-fn measure(path: Path, encoder: EncoderChoice, width: u32, height: u32, fps: u32) -> Trial {
+fn measure(path: Path, encoder: EncoderChoice, width: u32, height: u32, fps: u32, font: &[u8]) -> Trial {
     let mut trial = Trial { path, encoder, width, height, fps, capacity_fps: None, detail: String::new() };
     // The bitrate the program would use at this size.
     let pixels = (width * height) as f64 / (1920.0 * 1080.0);
@@ -99,7 +99,11 @@ fn measure(path: Path, encoder: EncoderChoice, width: u32, height: u32, fps: u32
         encoder,
     };
     let gpu = path == Path::Gpu;
-    let overlay = if gpu { "d3d12upload ! overlaycomposition ! d3d12overlaycompositor" } else { "overlaycomposition" };
+    let overlay = if gpu {
+        "d3d12upload ! overlaycomposition name=lyrics ! d3d12overlaycompositor"
+    } else {
+        "overlaycomposition name=lyrics"
+    };
     let frames = fps * SECONDS_PER_TRIAL;
     let desc = format!(
         "videotestsrc num-buffers={frames} is-live=false pattern=ball \
@@ -118,6 +122,18 @@ fn measure(path: Path, encoder: EncoderChoice, width: u32, height: u32, fps: u32
             return trial;
         }
     };
+    // The lyric layer, drawn once and attached to every frame, as the program does.
+    let layer = ab_glyph::FontRef::try_from_slice(font)
+        .ok()
+        .and_then(|face| lyrics::render(&face, &LYRICS, width, height, &lyrics::Style::default()))
+        .and_then(to_composition);
+    let Some(layer) = layer else {
+        trial.detail = "couldn't draw the lyric layer".into();
+        return trial;
+    };
+    if let Some(el) = pipeline.by_name("lyrics") {
+        el.connect("draw", false, move |_| Some(Some(layer.clone()).to_value()));
+    }
     // First and last encoded frame, and how many: the rate excludes start-up (loading the
     // encoder, opening the GPU device).
     let seen: Arc<Mutex<Seen>> = Arc::default();

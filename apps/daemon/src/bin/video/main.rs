@@ -9,7 +9,7 @@
 //!
 //! `--hardware-check` measures each picture path and encoder on this machine, writes
 //! `hardware.json` with the setting to use and why (see `hwcheck.rs`), prints it and exits:
-//! 0 when a setting keeps up, 1 when nothing does.
+//! 0 when a setting keeps up, 1 when nothing does, 2 when the report can't be saved.
 //!
 //! Camera and microphone run as separate pipelines, so one device failing never stops the
 //! other. A device that is unplugged or fails is retried every second and picked up again
@@ -497,8 +497,12 @@ fn main() {
         fail(&format!("data dir {}: {e}", args.data_dir.display()));
     }
     if args.hardware_check {
-        let report = hwcheck::run(&args.data_dir, args.test_encoder);
+        let font = jivvy_daemon::lyrics::load_font(None).unwrap_or_else(|e| fail(&format!("lyric layer: {e}")));
+        let (report, saved) = hwcheck::run(&args.data_dir, args.test_encoder, &font);
         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        if let Err(e) = saved {
+            fail(&format!("hardware check: {e}")); // exits 2: the check isn't done until it's saved
+        }
         std::process::exit(if report.chosen.is_some() { 0 } else { 1 });
     }
     if args.supervised {

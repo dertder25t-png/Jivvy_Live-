@@ -128,6 +128,13 @@ cargo run --release --bin jivvy-watchdog -- --data-dir .\tmp --listen 127.0.0.1:
 $env:JIVVY_TEST_SOURCES = '1'; .\dev.ps1 run --release --features video --bin jivvy-watchdog   # no camera or microphone needed
 ```
 
+To try features by hand against a running daemon, `jivvy-ctl` sends one command and prints the engine's answer (the same newline-delimited JSON as every client, on 127.0.0.1:47800 or `--connect ADDR`):
+
+```powershell
+.\dev.ps1 ctl next          # also: back, goto 3, black, black off, state, watch, stream start, stream stop
+.\dev.ps1 ctl state
+```
+
 `--test-sources` on `jivvy-watchdog` (or `JIVVY_TEST_SOURCES=1`) runs the whole daemon on a GStreamer test pattern and tone for every camera and microphone, whatever `media.json` names, so any machine can run it without a camera, capture card or microphone. An input set to `none` stays off.
 
 ## Test

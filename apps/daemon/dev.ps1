@@ -4,6 +4,7 @@
 #                          debug build, kill test at JIVVY_CHAOS_ITERATIONS (default 10). No GStreamer.
 #   .\dev.ps1 slow      -> SLOW tier: jivvy-video unit tests and the video and streaming chaos tests
 #                          (release, --features video)
+#   .\dev.ps1 ctl next  -> jivvy-ctl: one-line commands to a running daemon (next, back, black, state, ...)
 #   .\dev.ps1 build     -> cargo build --release --features video
 #   .\dev.ps1 test      -> FULL: cargo test --release --features video, engine killed 100 times
 #   .\dev.ps1 <args>    -> cargo <args> with GStreamer's paths set
@@ -48,6 +49,7 @@ try {
       Show-Tier 'SLOW' "finished, exit $code" $null
       exit $code
     }
+    'ctl' { cargo run -q --bin jivvy-ctl -- @($Rest | Select-Object -Skip 1) }
     'build' { Use-GStreamer; cargo build --release --features video }
     'test' {
       Use-GStreamer

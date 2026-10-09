@@ -20,6 +20,11 @@ path = "src/bin/engine.rs"
 name = "jivvy-outputs"
 path = "src/bin/outputs.rs"
 
+# One-line commands to a running daemon: jivvy-ctl next, jivvy-ctl state, ...
+[[bin]]
+name = "jivvy-ctl"
+path = "src/bin/ctl.rs"
+
 # Camera and audio input. Needs GStreamer installed, so it is opt-in: --features video.
 [[bin]]
 name = "jivvy-video"

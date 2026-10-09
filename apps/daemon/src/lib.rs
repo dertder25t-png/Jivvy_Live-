@@ -10,6 +10,7 @@
 
 pub mod bandwidth;
 pub mod client;
+pub mod ctl;
 pub mod engine;
 pub mod hls;
 pub mod lyrics;

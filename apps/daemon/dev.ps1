@@ -3,7 +3,7 @@
 #   .\dev.ps1 check     -> before pushing: cargo fmt, clippy, FAST tier, npm run typecheck, npm test.
 #                          Says at the end what it did not cover. No GStreamer needed.
 #   .\dev.ps1 test-full -> everything, once per PR: fmt, clippy and all tests with video, engine
-#                          killed 100 times, plus npm typecheck and tests (GStreamer + MediaMTX)
+#                          killed 100 times, plus npm typecheck, tests and build (GStreamer + MediaMTX)
 #   .\dev.ps1 fast      -> FAST tier: unit tests (lib + bins, not jivvy-video) and the chaos tests without video,
 #                          debug build, kill test at JIVVY_CHAOS_ITERATIONS (default 10). No GStreamer.
 #   .\dev.ps1 slow      -> SLOW tier: jivvy-video unit tests and the video and streaming chaos tests
@@ -62,11 +62,19 @@ function Invoke-Npm($script) {
   try { npm run $script } finally { Pop-Location }
 }
 
+# Environment changes made here are undone on exit, so they never leak into the caller's shell.
+$Saved = @{}
+foreach ($name in 'JIVVY_CHAOS_ITERATIONS', 'PATH', 'PKG_CONFIG', 'PKG_CONFIG_PATH') {
+  $Saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
+
 Push-Location $PSScriptRoot
 try {
   switch ($Rest[0]) {
     'check' {
-      $kills = if ($env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS } else { '10' }
+      # Set it, not just show it: with CI set, the tests would otherwise default to 100.
+      if (-not $env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS = '10' }
+      $kills = $env:JIVVY_CHAOS_ITERATIONS
       $code = Invoke-Steps 'CHECK (fast tier)' @(
         (Step 'cargo fmt --check' { cargo fmt --check }),
         (Step 'cargo clippy (no video)' { cargo clippy --all-targets -q -- -D warnings }),
@@ -86,12 +94,15 @@ try {
         (Step 'cargo clippy (with video)' { cargo clippy --release --all-targets --features video -q -- -D warnings }),
         (Step "all Rust tests with video, release, engine killed $kills times" { cargo test --release --features video }),
         (Step 'npm run typecheck' { Invoke-Npm typecheck }),
-        (Step 'npm test' { Invoke-Npm test })
+        (Step 'npm test' { Invoke-Npm test }),
+        (Step 'npm run build' { Invoke-Npm build })
       ) $skips
       exit $code
     }
     'fast' {
-      $kills = if ($env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS } else { '10' }
+      # Set it, not just show it: with CI set, the tests would otherwise default to 100.
+      if (-not $env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS = '10' }
+      $kills = $env:JIVVY_CHAOS_ITERATIONS
       Show-Tier 'FAST' "unit tests (lib + bins, not jivvy-video) and chaos tests without video, engine killed $kills times" 'video and streaming tests, jivvy-video unit tests (run .\dev.ps1 slow)'
       cargo test @($Rest | Select-Object -Skip 1)
       $code = $LASTEXITCODE
@@ -124,4 +135,7 @@ try {
     default { Use-GStreamer; cargo @Rest }
   }
   exit $LASTEXITCODE
-} finally { Pop-Location }
+} finally {
+  Pop-Location
+  foreach ($name in $Saved.Keys) { [Environment]::SetEnvironmentVariable($name, $Saved[$name], 'Process') }
+}

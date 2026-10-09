@@ -288,6 +288,120 @@ fn read_commands(stream: TcpStream, engine: &Mutex<Engine>, outbox: &Outbox) -> 
     }
 }
 
+/// How long a WebSocket connection waits for a message before checking its outbox again:
+/// the most an event for a WebSocket device can wait behind a quiet socket.
+const WS_POLL: Duration = Duration::from_millis(15);
+/// A client that hasn't finished the WebSocket handshake by now is dropped.
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Who may open the WebSocket command channel. Programs (no `Origin` header) always may.
+/// Browsers send their page's origin, and only listed origins are accepted, so a web page
+/// open on a booth computer can't drive the service.
+#[derive(Debug, Clone, Default)]
+pub struct WsAccess {
+    pub origins: Vec<String>,
+}
+
+impl WsAccess {
+    pub fn allows(&self, origin: Option<&str>) -> bool {
+        origin.is_none_or(|o| self.origins.iter().any(|a| a.eq_ignore_ascii_case(o)))
+    }
+}
+
+/// Serves the same protocol over WebSocket: one envelope per text message in, and the same
+/// acks and events out, one per text message (the TCP channel's lines, without the newline).
+pub fn serve_ws(listener: TcpListener, engine: Arc<Mutex<Engine>>, access: Arc<WsAccess>) {
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        let (engine, access) = (engine.clone(), access.clone());
+        std::thread::spawn(move || {
+            let _ = serve_ws_connection(stream, &engine, &access);
+        });
+    }
+}
+
+fn serve_ws_connection(stream: TcpStream, engine: &Mutex<Engine>, access: &WsAccess) -> std::io::Result<()> {
+    use tungstenite::{Error, Message, handshake::server::ErrorResponse, http::StatusCode};
+
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(WS_HANDSHAKE_TIMEOUT))?;
+    let shared = Arc::new(stream.try_clone()?);
+    // The error type is tungstenite's handshake `Callback` contract, so it can't be boxed.
+    #[allow(clippy::result_large_err)]
+    let check_origin = |req: &tungstenite::handshake::server::Request, resp| {
+        let origin = req.headers().get("origin").map(|o| o.to_str().unwrap_or("?"));
+        if access.allows(origin) {
+            return Ok(resp);
+        }
+        crate::log("engine", format!("refused a WebSocket from origin {}", origin.unwrap_or("")));
+        let mut no = ErrorResponse::new(Some("this origin may not control the service".into()));
+        *no.status_mut() = StatusCode::FORBIDDEN;
+        Err(no)
+    };
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_LINE))
+        .max_frame_size(Some(MAX_LINE));
+    let Ok(mut ws) = tungstenite::accept_hdr_with_config(stream, check_origin, Some(config)) else {
+        return Ok(());
+    };
+    ws.get_ref().set_read_timeout(Some(WS_POLL))?;
+
+    let (tx, rx) = sync_channel::<Vec<u8>>(OUTBOX_CAPACITY);
+    let outbox = Outbox::new(tx, Some(shared.clone()));
+    let as_message = |mut bytes: Vec<u8>| {
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        Message::text(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let result = loop {
+        let ack = match ws.read() {
+            Ok(Message::Text(text)) if text.trim().is_empty() => None,
+            Ok(Message::Text(text)) => {
+                // A panic in one handler must not poison the engine for every other device.
+                let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
+                Some(e.handle_line_from(text.trim(), Some(&outbox)))
+            }
+            Ok(Message::Binary(_)) => Some(protocol::nack("", ErrorCode::BadMessage, "send JSON as text messages")),
+            // tungstenite has queued the close reply; the flush below sends it, and the next
+            // read reports the connection closed, so the client sees a clean close.
+            Ok(Message::Close(_)) => None,
+            Ok(_) => None, // ping, pong: tungstenite answers pings itself
+            Err(Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                None
+            }
+            Err(Error::Capacity(_)) => {
+                let _ = ws.send(as_message(serde_json::to_vec(&protocol::nack(
+                    "",
+                    ErrorCode::BadMessage,
+                    "message too long",
+                ))?));
+                break Ok(());
+            }
+            Err(_) => break Ok(()),
+        };
+        // Events first, then the ack: the same order the TCP channel writes them in.
+        let mut sent = Ok(());
+        while let Ok(event) = rx.try_recv() {
+            sent = sent.and_then(|_| ws.write(as_message(event)));
+        }
+        if let Some(ack) = ack {
+            let bytes = serde_json::to_vec(&ack)?;
+            sent = sent.and_then(|_| ws.write(as_message(bytes)));
+        }
+        // Flush even if a write failed (e.g. an event after the client closed), so a queued
+        // close reply still goes out.
+        let flushed = ws.flush();
+        match sent.and(flushed) {
+            Ok(()) => {}
+            Err(Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break Ok(()),
+        }
+    };
+    let _ = shared.shutdown(Shutdown::Both);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +646,119 @@ mod tests {
         assert_eq!(lines[0]["state"]["slideIndex"], json!(1));
         assert_eq!(lines[1]["message"], json!("message too long"));
         assert_eq!((lines[2]["id"].clone(), lines[2]["state"]["slideIndex"].clone()), (json!("b"), json!(1)));
+    }
+
+    type Ws = tungstenite::WebSocket<TcpStream>;
+
+    /// One engine on both channels: (TCP address, WebSocket address).
+    fn serve_both(name: &str, origins: &[&str]) -> (std::net::SocketAddr, std::net::SocketAddr) {
+        let (e, _) = engine(name, 10);
+        let engine = Arc::new(Mutex::new(e));
+        let tcp = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let ws = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let addrs = (tcp.local_addr().unwrap(), ws.local_addr().unwrap());
+        let access = Arc::new(WsAccess { origins: origins.iter().map(|o| o.to_string()).collect() });
+        let e2 = engine.clone();
+        std::thread::spawn(move || serve(tcp, e2));
+        std::thread::spawn(move || serve_ws(ws, engine, access));
+        addrs
+    }
+
+    fn ws_connect(addr: std::net::SocketAddr, origin: Option<&str>) -> Result<Ws, tungstenite::Error> {
+        use tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/").into_client_request().unwrap();
+        if let Some(o) = origin {
+            req.headers_mut().insert("origin", o.parse().unwrap());
+        }
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        match tungstenite::client(req, stream) {
+            Ok((ws, _)) => Ok(ws),
+            Err(tungstenite::HandshakeError::Failure(e)) => Err(e),
+            Err(e) => panic!("handshake: {e}"),
+        }
+    }
+
+    fn ws_send(ws: &mut Ws, text: &str) {
+        ws.send(tungstenite::Message::text(text.to_string())).unwrap();
+    }
+
+    fn ws_next(ws: &mut Ws) -> Value {
+        loop {
+            match ws.read().unwrap() {
+                tungstenite::Message::Text(t) => return serde_json::from_str(&t).unwrap(),
+                _ => continue,
+            }
+        }
+    }
+
+    fn tcp_ask(addr: std::net::SocketAddr, line: &str) -> Value {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let mut l = String::new();
+        BufReader::new(s).read_line(&mut l).unwrap();
+        serde_json::from_str(&l).unwrap()
+    }
+
+    #[test]
+    fn websocket_carries_the_same_envelopes_acks_and_events_as_tcp() {
+        let (tcp, ws_addr) = serve_both("ws-same", &[]);
+        let mut ws = ws_connect(ws_addr, None).unwrap();
+        let goto = r#"{"v":1,"id":"g","ts":1,"command":{"type":"slide.goto","index":3}}"#;
+        ws_send(&mut ws, goto);
+        let ws_ack = ws_next(&mut ws);
+        let get = r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#;
+        assert_eq!(ws_ack, tcp_ask(tcp, get), "the same ack, byte for byte, on either channel");
+
+        // Subscribed over WebSocket, it hears a change made over TCP.
+        ws_send(&mut ws, r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#);
+        assert_eq!(ws_next(&mut ws)["id"], "s");
+        tcp_ask(tcp, r#"{"v":1,"id":"n","ts":1,"command":{"type":"slide.next"}}"#);
+        let event = ws_next(&mut ws);
+        assert_eq!((event["event"].clone(), event["state"]["slideIndex"].clone()), (json!("state"), json!(4)));
+
+        // A bad envelope is nacked the same way, and the connection stays up.
+        ws_send(&mut ws, "{not json");
+        assert_eq!(ws_next(&mut ws), tcp_ask(tcp, "{not json"));
+        ws.send(tungstenite::Message::binary(vec![1u8, 2, 3])).unwrap();
+        assert_eq!(ws_next(&mut ws)["code"], "bad_message");
+        ws_send(&mut ws, get);
+        assert_eq!(ws_next(&mut ws)["state"]["slideIndex"], 4);
+    }
+
+    #[test]
+    fn browsers_may_connect_only_from_listed_origins() {
+        let (_, ws_addr) = serve_both("ws-origin", &["https://app.jivvy.org"]);
+        assert!(ws_connect(ws_addr, None).is_ok(), "programs send no Origin");
+        assert!(ws_connect(ws_addr, Some("https://app.jivvy.org")).is_ok());
+        match ws_connect(ws_addr, Some("https://evil.example")) {
+            Err(tungstenite::Error::Http(r)) => assert_eq!(r.status(), 403),
+            other => panic!("an unlisted origin is refused, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn a_client_that_closes_gets_a_clean_close_back() {
+        let (_, ws_addr) = serve_both("ws-close", &[]);
+        let mut ws = ws_connect(ws_addr, None).unwrap();
+        ws_send(&mut ws, r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#);
+        assert_eq!(ws_next(&mut ws)["id"], "s");
+        ws.close(None).unwrap();
+        // The server's close reply ends it cleanly (ConnectionClosed), not a dropped socket.
+        let end = loop {
+            match ws.read() {
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(end, tungstenite::Error::ConnectionClosed), "closed uncleanly: {end}");
+    }
+
+    #[test]
+    fn an_oversized_websocket_message_is_refused() {
+        let (_, ws_addr) = serve_both("ws-big", &[]);
+        let mut ws = ws_connect(ws_addr, None).unwrap();
+        ws_send(&mut ws, &"x".repeat(MAX_LINE + 10));
+        assert_eq!(ws_next(&mut ws)["message"], "message too long");
     }
 }

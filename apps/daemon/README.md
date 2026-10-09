@@ -114,9 +114,11 @@ A destination whose address is `https://` uses YouTube's HLS ingestion instead o
 - **Status** (`media-status.json` → `stream`): each destination's `quality` and a plain-words `detail` ("Lowered to 480p: the internet upload is slow. It goes back up by itself." / "Paused: …"), the `uploadKbps` estimate, and the extra `encodes` running. Screens see `live` while every platform that isn't paused is live.
 - Next: Advanced mode (the church ranks platforms, sets a top quality per platform, and picks lower quality, audio only or pause when short), the pre-flight summary ("YouTube 1080p + Facebook 720p"), and alerts when a platform is lowered or paused.
 
-## Command channel (for now)
+## Command channel
 
-Newline-delimited JSON on `127.0.0.1:47800`, one protocol envelope per line and one ack per line. Every ok ack carries `state`. After `state.subscribe`, the connection also receives `state` events on every change and `levels` events for meters. The secure per-church WebSocket channel is a later Stage 1 item; the envelope and ack formats stay the same.
+Newline-delimited JSON on `127.0.0.1:47800`, one protocol envelope per line and one ack per line. Every ok ack carries `state`. After `state.subscribe`, the connection also receives `state` events on every change and `levels` events for meters.
+
+**WebSocket** (first step of the secure channel): `jivvy-engine --listen-ws ADDR` (or the same flag on `jivvy-watchdog`, which passes it on) also serves the protocol over WebSocket, off by default. One envelope per text message in; the same acks and events out, one per text message (the TCP lines without the newline); anything else gets the same nacks. The shared scenarios pass over both channels. Browsers send their page's origin, and only origins given with `--ws-origin ORIGIN` (repeatable) may connect, so a web page open on a booth computer can't drive the service; programs (no `Origin` header) always may. A busy WebSocket port is retried in the background and never stops the engine or its TCP channel. Still to come: TLS with a per-church certificate and hostname, and device pairing.
 
 `src/protocol.rs` is a port of `packages/protocol`, and both are tested against `packages/protocol/fixtures/parse-cases.json`, so they can't drift apart.
 

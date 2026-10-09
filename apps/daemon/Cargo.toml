@@ -43,6 +43,8 @@ gstreamer-video = { version = "0.25", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tao = "0.37"
+# The command channel over WebSocket (same envelopes as the TCP one); TLS comes with the certificate.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
 wry = "0.57"
 

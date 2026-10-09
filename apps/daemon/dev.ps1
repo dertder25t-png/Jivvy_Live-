@@ -1,14 +1,20 @@
 # Daemon dev commands. GStreamer's paths are set for this process only, and only for the
 # commands that need the `video` feature (jivvy-video). Usage: .\dev.ps1 <command>
+#   .\dev.ps1 check     -> before pushing: cargo fmt, clippy, FAST tier, npm run typecheck, npm test.
+#                          Says at the end what it did not cover. No GStreamer needed.
+#   .\dev.ps1 test-full -> everything, once per PR: fmt, clippy and all tests with video, engine
+#                          killed 100 times, plus npm typecheck, tests and build (GStreamer + MediaMTX)
 #   .\dev.ps1 fast      -> FAST tier: unit tests (lib + bins, not jivvy-video) and the chaos tests without video,
 #                          debug build, kill test at JIVVY_CHAOS_ITERATIONS (default 10). No GStreamer.
 #   .\dev.ps1 slow      -> SLOW tier: jivvy-video unit tests and the video and streaming chaos tests
 #                          (release, --features video)
 #   .\dev.ps1 ctl next  -> jivvy-ctl: one-line commands to a running daemon (next, back, black, state, ...)
 #   .\dev.ps1 build     -> cargo build --release --features video
-#   .\dev.ps1 test      -> FULL: cargo test --release --features video, engine killed 100 times
+#   .\dev.ps1 test      -> cargo test --release --features video, engine killed 100 times (Rust only)
 #   .\dev.ps1 <args>    -> cargo <args> with GStreamer's paths set
+# PowerShell drops a bare -- from a script's arguments: quote it, e.g. .\dev.ps1 fast '--' --nocapture
 $Rest = @($args)
+$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..\..')
 
 function Use-GStreamer {
   $gst = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
@@ -25,11 +31,78 @@ function Show-Tier($name, $covers, $skips) {
   if ($skips) { Write-Host "   NOT covered: $skips" -ForegroundColor Yellow }
 }
 
+# Runs named steps in order, stopping at the first failure, then prints each step's time and
+# result and what the run did not cover. Returns the exit code.
+function Invoke-Steps($title, $steps, $skips) {
+  $ran = @()
+  $code = 0
+  foreach ($s in $steps) {
+    Write-Host ""
+    Write-Host "-- $($s.Name)" -ForegroundColor Cyan
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & $s.Run | Out-Host
+    $code = $LASTEXITCODE
+    $result = if ($code -eq 0) { 'ok' } else { "FAILED (exit $code)" }
+    $ran += [pscustomobject]@{ Step = $s.Name; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Result = $result }
+    if ($code -ne 0) { break }
+  }
+  $total = ($ran | Measure-Object Seconds -Sum).Sum
+  $color = if ($code -eq 0) { 'Green' } else { 'Red' }
+  Write-Host ""
+  Write-Host "== $title $(if ($code -eq 0) { 'passed' } else { 'FAILED' }) in $total s" -ForegroundColor $color
+  $ran | Format-Table -AutoSize | Out-Host
+  if ($skips) { Write-Host "   NOT covered: $skips" -ForegroundColor Yellow }
+  return $code
+}
+
+function Step($name, [scriptblock]$run) { [pscustomobject]@{ Name = $name; Run = $run } }
+
+function Invoke-Npm($script) {
+  Push-Location $RepoRoot
+  try { npm run $script } finally { Pop-Location }
+}
+
+# Environment changes made here are undone on exit, so they never leak into the caller's shell.
+$Saved = @{}
+foreach ($name in 'JIVVY_CHAOS_ITERATIONS', 'PATH', 'PKG_CONFIG', 'PKG_CONFIG_PATH') {
+  $Saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
+
 Push-Location $PSScriptRoot
 try {
   switch ($Rest[0]) {
+    'check' {
+      # Set it, not just show it: with CI set, the tests would otherwise default to 100.
+      if (-not $env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS = '10' }
+      $kills = $env:JIVVY_CHAOS_ITERATIONS
+      $code = Invoke-Steps 'CHECK (fast tier)' @(
+        (Step 'cargo fmt --check' { cargo fmt --check }),
+        (Step 'cargo clippy (no video)' { cargo clippy --all-targets -q -- -D warnings }),
+        (Step "FAST tier: unit + chaos tests without video, engine killed $kills times" { cargo test }),
+        (Step 'npm run typecheck' { Invoke-Npm typecheck }),
+        (Step 'npm test' { Invoke-Npm test })
+      ) 'video and streaming tests and jivvy-video unit tests (.\dev.ps1 slow), clippy with video, the full 100 kills (.\dev.ps1 test-full)'
+      exit $code
+    }
+    'test-full' {
+      Use-GStreamer
+      if (-not $env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS = '100' }
+      $kills = $env:JIVVY_CHAOS_ITERATIONS
+      $skips = if ($kills -ne '100') { "the full 100 kills (JIVVY_CHAOS_ITERATIONS is $kills)" } else { $null }
+      $code = Invoke-Steps 'TEST-FULL (everything)' @(
+        (Step 'cargo fmt --check' { cargo fmt --check }),
+        (Step 'cargo clippy (with video)' { cargo clippy --release --all-targets --features video -q -- -D warnings }),
+        (Step "all Rust tests with video, release, engine killed $kills times" { cargo test --release --features video }),
+        (Step 'npm run typecheck' { Invoke-Npm typecheck }),
+        (Step 'npm test' { Invoke-Npm test }),
+        (Step 'npm run build' { Invoke-Npm build })
+      ) $skips
+      exit $code
+    }
     'fast' {
-      $kills = if ($env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS } else { '10' }
+      # Set it, not just show it: with CI set, the tests would otherwise default to 100.
+      if (-not $env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS = '10' }
+      $kills = $env:JIVVY_CHAOS_ITERATIONS
       Show-Tier 'FAST' "unit tests (lib + bins, not jivvy-video) and chaos tests without video, engine killed $kills times" 'video and streaming tests, jivvy-video unit tests (run .\dev.ps1 slow)'
       cargo test @($Rest | Select-Object -Skip 1)
       $code = $LASTEXITCODE
@@ -54,10 +127,15 @@ try {
     'test' {
       Use-GStreamer
       if (-not $env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS = '100' }
-      Show-Tier 'FULL' "everything, release build, engine killed $env:JIVVY_CHAOS_ITERATIONS times" $null
-      cargo test --release --features video @($Rest | Select-Object -Skip 1)
+      $extra = @($Rest | Select-Object -Skip 1)
+      $scope = if ($extra.Count) { "only: $($extra -join ' ')" } else { 'all Rust tests (npm and lint: .\dev.ps1 test-full)' }
+      Show-Tier 'FULL' "release build with video, engine killed $env:JIVVY_CHAOS_ITERATIONS times; $scope" $null
+      cargo test --release --features video @extra
     }
     default { Use-GStreamer; cargo @Rest }
   }
   exit $LASTEXITCODE
-} finally { Pop-Location }
+} finally {
+  Pop-Location
+  foreach ($name in $Saved.Keys) { [Environment]::SetEnvironmentVariable($name, $Saved[$name], 'Process') }
+}

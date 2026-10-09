@@ -20,7 +20,15 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 
 ## Commands
 `npm install`, `npm test`, `npm run typecheck`, `npm run build`, `npm run dev:site`
-Daemon (in `apps/daemon`): `.\dev.ps1 fast` (unit + chaos tests without video, engine killed 10 times, no GStreamer); `.\dev.ps1 slow` (video and streaming tests) before PRs touching video, stream, bandwidth, HLS or tiers; `.\dev.ps1 test` runs everything with the full 100 kills and the camera/audio and streaming tests (needs GStreamer, and MediaMTX in `apps/daemon/.tools/`; see the daemon README); `cargo fmt` and `cargo clippy` must be clean
+Daemon (in `apps/daemon`): `.\dev.ps1 check` (fmt, clippy, fast tier, npm typecheck and tests; ~30 s, no GStreamer); `.\dev.ps1 test-full` (everything: video and streaming tests, the full 100 kills, npm; needs GStreamer, and MediaMTX in `apps/daemon/.tools/`; see the daemon README); `.\dev.ps1 fast` / `slow` run one tier; `.\dev.ps1 ctl next` drives a running daemon; `cargo fmt` and `cargo clippy` must be clean
+
+## Workflow
+- While iterating: the fast tier (`.\dev.ps1 fast`). It never covers video or streaming, and says so.
+- Before every push: `.\dev.ps1 check`.
+- Once per PR: `.\dev.ps1 test-full`, and `.\dev.ps1 slow` before any PR touching video, stream, bandwidth, HLS or tiers code. CI runs everything on Windows and Linux at full strength either way.
+- New behavior goes in this order: `packages/protocol` (command and fixtures), then `packages/sim-daemon`, then the real daemon. Describe it in `packages/protocol/fixtures/scenarios.json` first; both daemons must pass it.
+- Never shorten a chaos test's outage or "nothing happens" waits, loosen a reliability target from the plan (back on the same slide within 3 s, stream recovers by itself from a blip under 30 s, no-audio or stream-down alert within 15 s), or loosen a chaos test's threshold (program at 25 fps or more, YouTube HLS caught up within 15 s of the connection returning) to make a test pass; report the margin instead.
+- Run the daemon without a camera or microphone with `--test-sources`.
 
 ## Brand
 Navy #10224F, Paper #F4F1EA, Jivvy blue #2E6BFF, On-air orange #FF7A1A (small accents only, never large areas).

@@ -516,6 +516,42 @@ fn a_killed_test_run_leaves_no_daemon_behind() {
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("jivvy-chaos-killed-run-{}", run.id())));
 }
 
+/// Runs `jivvy-ctl` with `args`: (exit code, stdout, stderr).
+fn ctl(args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_jivvy-ctl")).args(args).output().unwrap();
+    let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    (out.status.code().unwrap_or(-1), text(out.stdout), text(out.stderr))
+}
+
+#[test]
+fn jivvy_ctl_drives_a_running_daemon_in_one_line() {
+    let d = start("ctl", 10);
+    d.next_engine_pid(Duration::from_secs(10));
+    let at = ["--connect", d.addr.as_str()];
+    let state = |args: &[&str]| -> Value {
+        let (code, out, err) = ctl(&[&at[..], args].concat());
+        assert_eq!(code, 0, "jivvy-ctl {args:?}: {err}");
+        serde_json::from_str::<Value>(&out).unwrap()["state"].clone()
+    };
+    assert_eq!(state(&["next"])["slideIndex"], 1);
+    assert_eq!(state(&["next"])["slideIndex"], 2);
+    assert_eq!(state(&["back"])["slideIndex"], 1);
+    assert_eq!(state(&["goto", "7"])["slideIndex"], 7);
+    assert_eq!(state(&["black"])["black"], true);
+    assert_eq!(state(&["black", "off"])["black"], false);
+    assert_eq!(state(&["state"])["slideIndex"], 7);
+
+    let (code, out, err) = ctl(&[&at[..], &["goto", "99"]].concat());
+    assert_eq!(code, 1, "a refused command exits 1: {out}");
+    assert!(out.contains("bad_arguments") && err.contains("refused"), "{out} {err}");
+    let (code, _, err) = ctl(&["--connect", &format!("127.0.0.1:{}", free_port()), "state"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("can't reach the daemon"), "{err}");
+    let (code, _, err) = ctl(&["stream", "pause"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("unknown command"), "{err}");
+}
+
 fn displays(dir: &std::path::Path, names: &[&str]) {
     let list: Vec<Value> = names
         .iter()

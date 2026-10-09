@@ -183,7 +183,10 @@ fn to_composition(l: lyrics::Layer) -> Option<gst_video::VideoOverlayComposition
 
 impl Program {
     pub fn new(cfg: ProgramConfig, feed: Arc<Feed>, font: &'static [u8]) -> Program {
-        let gpu = has("d3d12upload") && has("d3d12overlaycompositor") && has("d3d12download");
+        // Test hook JIVVY_TEST_NO_GPU=1: blend and convert on the CPU even where the D3D12 plugins
+        // exist. CI's Windows runners have no GPU, where D3D12 runs in software at ~7 fps.
+        let no_gpu = std::env::var("JIVVY_TEST_NO_GPU").is_ok_and(|v| v.trim() == "1");
+        let gpu = !no_gpu && has("d3d12upload") && has("d3d12overlaycompositor") && has("d3d12download");
         let order = encoder_order(cfg.encoder, has);
         let sources: Arc<Mutex<Sources>> = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));

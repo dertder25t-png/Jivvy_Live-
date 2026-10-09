@@ -132,21 +132,6 @@ pub fn test_sources_from_env() -> bool {
     std::env::var(TEST_SOURCES_ENV).is_ok_and(|v| v.trim() == "1")
 }
 
-impl MediaConfig {
-    /// Test sources (`--test-sources`): every camera and microphone becomes a generated test
-    /// pattern or tone, whatever `media.json` names, so the whole daemon runs on a machine
-    /// with no camera, capture card or microphone. An input set to `none` stays off, and the
-    /// program settings are kept.
-    pub fn with_test_sources(mut self) -> MediaConfig {
-        for input in [&mut self.camera, &mut self.microphone] {
-            if *input != Selection::None {
-                *input = Selection::Test;
-            }
-        }
-        self
-    }
-}
-
 /// Reads `media.json`; missing means defaults. Invalid is an error and the caller keeps
 /// what it is already using.
 pub fn load_config(dir: &Path) -> Result<MediaConfig, String> {
@@ -241,6 +226,17 @@ impl Memory {
 
     /// What to use for one input. `auto` picks the default (or first) device once and then
     /// stays on it; any other selection clears that pin, so the next `auto` picks afresh.
+    /// `choose`, or with test sources (`--test-sources`) a generated test pattern or tone for
+    /// every input not set to `none`, whatever `media.json` names. Test sources leave the
+    /// remembered auto pins alone, so the next normal run keeps the same camera and microphone.
+    pub fn choose_input(&mut self, sel: &Selection, kind: Kind, devices: &[DeviceInfo], test_sources: bool) -> Choice {
+        match sel {
+            Selection::None => Choice::None,
+            _ if test_sources => Choice::Test,
+            _ => self.choose(sel, kind, devices),
+        }
+    }
+
     pub fn choose(&mut self, sel: &Selection, kind: Kind, devices: &[DeviceInfo]) -> Choice {
         let device = |d: &DeviceInfo| Choice::Device { id: d.id.clone(), name: d.name.clone() };
         if *sel != Selection::Auto {
@@ -308,15 +304,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sources_replace_every_device_but_leave_an_input_that_is_off() {
-        let camera = Selection::Device { id: "usb-1".into(), name: "Blackmagic ATEM".into() };
-        let c = MediaConfig { version: CONFIG_VERSION, camera, microphone: Selection::Auto, ..Default::default() };
-        let t = c.clone().with_test_sources();
-        assert_eq!((t.camera, t.microphone), (Selection::Test, Selection::Test));
-        assert_eq!(t.program, c.program, "program settings kept");
+    fn test_sources_replace_every_device_but_leave_an_input_that_is_off_and_the_auto_pins() {
+        let cam = |id: &str, name: &str| DeviceInfo {
+            kind: Kind::Camera,
+            id: id.into(),
+            name: name.into(),
+            api: "mediafoundation".into(),
+            default: false,
+        };
+        let (a, b) = (cam("path-a", "Capture A"), cam("path-b", "Capture B"));
+        let mut m = Memory::default();
+        let pinned = m.choose_input(&Selection::Auto, Kind::Camera, &[a.clone(), b.clone()], false);
+        assert_eq!(pinned, Choice::Device { id: "path-a".into(), name: "Capture A".into() });
 
-        let slides_only = MediaConfig { camera: Selection::None, ..c }.with_test_sources();
-        assert_eq!((slides_only.camera, slides_only.microphone), (Selection::None, Selection::Test));
+        let atem = Selection::Device { id: "usb-1".into(), name: "Blackmagic ATEM".into() };
+        for sel in [&Selection::Auto, &atem, &Selection::Test] {
+            assert_eq!(m.choose_input(sel, Kind::Camera, &[a.clone(), b.clone()], true), Choice::Test, "{sel:?}");
+        }
+        assert_eq!(
+            m.choose_input(&Selection::None, Kind::Camera, std::slice::from_ref(&a), true),
+            Choice::None,
+            "off stays off"
+        );
+
+        // Back to a normal run, with the devices listed the other way round: still the pinned one.
+        assert_eq!(m.choose_input(&Selection::Auto, Kind::Camera, &[b, a], false), pinned);
     }
 
     fn raw(name: &str, class: &str, props: &[(&str, &str)]) -> RawDevice {

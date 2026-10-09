@@ -21,9 +21,19 @@ fn main() {
 
 fn run(inv: &ctl::Invocation) -> Result<(), String> {
     let unreachable = |e: &dyn std::fmt::Display| format!("can't reach the daemon at {}: {e}", inv.addr);
-    let addr =
-        inv.addr.to_socket_addrs().map_err(|e| unreachable(&e))?.next().ok_or_else(|| unreachable(&"no address"))?;
-    let mut conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| unreachable(&e))?;
+    // A name can resolve to several addresses (localhost: IPv6, then IPv4); try each in turn.
+    let mut last_error = String::from("no address");
+    let mut conn = None;
+    for addr in inv.addr.to_socket_addrs().map_err(|e| unreachable(&e))? {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(c) => {
+                conn = Some(c);
+                break;
+            }
+            Err(e) => last_error = e.to_string(),
+        }
+    }
+    let mut conn = conn.ok_or_else(|| unreachable(&last_error))?;
     let id = format!("ctl-{}", std::process::id());
     let line = ctl::envelope(&inv.command, &id, jivvy_daemon::now_ms());
     conn.write_all(line.as_bytes()).map_err(|e| unreachable(&e))?;

@@ -356,7 +356,6 @@ impl Video {
         let elapsed = self.last_rescan.map(|t| now.duration_since(t));
         self.problems.clear();
         match media::load_config(&self.args.data_dir) {
-            Ok(c) if self.args.test_sources => self.config = c.with_test_sources(),
             Ok(c) => self.config = c,
             Err(e) => self.problems.push(format!("{e}; keeping the last good setup")),
         }
@@ -389,7 +388,7 @@ impl Video {
         self.memory.observe(&self.devices);
         for input in self.inputs.iter_mut() {
             let sel = if input.kind == Kind::Camera { &self.config.camera } else { &self.config.microphone };
-            let choice = self.memory.choose(sel, input.kind, &self.devices);
+            let choice = self.memory.choose_input(sel, input.kind, &self.devices, self.args.test_sources);
             if let Some(e) = elapsed {
                 let n = input.count.load(Ordering::Relaxed);
                 input.rate = (n - input.last_count) as f64 / e.as_secs_f64();

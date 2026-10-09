@@ -563,7 +563,45 @@ fn contains(actual: &Value, expected: &Value) -> bool {
 
 #[test]
 fn shared_scenarios_behave_the_same_on_the_real_daemon() {
-    // Also run against the simulated daemon (packages/sim-daemon/test/scenarios.test.ts).
+    run_shared_scenarios(false);
+}
+
+#[test]
+fn shared_scenarios_behave_the_same_over_the_websocket_channel() {
+    run_shared_scenarios(true);
+}
+
+/// Sends one command over the WebSocket channel, reconnecting until the engine answers or
+/// time runs out (as `Daemon::send` does over TCP).
+fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
+    use tungstenite::client::IntoClientRequest;
+    let deadline = Instant::now() + within;
+    let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
+    loop {
+        let attempt = (|| -> Result<Value, String> {
+            let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
+            let req = format!("ws://{addr}/").into_client_request().map_err(|e| e.to_string())?;
+            let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| e.to_string())?;
+            ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| e.to_string())?;
+            loop {
+                if let tungstenite::Message::Text(t) = ws.read().map_err(|e| e.to_string())? {
+                    return serde_json::from_str(&t).map_err(|e| e.to_string());
+                }
+            }
+        })();
+        match attempt {
+            Ok(v) => return v,
+            Err(e) if Instant::now() >= deadline => panic!("engine did not answer over WebSocket in time: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Runs `packages/protocol/fixtures/scenarios.json` against the real daemon, over its TCP
+/// channel or its WebSocket channel. Also run against the simulated daemon
+/// (packages/sim-daemon/test/scenarios.test.ts).
+fn run_shared_scenarios(over_ws: bool) {
     const SCENARIOS: &str = include_str!("../../../packages/protocol/fixtures/scenarios.json");
     let shared: Value = serde_json::from_str(SCENARIOS).unwrap();
     let scenarios = shared["scenarios"].as_array().unwrap();
@@ -573,7 +611,18 @@ fn shared_scenarios_behave_the_same_on_the_real_daemon() {
         for (n, scenario) in scenarios.iter().enumerate() {
             scope.spawn(move || {
                 let name = scenario["name"].as_str().unwrap();
-                let d = start(&format!("scenario-{n}"), scenario["slides"].as_u64().unwrap());
+                let slides = scenario["slides"].as_u64().unwrap();
+                let ws = format!("127.0.0.1:{}", free_port());
+                let d = if over_ws {
+                    start_with(
+                        test_dir(&format!("scenario-ws-{n}")),
+                        slides,
+                        false,
+                        &["--no-video", "--listen-ws", &ws],
+                    )
+                } else {
+                    start(&format!("scenario-{n}"), slides)
+                };
                 let mut engine = d.next_engine_pid(Duration::from_secs(10));
                 for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
                     if step["crash"] == true {
@@ -582,7 +631,11 @@ fn shared_scenarios_behave_the_same_on_the_real_daemon() {
                         continue;
                     }
                     // Waits for a restarted engine to answer, like any client reconnecting.
-                    let ack = d.send(step["send"].clone(), RESTORE_TARGET);
+                    let ack = if over_ws {
+                        send_ws(&ws, step["send"].clone(), RESTORE_TARGET)
+                    } else {
+                        d.send(step["send"].clone(), RESTORE_TARGET)
+                    };
                     assert!(
                         contains(&ack, &step["expect"]),
                         "{name}, step {i} ({}): expected {} in {ack}",

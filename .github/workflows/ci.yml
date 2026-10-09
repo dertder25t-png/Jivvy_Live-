@@ -20,14 +20,14 @@ jobs:
       - run: npm test
       - run: npm run build
   daemon:
-    # The daemon targets Windows first; Linux keeps it portable. Camera/audio input
-    # (the `video` feature) needs GStreamer, installed here on Linux only for now.
+    # The daemon targets Windows first; Linux keeps it portable. Both run everything,
+    # including camera/audio and streaming (the `video` feature, which needs GStreamer).
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            features: ""
+            features: "--features video"
           - os: ubuntu-latest
             features: "--features video"
     runs-on: ${{ matrix.os }}
@@ -44,6 +44,33 @@ jobs:
           sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
           libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good
           gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav fonts-dejavu-core
+      # GStreamer on Windows: the same release as on the founder's laptop, checked against its
+      # published SHA-256 and installed silently (runtime and development files), cached by version.
+      - if: runner.os == 'Windows'
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\gstreamer
+          key: gstreamer-msvc-x86_64-1.28.6
+      - if: runner.os == 'Windows' && steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $base = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.28.6/msvc/gstreamer-1.0-msvc-x86_64-1.28.6.exe'
+          Invoke-WebRequest "$base" -OutFile $env:RUNNER_TEMP\gst.exe
+          Invoke-WebRequest "$base.sha256sum" -OutFile $env:RUNNER_TEMP\gst.sha256sum
+          $want = (Get-Content $env:RUNNER_TEMP\gst.sha256sum -Raw).Split(' ')[0].Trim()
+          $got = (Get-FileHash $env:RUNNER_TEMP\gst.exe -Algorithm SHA256).Hash
+          if ($got -ne $want) { throw "GStreamer installer checksum mismatch: $got, expected $want" }
+          Start-Process $env:RUNNER_TEMP\gst.exe -Wait -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/ALLUSERS','/DIR=C:\gstreamer\1.0\msvc_x86_64'
+          if (-not (Test-Path C:\gstreamer\1.0\msvc_x86_64\bin\pkg-config.exe)) { throw 'GStreamer installed without its development files' }
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $gst = 'C:\gstreamer\1.0\msvc_x86_64'
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gst" >> $env:GITHUB_ENV
+          "PKG_CONFIG=$gst\bin\pkg-config.exe" >> $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$gst\lib\pkgconfig" >> $env:GITHUB_ENV
+          "$gst\bin" >> $env:GITHUB_PATH
       # A local RTMP server for the streaming tests (same release as on the founder's laptop).
       - if: runner.os == 'Linux'
         env:
@@ -53,6 +80,15 @@ jobs:
           gh release download v1.21.1 --repo bluenviron/mediamtx --pattern 'mediamtx_v1.21.1_linux_amd64.tar.gz' --pattern checksums.sha256
           grep linux_amd64.tar.gz checksums.sha256 | sha256sum -c -
           tar xzf mediamtx_v1.21.1_linux_amd64.tar.gz mediamtx
+      - if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .tools/mediamtx && cd .tools/mediamtx
+          gh release download v1.21.1 --repo bluenviron/mediamtx --pattern 'mediamtx_v1.21.1_windows_amd64.zip' --pattern checksums.sha256
+          grep windows_amd64.zip checksums.sha256 | sha256sum -c -
+          unzip -o mediamtx_v1.21.1_windows_amd64.zip mediamtx.exe
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

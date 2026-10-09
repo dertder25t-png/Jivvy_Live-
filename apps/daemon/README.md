@@ -152,7 +152,7 @@ To try features by hand against a running daemon, `jivvy-ctl` sends one command 
 
 Each chaos test works in `%TEMP%\jivvy-chaos-<test>-<pid>`: deleted when the test passes, kept (path printed) when it fails, with the daemon's log in `daemon.log`. Test ports come from 20000-32767, below the ephemeral range, and a daemon or MediaMTX whose port is taken is started again on another. On Windows the test process puts itself in a job object, so killing it outright (an IDE's stop button, Task Manager) also ends every daemon and MediaMTX it started.
 
-CI runs everything, video and streaming included, on both Windows and Linux. On Windows it installs GStreamer 1.28.6 (the founder's laptop's version, checksum-verified, cached by version) and MediaMTX; there is no GPU there, so the program encodes with x264.
+CI runs everything, video and streaming included, on both Windows and Linux. On Windows it installs GStreamer 1.28.6 (the founder's laptop's version, checksum-verified, cached by version) and MediaMTX. Its runners have no GPU, where Media Foundation is a software encoder managing only ~6 fps at 1080p, so CI sets the test hook `JIVVY_TEST_ENCODER=x264` (the encoder Linux uses anyway). Automatic encoder choice that measures whether an encoder keeps up is the plan's "Encoder self-test and fallback" item.
 
 The streaming tests need [MediaMTX](https://github.com/bluenviron/mediamtx) as a local RTMP server, in `apps/daemon/.tools/mediamtx/` (git-ignored) or at `$JIVVY_MEDIAMTX`. To get the same release CI uses (checksum checked):
 

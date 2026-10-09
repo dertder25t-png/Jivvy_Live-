@@ -86,6 +86,16 @@ fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
 }
 
 fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&str]) -> Daemon {
+    start_with_env(data_dir, slides, headless_outputs, extra, &[])
+}
+
+fn start_with_env(
+    data_dir: PathBuf,
+    slides: u64,
+    headless_outputs: bool,
+    extra: &[&str],
+    envs: &[(&str, &str)],
+) -> Daemon {
     let video_slot = (!extra.contains(&"--no-video")).then(VideoSlot::take);
     let addr = format!("127.0.0.1:{}", free_port());
     let outputs_flag = if headless_outputs { "--outputs-headless" } else { "--no-outputs" };
@@ -95,8 +105,14 @@ fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&
         .arg(outputs_flag)
         .args(extra)
         .env("JIVVY_TEST_HOOKS", "1")
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
-        .stderr(if std::env::var_os("JIVVY_TEST_STDERR").is_some() { Stdio::inherit() } else { Stdio::null() })
+        // The daemon's log goes to a file in its data directory, shown when a check fails.
+        .stderr(if std::env::var_os("JIVVY_TEST_STDERR").is_some() {
+            Stdio::inherit()
+        } else {
+            std::fs::File::create(data_dir.join("daemon.log")).map(Stdio::from).unwrap_or(Stdio::null())
+        })
         .spawn()
         .unwrap();
     let (engine_tx, engine_starts) = channel();
@@ -122,6 +138,13 @@ fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&
 }
 
 impl Daemon {
+    /// The last lines of the daemon's log, for a failure message.
+    fn log_tail(&self) -> String {
+        let log = std::fs::read_to_string(self.data_dir.join("daemon.log")).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        format!("daemon log (last 40 lines):\n{}", lines[lines.len().saturating_sub(40)..].join("\n"))
+    }
+
     /// Waits for the next "engine started" event and returns the engine's pid.
     fn next_engine_pid(&self, within: Duration) -> u32 {
         self.engine_starts.recv_timeout(within).expect("engine did not (re)start in time")
@@ -146,7 +169,7 @@ impl Daemon {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!("outputs never reached: {what}; last status {last}");
+        panic!("outputs never reached: {what}; last status {last}\n{}", self.log_tail());
     }
 
     /// Sends one command, retrying the connection until the engine answers or time runs out.
@@ -402,7 +425,7 @@ mod video {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            panic!("video never reached: {what}; last status {last}");
+            panic!("video never reached: {what}; last status {last}\n{}", self.log_tail());
         }
     }
 
@@ -653,6 +676,9 @@ mod video {
                 if let Some(b) = self.receiving() {
                     match first {
                         None => first = Some(b),
+                        // A new connection (e.g. the bandwidth manager trying a step up)
+                        // starts the count again.
+                        Some(f) if b < f => first = Some(b),
                         Some(f) if b > f + 100_000 => return,
                         _ => {}
                     }
@@ -732,6 +758,10 @@ mod video {
         wait_stream_state(&d, "live", Duration::from_secs(10));
         println!("stream live again {:?} after the server returned", back_at.elapsed());
         assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
+        // A dead connection isn't a slow one: the quality was never lowered for it.
+        let s = d.media_status(Duration::from_secs(3), "status", |_| true);
+        assert_eq!(s["stream"]["destinations"][0]["quality"], "1080p", "{}", s["stream"]);
+        assert!(s["stream"]["uploadKbps"].is_null(), "no upload limit inferred: {}", s["stream"]);
     }
 
     #[test]
@@ -1000,10 +1030,11 @@ mod video {
                     head.join(" ")
                 ));
             }
-            if i.segments.iter().any(|(s, _)| s == file) {
-                i.violations.push(format!("{file} sent again after it was confirmed"));
+            // Sent again (the answer didn't reach the client in time): harmless, PUT replaces
+            // it, but it counts once.
+            if !i.segments.iter().any(|(s, _)| s == file) {
+                i.segments.push((file.to_string(), body.len()));
             }
-            i.segments.push((file.to_string(), body.len()));
             i.last = body.to_vec();
             if i.names.values().any(|n| n == file) {
                 200
@@ -1188,5 +1219,250 @@ mod video {
                 assert!(!text.contains(wrong), "{f} contains the stream key");
             }
         }
+    }
+
+    /// A shared upload limit for throttling proxies: kbps, 0 for unlimited.
+    #[derive(Default)]
+    struct Uplink {
+        kbps: std::sync::atomic::AtomicU64,
+        next_free: std::sync::Mutex<Option<Instant>>,
+    }
+
+    impl Uplink {
+        fn set(&self, kbps: u64) {
+            self.kbps.store(kbps, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Waits until `n` more bytes fit under the limit.
+        fn pass(&self, n: usize) {
+            let kbps = self.kbps.load(std::sync::atomic::Ordering::SeqCst);
+            if kbps == 0 {
+                return;
+            }
+            let cost = Duration::from_secs_f64(n as f64 * 8.0 / (kbps as f64 * 1000.0));
+            let until = {
+                let mut next = self.next_free.lock().unwrap();
+                let start = next.map_or(Instant::now(), |t| t.max(Instant::now()));
+                *next = Some(start + cost);
+                start + cost
+            };
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    /// A TCP proxy to `target` whose upload (towards the server) goes through `uplink`,
+    /// like the church's internet connection. Returns its port.
+    fn throttled(uplink: std::sync::Arc<Uplink>, target: u16) -> u16 {
+        // A small receive buffer, so the sender feels the limit through TCP flow control as
+        // it would on a real slow link. Without it Linux's auto-tuned loopback buffers soak
+        // up megabytes first and hide the congestion for tens of seconds.
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
+        socket.listen(16).unwrap();
+        let listener: TcpListener = socket.into();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(server) = TcpStream::connect(("127.0.0.1", target)) else { continue };
+                let (mut c_in, mut s_out) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+                let up = uplink.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = std::io::Read::read(&mut c_in, &mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        up.pass(n);
+                        if s_out.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = s_out.shutdown(std::net::Shutdown::Both);
+                });
+                let (mut s_in, mut c_out) = (server, client);
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut s_in, &mut c_out);
+                    let _ = c_out.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        port
+    }
+
+    fn destination(s: &Value, id: &str) -> Value {
+        s["stream"]["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id).cloned().unwrap_or(Value::Null)
+    }
+
+    /// A daemon for the bandwidth tests, streaming to `destinations` (JSON). The test
+    /// picture is noise, like a camera's, so every encoder really spends its bitrate (x264
+    /// squeezes the usual test pattern to almost nothing), at 720p and 3 Mbps so x264 keeps
+    /// up on a CI runner. Lower qualities: 480p and 360p.
+    fn start_bandwidth(name: &str, destinations: &str) -> Daemon {
+        let dir = test_dir(name);
+        std::fs::write(
+            dir.join("media.json"),
+            r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"},
+                "program":{"width":1280,"height":720,"bitrateKbps":3000}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("stream.json"), format!(r#"{{"version":1,"destinations":[{destinations}]}}"#)).unwrap();
+        let video = env!("CARGO_BIN_EXE_jivvy-video");
+        let d = start_with_env(dir, 10, false, &["--video", video], &[("JIVVY_TEST_PATTERN", "snow")]);
+        d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        d
+    }
+
+    fn rtmp_destination(id: &str, port: u16) -> String {
+        format!(r#"{{"id":"{id}","name":"{id}","url":"rtmp://127.0.0.1:{port}/live","key":"{TEST_KEY}"}}"#)
+    }
+
+    fn hls_destination(id: &str, port: u16) -> String {
+        format!(r#"{{"id":"{id}","name":"{id}","url":"http://127.0.0.1:{port}/http_upload_hls","key":"{TEST_KEY}"}}"#)
+    }
+
+    /// What the program really sends (kbps).
+    fn program_kbps(d: &Daemon) -> f64 {
+        let s = d.media_status(Duration::from_secs(20), "program running", |s| {
+            program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0 && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
+        });
+        program(&s)["kbps"].as_f64().unwrap()
+    }
+
+    #[test]
+    fn a_slow_upload_steps_the_stream_down_and_back_up_while_the_program_stays_full() {
+        let dir = test_dir("bw-slow-mtx");
+        let server = MediaMtx::start(&dir);
+        let uplink = std::sync::Arc::new(Uplink::default());
+        let d = start_bandwidth("bw-slow", &rtmp_destination("local", throttled(uplink.clone(), server.rtmp)));
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        wait_stream_state(&d, "live", Duration::from_secs(20));
+        d.media_status(Duration::from_secs(5), "live at full quality", |s| {
+            destination(s, "local")["quality"] == "720p"
+        });
+
+        // The church's upload drops to 1 Mbps.
+        let full = program_kbps(&d);
+        let limit = 1000.0;
+        uplink.set(limit as u64);
+        let slowed = Instant::now();
+        let s = d.media_status(Duration::from_secs(40), "stepped down to 360p and live", |s| {
+            let dest = destination(s, "local");
+            dest["quality"] == "360p" && dest["state"] == "live"
+        });
+        println!("live at 360p {:?} after the upload dropped to {limit:.0} kbps", slowed.elapsed());
+        let dest = destination(&s, "local");
+        assert!(dest["detail"].as_str().unwrap().contains("Lowered to 360p"), "{dest}");
+        let upload = s["stream"]["uploadKbps"].as_f64().expect("an upload estimate");
+        println!("upload estimate {upload:.0} kbps on a {limit:.0} kbps link");
+        // On Linux a stalling loopback socket takes nothing for whole seconds, which makes
+        // the reading coarse; Windows (the church computer) measures it closely.
+        if cfg!(windows) {
+            assert!((limit * 0.4..=limit * 1.5).contains(&upload), "upload estimate {upload} kbps");
+        } else {
+            assert!(upload < full, "upload estimate {upload} kbps, below the program's {full:.0}");
+        }
+        assert_eq!(s["stream"]["encodes"][0]["quality"], "360p", "{}", s["stream"]);
+        // The program (and so the recording) never noticed: full size, full rate, full bitrate.
+        let s = d.media_status(Duration::from_secs(5), "program untouched", |s| {
+            program(s)["width"] == 1280 && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        });
+        let kbps = program(&s)["kbps"].as_f64().unwrap();
+        assert!(kbps > full * 0.6, "program bitrate untouched: {kbps:.0} kbps, was {full:.0}");
+        // The server keeps getting it (a step up the manager tries and takes back meanwhile
+        // reconnects, so allow for one).
+        server.wait_receiving(Duration::from_secs(30));
+
+        // The upload comes back: the stream steps back up by itself.
+        uplink.set(0);
+        let back = Instant::now();
+        d.media_status(Duration::from_secs(60), "stepped back up", |s| {
+            let dest = destination(s, "local");
+            dest["quality"] != "360p" && dest["quality"] != "" && dest["state"] == "live"
+        });
+        println!("stepped up {:?} after the upload came back", back.elapsed());
+        assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
+    }
+
+    #[test]
+    fn when_two_platforms_dont_fit_the_lower_priority_one_is_paused_and_the_main_one_stays_live() {
+        let dir = test_dir("bw-share-mtx");
+        let server = MediaMtx::start(&dir);
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        // YouTube first: the main platform.
+        let destinations = format!(
+            "{},{}",
+            hls_destination("youtube", throttled(uplink.clone(), yt.port)),
+            rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp))
+        );
+        let d = start_bandwidth("bw-share", &destinations);
+        // 1.2 Mbps shared: 840 kbps to spend can't carry both even at 360p (~630 each).
+        uplink.set(1200);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(90), "Facebook paused, YouTube live", |s| {
+            destination(s, "facebook")["state"] == "paused" && destination(s, "youtube")["state"] == "live"
+        });
+        let (yt_status, fb_status) = (destination(&s, "youtube"), destination(&s, "facebook"));
+        assert_eq!(yt_status["quality"], "360p", "{yt_status}");
+        assert!(fb_status["detail"].as_str().unwrap().contains("Paused"), "{fb_status}");
+        assert_eq!(stream_state(&d), "live", "screens: live, the paused platform aside");
+        // YouTube keeps getting video, within the ingestion rules.
+        yt.wait_segments(3, Duration::from_secs(20));
+        yt.assert_no_violations();
+    }
+
+    #[test]
+    fn youtube_on_a_link_too_slow_for_one_full_quality_segment_steps_down_and_goes_live() {
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        let port = throttled(uplink.clone(), yt.port);
+        let d = start_bandwidth("bw-hls-slow", &hls_destination("youtube", port));
+        // 900 kbps: a 2 s full-quality segment (3 Mbps, ~750 kB) needs ~6.7 s, more than the
+        // 6 s it gets, so nothing is ever confirmed at full quality; 360p (~630 kbps) fits.
+        let limit = 900.0;
+        uplink.set(limit as u64);
+        let started = Instant::now();
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(120), "YouTube live at 360p", |s| {
+            let dest = destination(s, "youtube");
+            dest["quality"] == "360p" && dest["state"] == "live"
+        });
+        println!("live at 360p {:?} after start on a {limit:.0} kbps link", started.elapsed());
+        assert!(destination(&s, "youtube")["detail"].as_str().unwrap().contains("Lowered to 360p"));
+        yt.wait_segments(3, Duration::from_secs(20));
+        yt.assert_no_violations();
+    }
+
+    #[test]
+    fn a_paused_youtube_destination_stops_uploading_at_once() {
+        let dir = test_dir("bw-pause-hls-mtx");
+        let server = MediaMtx::start(&dir);
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        // Facebook first this time: YouTube (HLS) is the one to pause.
+        let destinations = format!(
+            "{},{}",
+            rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp)),
+            hls_destination("youtube", throttled(uplink.clone(), yt.port))
+        );
+        let d = start_bandwidth("bw-pause-hls", &destinations);
+        uplink.set(1200);
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+        d.media_status(Duration::from_secs(90), "YouTube paused, Facebook live", |s| {
+            destination(s, "youtube")["state"] == "paused" && destination(s, "facebook")["state"] == "live"
+        });
+        assert_eq!(stream_state(&d), "live");
+        let paused_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        // Paused means paused: nothing is cut after the pause, so nothing cut after it ever
+        // reaches YouTube (what was already on its way may still land), and nothing waits on
+        // disk. Checked well inside the 20 s before the manager tries un-pausing it.
+        std::thread::sleep(Duration::from_secs(10));
+        for (name, _) in yt.segments() {
+            let session: u128 = name.trim_start_matches('s').split('-').next().unwrap().parse().unwrap();
+            assert!(session < paused_at, "{name} was cut after the pause");
+        }
+        assert_eq!(spool_files(&d), 0, "its backlog is skipped");
+        yt.assert_no_violations();
     }
 }

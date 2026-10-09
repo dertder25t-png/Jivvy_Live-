@@ -15,6 +15,7 @@
 mod hls;
 mod program;
 mod stream;
+mod tiers;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,7 +180,10 @@ fn start(input: &mut Input, devices: &DeviceCache, feed: &Arc<Feed>, cfg: &Progr
         Choice::Test if input.kind == Kind::Camera => {
             let s = make("videotestsrc")?;
             s.set_property("is-live", true);
-            s.set_property_from_str("pattern", "ball");
+            // Tests can ask for a noisier picture (e.g. "snow") so an encoder really spends
+            // its bitrate, as it does on a camera.
+            let pattern = std::env::var("JIVVY_TEST_PATTERN").unwrap_or_else(|_| "ball".into());
+            s.set_property_from_str("pattern", &pattern);
             s
         }
         Choice::Test => {
@@ -286,6 +290,7 @@ struct Video {
     device_cache: DeviceCache,
     program: Option<Program>,
     streamer: Streamer,
+    tiers: tiers::Tiers,
     /// The stream status last reported to the engine, and when.
     stream_reported: Option<(&'static str, Instant)>,
     inputs: [Input; 2],
@@ -364,7 +369,9 @@ impl Video {
         if let (Some(p), Some(e)) = (self.program.as_mut(), elapsed) {
             p.measure(e);
         }
-        self.streamer.reconcile(&self.args.data_dir, &self.feed);
+        self.streamer.reconcile(&self.args.data_dir, &self.feed, &program_cfg);
+        let encoders = media_encoders(&program_cfg);
+        self.tiers.reconcile(self.streamer.ladder(), &program_cfg, &encoders, &self.feed);
         let raw: Vec<RawDevice> = self.device_cache.lock().unwrap().iter().map(|(r, _)| r.clone()).collect();
         self.devices = media::devices(&raw);
         let remembered = self.memory.clone();
@@ -409,7 +416,8 @@ impl Video {
             *self.feed.frame.lock().unwrap() = None; // slate right away, not after the stale timeout
         }
         let wanted = self.feed.live.lock().unwrap().is_some_and(|s| s.stream_wanted);
-        let stream = self.streamer.status(wanted);
+        let mut stream = self.streamer.status(wanted);
+        stream.encodes = self.tiers.status();
         // Tell the engine on every change and once a second (it treats silence as trouble).
         if self.stream_reported.is_none_or(|(s, at)| s != stream.status || at.elapsed() >= Duration::from_secs(1)) {
             self.levels.report_stream(stream.status);
@@ -434,6 +442,11 @@ impl Video {
             self.last_written = bytes;
         }
     }
+}
+
+/// Encoders for the lower-quality stream encodes, in the order the program uses.
+fn media_encoders(cfg: &jivvy_daemon::program::ProgramConfig) -> Vec<jivvy_daemon::program::EncoderChoice> {
+    jivvy_daemon::program::encoder_order(cfg.encoder, |e| gst::ElementFactory::find(e).is_some())
 }
 
 fn main() {
@@ -473,6 +486,7 @@ fn main() {
         device_cache: Arc::default(),
         program: None,
         streamer: Streamer::new(),
+        tiers: tiers::Tiers::default(),
         stream_reported: None,
         inputs: [Input::new(Kind::Camera), Input::new(Kind::Microphone)],
         devices: Vec::new(),

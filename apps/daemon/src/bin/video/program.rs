@@ -31,6 +31,8 @@ pub struct Feed {
     pub live: Mutex<Option<LiveState>>,
     /// Encoded packets for the stream destinations.
     pub taps: Arc<crate::stream::Taps>,
+    /// The composited picture, for the lower-quality stream encodes (only while one runs).
+    pub raw: Arc<crate::tiers::Raw>,
     frames_encoded: AtomicU64,
     bytes_encoded: AtomicU64,
     overlay_renders: AtomicU64,
@@ -72,6 +74,10 @@ pub struct Program {
     font: &'static [u8],
     /// The encoder being tried or running.
     current: Option<EncoderChoice>,
+    /// Lets the composited picture through to the lower-quality encodes (closed while
+    /// none runs, so it costs nothing then).
+    raw_valve: Option<gst::Element>,
+    raw_open: bool,
     /// Cleared on drop, which stops this program's pacer threads.
     alive: Arc<AtomicBool>,
     detail: String,
@@ -85,7 +91,7 @@ fn has(element: &str) -> bool {
     gst::ElementFactory::find(element).is_some()
 }
 
-fn encoder_description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
+pub(crate) fn encoder_description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
     let (br, gop) = (cfg.bitrate_kbps, cfg.fps * 2);
     // Media Foundation and x264 take system memory, so frames come back from the GPU first.
     let to_system =
@@ -120,7 +126,8 @@ fn description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
     let mut d = format!(
         "appsrc name=vsrc is-live=true format=time do-timestamp=false block=false \
            caps=video/x-raw,format=NV12,width={w},height={h},framerate={fps}/1 \
-         ! {overlay} ! queue max-size-buffers=3 leaky=downstream ! {enc} \
+         ! {overlay} ! tee name=raw allow-not-linked=true \
+         raw. ! queue max-size-buffers=3 leaky=downstream ! {enc} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au ! tee name=vt allow-not-linked=true \
          vt. ! queue ! fakesink name=vmon sync=false async=false \
          vt. ! queue leaky=downstream max-size-time=2000000000 ! appsink name=vtap sync=false async=false max-buffers=32 drop=true \
@@ -128,8 +135,12 @@ fn description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
            caps=audio/x-raw,format=S16LE,rate={AUDIO_RATE},channels={AUDIO_CHANNELS},layout=interleaved \
          ! audioconvert ! avenc_aac bitrate=128000 ! aacparse ! tee name=at allow-not-linked=true \
          at. ! queue ! fakesink sync=false async=false \
-         at. ! queue leaky=downstream max-size-time=2000000000 ! appsink name=atap sync=false async=false max-buffers=64 drop=true",
+         at. ! queue leaky=downstream max-size-time=2000000000 ! appsink name=atap sync=false async=false max-buffers=64 drop=true \
+         raw. ! queue max-size-buffers=2 leaky=downstream ! valve name=rawvalve drop=true ! {to_system} \
+         ! appsink name=rawtap sync=false async=false max-buffers=2 drop=true",
         enc = encoder_description(enc, cfg, gpu),
+        to_system =
+            if gpu { "d3d12download ! video/x-raw,format=NV12" } else { "videoconvert ! video/x-raw,format=NV12" },
     );
     // Developer aid until the recording item lands: also write the program to a file.
     if let Ok(path) = std::env::var("JIVVY_DEBUG_PROGRAM_FILE") {
@@ -189,6 +200,8 @@ impl Program {
             feed,
             font,
             current: None,
+            raw_valve: None,
+            raw_open: false,
             alive,
             detail: String::new(),
             // The feed's counters outlive programs: measure from where they are now.
@@ -222,6 +235,7 @@ impl Program {
             let mut s = self.sources.lock().unwrap();
             (s.video, s.audio, s.start) = (None, None, None);
         }
+        self.raw_valve = None;
         if let Some(p) = self.pipeline.take() {
             let _ = p.set_state(gst::State::Null);
         }
@@ -271,6 +285,20 @@ impl Program {
                 gst::PadProbeReturn::Ok
             },
         );
+
+        // The composited picture goes to the lower-quality encodes while any runs.
+        let raw = self.feed.raw.clone();
+        get("rawtap")?.downcast::<gst_app::AppSink>().map_err(|_| "rawtap is not an appsink")?.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    raw.publish(&sample);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        self.raw_valve = Some(get("rawvalve")?);
+        self.raw_open = false;
 
         // Encoded packets go to the stream destinations, never blocking the program.
         for (name, video) in [("vtap", true), ("atap", false)] {
@@ -328,6 +356,13 @@ impl Program {
                         Some(format!("{} ({})", e.error(), e.src().map(|s| s.name().to_string()).unwrap_or_default()));
                 }
             }
+        }
+        let want_raw = self.feed.raw.wanted();
+        if want_raw != self.raw_open
+            && let Some(v) = &self.raw_valve
+        {
+            v.set_property("drop", !want_raw);
+            self.raw_open = want_raw;
         }
         let encoded = self.feed.frames_encoded.load(Ordering::Relaxed);
         match self.state {

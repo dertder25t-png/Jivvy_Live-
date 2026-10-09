@@ -18,7 +18,10 @@ pub const CONFIG_FILE: &str = "stream.json";
 pub const CONFIG_VERSION: u32 = 1;
 /// No bytes reaching the server for this long (with the connection still open) counts as
 /// a dropped connection: tear down and reconnect rather than wait on a dead socket.
-pub const STALL: Duration = Duration::from_secs(5);
+/// Generous: a socket on an overloaded link can take nothing for several seconds at a time
+/// (Linux drains a large send buffer in big steps), and that is a slow connection to step
+/// down, not a dead one to reconnect. Screens stop showing live within 2 s regardless.
+pub const STALL: Duration = Duration::from_secs(15);
 /// Encoded packets queued for one destination before it counts as stuck.
 pub const QUEUE_PACKETS: usize = 600;
 
@@ -187,7 +190,7 @@ pub fn plain_error(raw: &str) -> String {
         "unexpected eof",
     ]) {
         "Lost the connection to the streaming server. Reconnecting.".into()
-    } else if says(&["couldn't keep up"]) {
+    } else if says(&["couldn't keep up", "upload is too slow"]) {
         "The internet upload is too slow for this stream. Reconnecting.".into()
     } else if says(&["program changed"]) {
         "The stream settings changed. Reconnecting.".into()
@@ -268,7 +271,7 @@ impl DeliveryTracker {
             (self.last_out, self.last_out_at) = (s.out_bytes, Some(now));
             self.flowing_since.get_or_insert(now);
         } else if now.duration_since(self.last_out_at.unwrap_or(connected_at)) > STALL {
-            return Delivery::Failed("no data reached the server for 5 s");
+            return Delivery::Failed("no data reached the server for 15 s");
         }
         let unacked = s.out_bytes.saturating_sub(s.acked);
         if s.window > 0 && unacked > 3 * s.window {
@@ -294,18 +297,23 @@ pub struct DestinationStatus {
     pub id: String,
     pub name: String,
     pub server: String,
-    /// "off", "connecting", "live" or "reconnecting".
+    /// "off", "connecting", "live", "reconnecting", or "paused" (by the bandwidth manager:
+    /// the upload can't carry this platform too).
     pub state: &'static str,
     pub detail: String,
     pub kbps: f64,
     pub reconnects: u32,
+    /// What it sends: "1080p", "720p", ... (the bandwidth manager's choice), or "" when off.
+    pub quality: String,
 }
 
-/// What screens see: live only when every enabled destination is live.
+/// What screens see: live only when every destination is live, apart from ones the
+/// bandwidth manager paused (as long as one is still live).
 pub fn overall(wanted: bool, destinations: &[DestinationStatus]) -> &'static str {
+    let sending: Vec<&DestinationStatus> = destinations.iter().filter(|d| d.state != "paused").collect();
     if !wanted {
         "off"
-    } else if !destinations.is_empty() && destinations.iter().all(|d| d.state == "live") {
+    } else if !sending.is_empty() && sending.iter().all(|d| d.state == "live") {
         "live"
     } else {
         "reconnecting"
@@ -320,6 +328,20 @@ pub struct StreamStatus {
     pub status: &'static str,
     pub destinations: Vec<DestinationStatus>,
     pub problems: Vec<String>,
+    /// The upload speed the bandwidth manager is working with (kbps); None until the
+    /// connection has shown a limit.
+    pub upload_kbps: Option<f64>,
+    /// Lower-quality encodes running for stepped-down destinations.
+    pub encodes: Vec<EncodeStatus>,
+}
+
+/// One lower-quality encode.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncodeStatus {
+    pub quality: String,
+    pub encoder: String,
+    pub frames_encoded: u64,
 }
 
 #[cfg(test)]
@@ -433,7 +455,7 @@ mod tests {
                 "Connection error: Error receiving data: An existing connection was forcibly closed",
                 "Lost the connection",
             ),
-            ("no data reached the server for 5 s", "stopped responding"),
+            ("no data reached the server for 15 s", "stopped responding"),
             ("Error resolving 'a.rtmps.youtube.com': No such host is known", "Can't find"),
             ("the connection couldn't keep up", "too slow"),
             ("the server answered 401", "rejected"),
@@ -496,10 +518,11 @@ mod tests {
         // The socket stops taking bytes at all.
         let mut d = DeliveryTracker::new(t0);
         d.update(stats(394, 1_000_000, 0), at(t0, 0));
-        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 4_900)), Delivery::Starting);
+        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 2_500)), Delivery::Starting, "not live, not dead");
+        assert_eq!(d.update(stats(394, 1_000_000, 0), at(t0, 14_900)), Delivery::Starting);
         assert_eq!(
-            d.update(stats(394, 1_000_000, 0), at(t0, 5_100)),
-            Delivery::Failed("no data reached the server for 5 s")
+            d.update(stats(394, 1_000_000, 0), at(t0, 15_100)),
+            Delivery::Failed("no data reached the server for 15 s")
         );
     }
 
@@ -522,8 +545,11 @@ mod tests {
             detail: String::new(),
             kbps: 0.0,
             reconnects: 0,
+            quality: String::new(),
         };
         assert_eq!(overall(false, &[d("live")]), "off");
+        assert_eq!(overall(true, &[d("live"), d("paused")]), "live", "paused for bandwidth");
+        assert_eq!(overall(true, &[d("paused")]), "reconnecting", "nothing going out");
         assert_eq!(overall(true, &[d("live"), d("live")]), "live");
         assert_eq!(overall(true, &[d("live"), d("reconnecting")]), "reconnecting");
         assert_eq!(overall(true, &[]), "reconnecting", "wanted but nowhere to send it");

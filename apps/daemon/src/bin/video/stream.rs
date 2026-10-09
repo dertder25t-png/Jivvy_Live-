@@ -2,7 +2,7 @@
 //! copies of the program's encoded packets. RTMP/RTMPS here (see `jivvy_daemon::stream`);
 //! YouTube's HLS segment upload in `hls.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,9 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+use jivvy_daemon::bandwidth::{self, Manager, Quality, Report, Tier};
 use jivvy_daemon::log;
+use jivvy_daemon::program::ProgramConfig;
 use jivvy_daemon::stream::{
     self, Delivery, DeliveryTracker, Destination, DestinationStatus, QUEUE_PACKETS, RtmpStats, StreamConfig,
     reconnect_delay,
@@ -29,12 +31,14 @@ pub enum Packet {
 
 struct Subscriber {
     id: u64,
+    /// Which quality's video it takes (audio is the same for all).
+    tier: Tier,
     tx: SyncSender<Packet>,
     overflowed: Arc<AtomicBool>,
 }
 
-/// Hands the program's encoded packets to every connected destination without ever
-/// blocking the program: a destination that can't keep up is marked and dropped.
+/// Hands encoded packets to every connected destination without ever blocking the
+/// program: a destination that can't keep up is marked and dropped.
 #[derive(Default)]
 pub struct Taps {
     subscribers: Mutex<Vec<Subscriber>>,
@@ -42,26 +46,128 @@ pub struct Taps {
 }
 
 impl Taps {
+    /// From the program: its video for full-quality destinations, its audio for all.
     pub fn publish(&self, packet: Packet) {
+        let video = matches!(packet, Packet::Video(_));
+        self.send(|s| !video || s.tier == Tier::Full, packet);
+    }
+
+    /// Video from a lower-quality encode.
+    pub fn publish_tier(&self, tier: Tier, sample: gst::Sample) {
+        self.send(|s| s.tier == tier, Packet::Video(sample));
+    }
+
+    fn send(&self, to: impl Fn(&Subscriber) -> bool, packet: Packet) {
         let mut subs = self.subscribers.lock().unwrap();
-        subs.retain(|s| match s.tx.try_send(packet.clone()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                s.overflowed.store(true, Ordering::Relaxed);
-                false
+        subs.retain(|s| {
+            if !to(s) {
+                return true;
             }
-            Err(TrySendError::Disconnected(_)) => false,
+            match s.tx.try_send(packet.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    s.overflowed.store(true, Ordering::Relaxed);
+                    false
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
         });
     }
 
-    pub(crate) fn subscribe(self: &Arc<Self>) -> Subscription {
+    /// The qualities destinations are taking right now.
+    pub fn tiers_used(&self) -> HashSet<Tier> {
+        self.subscribers.lock().unwrap().iter().map(|s| s.tier).collect()
+    }
+
+    pub(crate) fn subscribe(self: &Arc<Self>, tier: Tier) -> Subscription {
         let (tx, rx) = sync_channel(QUEUE_PACKETS);
         let overflowed = Arc::new(AtomicBool::new(false));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.subscribers.lock().unwrap().push(Subscriber { id, tx, overflowed: overflowed.clone() });
+        self.subscribers.lock().unwrap().push(Subscriber { id, tier, tx, overflowed: overflowed.clone() });
         Subscription { taps: self.clone(), id, rx, overflowed }
     }
 }
+
+/// Between the bandwidth manager and one destination's worker.
+pub(crate) struct Link {
+    /// What to send: a quality, or None (paused for bandwidth).
+    assigned: Mutex<Option<Quality>>,
+    /// The worker's latest measurements.
+    report: Mutex<(Report, Instant)>,
+}
+
+/// A report older than this (its worker is reconnecting) no longer counts.
+const REPORT_STALE: Duration = Duration::from_secs(10);
+
+impl Link {
+    fn new(id: &str, full: Quality) -> Link {
+        let report = (Report { id: id.into(), ..Report::default() }, Instant::now());
+        Link { assigned: Mutex::new(Some(full)), report: Mutex::new(report) }
+    }
+
+    /// The latest report, or an empty one if it's stale.
+    fn current(&self) -> Report {
+        let (r, at) = self.report.lock().unwrap().clone();
+        if at.elapsed() < REPORT_STALE { r } else { Report { id: r.id, ..Report::default() } }
+    }
+
+    fn congested(&self) -> bool {
+        self.report.lock().unwrap().0.congested
+    }
+
+    pub(crate) fn assigned(&self) -> Option<Quality> {
+        *self.assigned.lock().unwrap()
+    }
+
+    /// Called about once a second by the worker. Never call while holding `status`.
+    pub(crate) fn report(&self, sent_kbps: f64, congested: bool, capacity_kbps: Option<f64>) {
+        let mut r = self.report.lock().unwrap();
+        (r.0.sent_kbps, r.0.congested, r.0.capacity_kbps, r.1) = (sent_kbps, congested, capacity_kbps, Instant::now());
+    }
+
+    fn clear(&self) {
+        self.report(0.0, false, None);
+    }
+}
+
+/// What a connection carried while congested: the mean of its one-second rates since the
+/// congestion began (at most the last 10), so one second when the socket took nothing
+/// doesn't read as no upload at all, and the faster seconds before it don't count.
+#[derive(Default)]
+pub(crate) struct Average {
+    rates: std::collections::VecDeque<f64>,
+    congested: bool,
+}
+
+impl Average {
+    /// Adds this second's rate and returns what to report.
+    pub(crate) fn add(&mut self, kbps: f64, congested: bool) -> f64 {
+        if congested && !self.congested {
+            self.rates.clear();
+        }
+        self.congested = congested;
+        if !congested {
+            return kbps;
+        }
+        self.rates.push_back(kbps);
+        if self.rates.len() > 10 {
+            self.rates.pop_front();
+        }
+        self.rates.iter().sum::<f64>() / self.rates.len() as f64
+    }
+}
+
+/// What a destination shows while live at `quality`.
+pub(crate) fn lowered_detail(quality: &Quality) -> String {
+    if quality.tier == Tier::Full {
+        String::new()
+    } else {
+        format!("Lowered to {}: the internet upload is slow. It goes back up by itself.", quality.label())
+    }
+}
+
+pub(crate) const PAUSED_DETAIL: &str =
+    "Paused: the internet upload can't carry this platform as well. It resumes by itself.";
 
 pub(crate) struct Subscription {
     taps: Arc<Taps>,
@@ -80,45 +186,66 @@ struct Worker {
     destination: Destination,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<DestinationStatus>>,
+    link: Arc<Link>,
 }
 
-/// All destinations, kept in step with `stream.json`.
+/// All destinations, kept in step with `stream.json`, and the bandwidth manager fitting
+/// them into the upload.
 pub struct Streamer {
     workers: HashMap<String, Worker>,
     config: StreamConfig,
     problems: Vec<String>,
+    manager: Manager,
+    ladder: Vec<Quality>,
 }
 
 impl Streamer {
     pub fn new() -> Streamer {
-        Streamer { workers: HashMap::new(), config: StreamConfig::default(), problems: Vec::new() }
+        Streamer {
+            workers: HashMap::new(),
+            config: StreamConfig::default(),
+            problems: Vec::new(),
+            manager: Manager::new(Instant::now()),
+            ladder: Vec::new(),
+        }
     }
 
-    /// Re-reads `stream.json` and starts, restarts or stops destination workers to match.
-    /// Never blocks: old workers are told to stop and finish on their own threads.
-    pub fn reconcile(&mut self, dir: &std::path::Path, feed: &Arc<Feed>) {
+    /// The qualities on offer for the current program, best first.
+    pub fn ladder(&self) -> &[Quality] {
+        &self.ladder
+    }
+
+    /// Once a second: re-reads `stream.json`, starts, restarts or stops destination workers
+    /// to match, and lets the bandwidth manager set each one's quality. Never blocks: old
+    /// workers are told to stop and finish on their own threads.
+    pub fn reconcile(&mut self, dir: &std::path::Path, feed: &Arc<Feed>, program: &ProgramConfig) {
+        self.ladder = bandwidth::ladder(program);
         self.problems.clear();
         match stream::load_config(dir) {
             Ok(c) => self.config = c,
             Err(e) => self.problems.push(format!("{e}; keeping the last good destinations")),
         }
-        let mut wanted: HashMap<String, Destination> = HashMap::new();
+        let mut enabled: HashMap<String, Destination> = HashMap::new();
+        // Priority order: the first destination in stream.json is the main platform.
+        let mut order: Vec<String> = Vec::new();
         for d in self.config.destinations.iter().filter(|d| d.enabled) {
             match stream::validate(d) {
-                Ok(()) => {
-                    wanted.insert(d.id.clone(), d.clone());
+                Ok(()) if !enabled.contains_key(&d.id) => {
+                    enabled.insert(d.id.clone(), d.clone());
+                    order.push(d.id.clone());
                 }
+                Ok(()) => self.problems.push(format!("{}: another destination has the same id", d.id)),
                 Err(e) => self.problems.push(e),
             }
         }
         self.workers.retain(|id, w| {
-            let keep = wanted.get(id) == Some(&w.destination);
+            let keep = enabled.get(id) == Some(&w.destination);
             if !keep {
                 w.stop.store(true, Ordering::Relaxed);
             }
             keep
         });
-        for (id, d) in wanted {
+        for (id, d) in enabled {
             if self.workers.contains_key(&id) {
                 continue;
             }
@@ -131,15 +258,27 @@ impl Streamer {
                 detail: String::new(),
                 kbps: 0.0,
                 reconnects: 0,
+                quality: String::new(),
             }));
-            let (dest, f, s, st) = (d.clone(), feed.clone(), stop.clone(), status.clone());
+            let link = Arc::new(Link::new(&id, self.ladder[0]));
+            let (dest, f, s, st, l) = (d.clone(), feed.clone(), stop.clone(), status.clone(), link.clone());
             if d.is_hls() {
                 let dir = dir.to_path_buf();
-                std::thread::spawn(move || crate::hls::run(dest, f, s, st, dir));
+                std::thread::spawn(move || crate::hls::run(dest, f, s, st, l, dir));
             } else {
-                std::thread::spawn(move || run(dest, f, s, st));
+                std::thread::spawn(move || run(dest, f, s, st, l));
             }
-            self.workers.insert(id, Worker { destination: d, stop, status });
+            self.workers.insert(id, Worker { destination: d, stop, status, link });
+        }
+
+        let reports: Vec<Report> =
+            order.iter().filter_map(|id| self.workers.get(id)).map(|w| w.link.current()).collect();
+        let assignments = self.manager.update(&self.ladder, &order, &reports, wanted(feed), Instant::now());
+        for (id, a) in assignments {
+            if let Some(w) = self.workers.get(&id) {
+                let quality = a.and_then(|t| self.ladder.iter().find(|q| q.tier == t).copied());
+                *w.link.assigned.lock().unwrap() = quality;
+            }
         }
     }
 
@@ -152,6 +291,8 @@ impl Streamer {
             status: stream::overall(wanted, &destinations),
             destinations,
             problems: self.problems.clone(),
+            upload_kbps: self.manager.capacity_kbps(),
+            encodes: Vec::new(),
         }
     }
 }
@@ -168,25 +309,48 @@ pub(crate) fn set(status: &Mutex<DestinationStatus>, state: &'static str, detail
 
 /// One destination, for as long as it is configured: connect while the stream is wanted,
 /// reconnect after any failure, stop when it isn't wanted.
-fn run(dest: Destination, feed: Arc<Feed>, stop: Arc<AtomicBool>, status: Arc<Mutex<DestinationStatus>>) {
+fn run(
+    dest: Destination,
+    feed: Arc<Feed>,
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<DestinationStatus>>,
+    link: Arc<Link>,
+) {
     let mut attempt = 0u32;
     while !stop.load(Ordering::Relaxed) {
         if !wanted(&feed) {
             set(&status, "off", String::new(), 0.0);
+            status.lock().unwrap().quality.clear();
+            link.clear();
             attempt = 0;
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
+        let Some(quality) = link.assigned() else {
+            set(&status, "paused", PAUSED_DETAIL.into(), 0.0);
+            status.lock().unwrap().quality.clear();
+            link.clear();
+            attempt = 0;
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
         let state = if attempt == 0 { "connecting" } else { "reconnecting" };
         {
             // Keep the last error visible while retrying.
             let mut s = status.lock().unwrap();
             (s.state, s.kbps) = (state, 0.0);
         }
-        match session(&dest, &feed, &stop, &status) {
+        status.lock().unwrap().quality = quality.label();
+        match session(&dest, &feed, &stop, &status, &link, quality) {
             Ok(()) => attempt = 0,
             Err(e) => {
                 attempt += 1;
+                // A dead connection isn't congestion; but one that gave up while data was
+                // still moving and piling up (e.g. a write timing out on an overloaded link)
+                // is, and the manager needs that to step it down.
+                if !link.congested() {
+                    link.clear();
+                }
                 // The log keeps the technical reason (key removed); the screen gets plain words.
                 log(
                     "video",
@@ -253,19 +417,23 @@ fn rtmp_stats(sink: &gst::Element) -> RtmpStats {
     }
 }
 
-/// One connection, from the first keyframe until it fails (Err) or the stream is no longer
-/// wanted (Ok).
+/// One connection at one quality, from the first keyframe until it fails (Err), or the
+/// stream is no longer wanted or the bandwidth manager picks another quality (Ok).
 fn session(
     dest: &Destination,
     feed: &Arc<Feed>,
     stop: &AtomicBool,
     status: &Mutex<DestinationStatus>,
+    link: &Link,
+    quality: Quality,
 ) -> Result<(), String> {
-    let sub = feed.taps.subscribe();
-    // Start on a keyframe (the program sends one every 2 s), with audio from then on.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let sub = feed.taps.subscribe(quality.tier);
+    let still_wanted = || !stop.load(Ordering::Relaxed) && wanted(feed) && link.assigned() == Some(quality);
+    // Start on a keyframe (the program sends one every 2 s), with audio from then on. A
+    // lower quality's encode may need a few seconds to start.
+    let deadline = Instant::now() + Duration::from_secs(if quality.tier == Tier::Full { 5 } else { 10 });
     let first = loop {
-        if stop.load(Ordering::Relaxed) || !wanted(feed) {
+        if !still_wanted() {
             return Ok(());
         }
         match sub.rx.recv_timeout(Duration::from_millis(100)) {
@@ -285,7 +453,7 @@ fn session(
 
     let pipeline = gst::parse::launch(
         // The muxer's pads are named: the appsrcs get their caps only once packets arrive.
-        "flvmux name=mux streamable=true ! rtmp2sink name=out async-connect=true timeout=5 \
+        "flvmux name=mux streamable=true ! rtmp2sink name=out async-connect=true timeout=20 \
          appsrc name=v is-live=true format=time leaky-type=downstream max-time=3000000000 ! queue ! mux.video \
          appsrc name=a is-live=true format=time leaky-type=downstream max-time=3000000000 ! queue ! mux.audio",
     )
@@ -304,12 +472,24 @@ fn session(
     };
     pipeline.set_state(gst::State::Playing).map_err(|_| "the stream pipeline would not start")?;
 
+    // Bytes handed to the pipeline: what the socket hasn't taken yet is the backlog. The
+    // RTMP sink keeps whatever it can't send, so this is where a slow upload shows.
+    let pushed = std::cell::Cell::new(0u64);
     let push = |src: &gst_app::AppSrc, sample: &gst::Sample| {
         if let Some(b) = retimed(sample, base, gst::ClockTime::ZERO) {
+            pushed.set(pushed.get() + b.size() as u64);
             let _ = src.push_buffer(b);
         }
     };
     push(&vsrc, &first);
+    let mut last_pushed = 0u64;
+    // When the socket last took bytes: congestion needs data still moving (on an overloaded
+    // link it can take nothing for seconds at a time; a dead link takes nothing at all).
+    let mut last_moved: Option<Instant> = None;
+    // The backlog over the last few seconds, and what the socket took each second (the
+    // report averages it: on a stalling link single seconds are often 0).
+    let mut backlogs: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut sent = Average::default();
 
     let mut audio_caps_set = false;
     let mut last_video = running_time(&first).map(|(t, _)| t);
@@ -317,8 +497,10 @@ fn session(
     // the sink (those are accepted before the connection even exists).
     let mut tracker = DeliveryTracker::new(Instant::now());
     let (mut rate_bytes, mut last_rate_at) = (0u64, Instant::now());
+    let mut connected_at: Option<Instant> = None;
+    let mut backlog_base: Option<u64> = None;
     let result = loop {
-        if stop.load(Ordering::Relaxed) || !wanted(feed) {
+        if !still_wanted() {
             break Ok(());
         }
         if sub.overflowed.load(Ordering::Relaxed) {
@@ -370,11 +552,53 @@ fn session(
             let kbps = st.out_bytes.saturating_sub(rate_bytes) as f64 * 8.0
                 / 1000.0
                 / now.duration_since(last_rate_at).as_secs_f64();
+            // One second of this stream, in bytes, from what was really pushed (an encoder
+            // can send less than its nominal bitrate).
+            let pushed_now = pushed.get();
+            let push_rate = (pushed_now - last_pushed) as f64 / now.duration_since(last_rate_at).as_secs_f64();
+            let second = (push_rate as u64).max(16_000);
+            last_pushed = pushed_now;
             (rate_bytes, last_rate_at) = (st.out_bytes, now);
+            // Congested: video waiting for the network (the sink can't take it fast
+            // enough), or the server's confirmations falling behind. The backlog is
+            // counted from 3 s after connecting: before that, data queues normally, and the
+            // input drops what waits over 3 s (never sent, but counted as pushed).
+            if connected_at.is_none() && st.in_bytes > 0 {
+                connected_at = Some(now);
+            }
+            let settled = connected_at.is_some_and(|t| now.duration_since(t) > Duration::from_secs(3));
+            let raw_backlog = pushed.get().saturating_sub(st.out_bytes);
+            if settled && backlog_base.is_none() {
+                backlog_base = Some(raw_backlog);
+            }
+            let backlog = backlog_base.map_or(0, |b| raw_backlog.saturating_sub(b));
+            if backlog > 10 * second {
+                break Err("the connection couldn't keep up".into());
+            }
+            let behind = st.window > 0 && st.out_bytes.saturating_sub(st.acked) > 2 * st.window;
+            if kbps > 32.0 {
+                last_moved = Some(now);
+            }
+            // A connection that never sent anything is broken, not congested.
+            let moving = last_moved.is_some_and(|t| now.duration_since(t) < Duration::from_secs(10));
+            // Growing, not just above a level: a muxer holds a steady bit back (a tiny
+            // stream waits on its slow picture), and that's no reason to step down.
+            backlogs.push_back(backlog);
+            if backlogs.len() > 4 {
+                backlogs.pop_front();
+            }
+            let growing = backlogs.len() == 4 && backlog > backlogs[0] + second / 2;
+            let piling_up = backlog > second && growing;
+            let congested = settled && moving && (piling_up || behind);
+            link.report(sent.add(kbps, congested), congested, None);
             let mut s = status.lock().unwrap();
-            if delivery == Delivery::Live {
+            if delivery == Delivery::Live && piling_up {
+                // Connected, but the video goes out slower than it's made: viewers fall behind.
+                s.state = "reconnecting";
+                s.detail = "The internet upload is slower than the stream. Lowering the quality.".into();
+            } else if delivery == Delivery::Live {
                 s.state = "live";
-                s.detail.clear();
+                s.detail = lowered_detail(&quality);
             } else if s.state == "live" {
                 // Was live, now catching up (e.g. confirmations falling behind).
                 s.state = "reconnecting";

@@ -40,9 +40,15 @@ pub const CONFIRMED_LISTED: usize = 2;
 pub const BACKLOG_LIMIT: Duration = Duration::from_secs(60);
 /// Up to this much video waiting still counts as live (one segment being cut, one sending).
 pub const LIVE_BEHIND: Duration = Duration::from_secs(6);
-/// An upload that hasn't finished in this long has failed (a 2 s segment at 6 Mbps is
-/// 1.5 MB, so this is under 1 Mbps).
+/// A playlist upload that hasn't finished in this long has failed.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a segment gets to go up: three times its own length (at least 5 s). Slower
+/// than that, the connection can't carry this stream live, and a 2 s segment that takes
+/// longer is no use to viewers anyway.
+pub fn segment_timeout(duration_secs: f64) -> Duration {
+    Duration::from_secs_f64((duration_secs * 3.0).max(5.0))
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
@@ -50,6 +56,9 @@ pub struct Segment {
     pub name: String,
     /// Seconds.
     pub duration: f64,
+    /// The stream bitrate it was cut at (kbps; 0 if unknown).
+    #[serde(default)]
+    pub kbps: u32,
 }
 
 /// What still has to reach the server, and where the playlist is up to.
@@ -74,6 +83,11 @@ pub struct Queue {
     /// The server has accepted a playlist, so the numbers it listed are spoken for.
     #[serde(default)]
     pub playlist_accepted: bool,
+    /// Sequence numbers used up right after the first waiting segment by segments skipped
+    /// behind it (`skip_backlog`). Until it is confirmed or discarded, nothing after it is
+    /// listed; then the playlist starts after the gap.
+    #[serde(default)]
+    pub gap: u64,
     /// Where the last segment cut ends, in nanoseconds of stream time: the next segmenter
     /// run carries timestamps on from here.
     pub end_ns: u64,
@@ -133,11 +147,28 @@ impl Queue {
         if self.listed > 0 {
             self.listed -= 1;
             if self.playlist_accepted {
-                self.first_seq += self.confirmed.len() as u64 + 1;
+                self.first_seq += self.confirmed.len() as u64 + 1 + self.gap;
                 self.confirmed.clear();
             }
         }
+        self.gap = 0;
         true
+    }
+
+    /// Gives up on everything waiting behind the next segment (which may be on its way
+    /// up): after stepping down to a lower quality, a backlog at the old bitrate would
+    /// take far too long through the slow connection. Returns the skipped segments.
+    pub fn skip_backlog(&mut self) -> Vec<Segment> {
+        if self.waiting.len() <= 1 {
+            return Vec::new();
+        }
+        let skipped: Vec<Segment> = self.waiting.drain(1..).collect();
+        if self.playlist_accepted {
+            self.gap += self.listed.saturating_sub(1) as u64;
+        }
+        self.listed = self.listed.min(1);
+        self.skipped_secs += skipped.iter().map(|s| s.duration).sum::<f64>();
+        skipped
     }
 
     /// Adds a segment just cut, ending at `end_ns`. Returns segments skipped to keep the
@@ -162,7 +193,8 @@ impl Queue {
 
     /// The playlist to send before the next segment. Marks what it lists as listed.
     pub fn playlist(&mut self) -> String {
-        let n = self.waiting.len().min(OUTSTANDING);
+        // Numbers after the first waiting segment are used up: list nothing past it yet.
+        let n = self.waiting.len().min(if self.gap > 0 { 1 } else { OUTSTANDING });
         self.listed = self.listed.max(n);
         let listed: Vec<&Segment> = self.confirmed.iter().chain(self.waiting.iter().take(n)).collect();
         // Every segment, rounded, must fit the target duration, and it should never change.
@@ -196,6 +228,11 @@ impl Queue {
             self.confirmed.pop_front();
             self.first_seq += 1;
         }
+        if self.gap > 0 {
+            // A playlist lists consecutive numbers: start after the gap.
+            self.first_seq += self.confirmed.len() as u64 + self.gap;
+            (self.confirmed, self.gap) = (VecDeque::new(), 0);
+        }
         true
     }
 
@@ -226,6 +263,24 @@ pub enum Outcome {
     /// Anything else: network errors, 401 (key not accepted, maybe fixed in a moment),
     /// 5xx. Wait and retry.
     Retry(String),
+    /// Connected and sending, but the upload didn't finish within `REQUEST_TIMEOUT`: the
+    /// connection is too slow for this segment. Congestion, not a dead connection.
+    TooSlow,
+}
+
+/// A segment that didn't fit through the connection this many times in a row is skipped:
+/// the same bytes won't go faster. One cut at a higher bitrate than the destination now
+/// sends is skipped on its first failure: lower-quality segments are coming behind it.
+pub const TOO_SLOW_TRIES: u32 = 2;
+
+/// An upper bound on the upload speed after `bytes` didn't go up within `timeout`.
+pub fn too_slow_kbps(bytes: usize, timeout: Duration) -> f64 {
+    bytes as f64 * 8.0 / 1000.0 / timeout.as_secs_f64()
+}
+
+/// Whether a segment that didn't go up in time should be skipped rather than retried.
+pub fn give_up_too_slow(segment_kbps: u32, now_kbps: Option<u32>, tries: u32) -> bool {
+    tries >= TOO_SLOW_TRIES || now_kbps.is_some_and(|k| segment_kbps > k)
 }
 
 pub fn outcome(status: u16) -> Outcome {
@@ -257,7 +312,7 @@ mod tests {
     use super::*;
 
     fn seg(i: u32) -> Segment {
-        Segment { name: segment_name(7, i), duration: 2.0 }
+        Segment { name: segment_name(7, i), duration: 2.0, kbps: 6128 }
     }
 
     /// (sequence, name) pairs a playlist lists.
@@ -394,6 +449,39 @@ mod tests {
     }
 
     #[test]
+    fn stepping_down_skips_the_backlog_but_never_reuses_a_number() {
+        let mut q = Queue::new(1);
+        q.push(seg(0), 0);
+        q.playlist();
+        q.accept_playlist();
+        q.confirm("s7-00000.ts");
+        for i in 1..=6 {
+            q.push(seg(i), 0);
+        }
+        q.playlist(); // lists 1..=5 (sequence 1..=5); 1 is being uploaded
+        let skipped = q.skip_backlog();
+        assert_eq!(skipped.len(), 5);
+        assert_eq!(q.waiting.len(), 1);
+        q.push(seg(7), 0);
+        assert_eq!(
+            listed(&q.playlist()),
+            [(0, "s7-00000.ts".into()), (1, "s7-00001.ts".into())],
+            "nothing past the gap while 1 is on its way"
+        );
+        assert!(q.confirm("s7-00001.ts"));
+        assert_eq!(listed(&q.playlist()), [(6, "s7-00007.ts".into())], "2-5 were listed: used up");
+
+        // The same when the segment on its way is then rejected.
+        q.push(seg(8), 0);
+        q.push(seg(9), 0);
+        q.playlist(); // 7, 8, 9 as 6, 7, 8
+        q.skip_backlog();
+        assert!(q.discard("s7-00007.ts"));
+        q.push(seg(10), 0);
+        assert_eq!(listed(&q.playlist()), [(9, "s7-00010.ts".into())]);
+    }
+
+    #[test]
     fn before_any_playlist_is_accepted_numbering_starts_over_at_zero() {
         let mut q = Queue::new(1);
         q.push(seg(0), 0);
@@ -423,6 +511,18 @@ mod tests {
         assert!(matches!(outcome(400), Outcome::Unusable(_)));
         assert!(matches!(outcome(401), Outcome::Retry(e) if e.contains("401")));
         assert!(matches!(outcome(500), Outcome::Retry(_)));
+    }
+
+    #[test]
+    fn a_segment_that_cant_go_up_in_time_bounds_the_speed_and_is_skipped_when_its_bitrate_is_gone() {
+        // A 2 s segment gets 6 s; at 6 Mbps (1.5 MB) not up by then means under 2 Mbps.
+        assert_eq!(segment_timeout(2.0), Duration::from_secs(6));
+        assert_eq!(segment_timeout(0.5), Duration::from_secs(5));
+        assert_eq!(too_slow_kbps(1_500_000, segment_timeout(2.0)).round(), 2000.0);
+        assert!(!give_up_too_slow(6128, Some(6128), 1), "same quality: one more try");
+        assert!(give_up_too_slow(6128, Some(6128), 2));
+        assert!(give_up_too_slow(6128, Some(628), 1), "stepped down since: skip it now");
+        assert!(!give_up_too_slow(6128, None, 1), "paused: the pause skips it");
     }
 
     #[test]

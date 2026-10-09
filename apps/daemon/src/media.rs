@@ -119,9 +119,12 @@ pub struct MediaConfig {
     pub camera: Selection,
     #[serde(default)]
     pub microphone: Selection,
-    /// Program feed settings (resolution, frame rate, bitrate, encoder).
+    /// Program feed settings (resolution, frame rate, bitrate, encoder, picture path).
     #[serde(default)]
     pub program: crate::program::ProgramConfig,
+    /// Which program settings the file sets itself (they override the hardware check).
+    #[serde(skip)]
+    pub program_set: crate::program::ProgramSet,
 }
 
 /// Environment variable for test sources, the same as `--test-sources`: `JIVVY_TEST_SOURCES=1`.
@@ -142,10 +145,14 @@ pub fn load_config(dir: &Path) -> Result<MediaConfig, String> {
         }
         Err(e) => return Err(format!("can't read {CONFIG_FILE}: {e}")),
     };
-    let c: MediaConfig = serde_json::from_slice(&bytes).map_err(|e| format!("{CONFIG_FILE} is not valid: {e}"))?;
+    let raw: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{CONFIG_FILE} is not valid: {e}"))?;
+    let mut c: MediaConfig =
+        serde_json::from_value(raw.clone()).map_err(|e| format!("{CONFIG_FILE} is not valid: {e}"))?;
     if c.version != CONFIG_VERSION {
         return Err(format!("{CONFIG_FILE} has version {}, expected {CONFIG_VERSION}", c.version));
     }
+    c.program_set = crate::program::ProgramSet::of(raw.get("program"));
     Ok(c)
 }
 
@@ -299,6 +306,8 @@ pub struct Status {
     pub program: crate::program::ProgramStatus,
     pub stream: crate::stream::StreamStatus,
     pub problems: Vec<String>,
+    /// The hardware check's choice in plain words (`hardware.json`), empty before any check.
+    pub hardware: String,
 }
 
 #[cfg(test)]
@@ -511,6 +520,11 @@ mod tests {
             (c.camera, c.microphone),
             (Selection::Device { id: "p".into(), name: "Cam".into() }, Selection::Test)
         );
+        assert_eq!(c.program_set, crate::program::ProgramSet::default(), "nothing set: the check decides");
+        std::fs::write(dir.join(CONFIG_FILE), r#"{"version":1,"program":{"height":1080,"path":"gpu"}}"#).unwrap();
+        let c = load_config(&dir).unwrap();
+        assert_eq!(c.program_set, crate::program::ProgramSet { size: true, fps: false, bitrate: false });
+        assert_eq!(c.program.path, crate::program::PicturePath::Gpu);
         std::fs::write(dir.join(CONFIG_FILE), r#"{"version":1,"camera":{"use":"projector"}}"#).unwrap();
         assert!(load_config(&dir).is_err());
     }

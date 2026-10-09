@@ -43,7 +43,22 @@ struct Daemon {
     video_starts: Receiver<u32>,
     addr: String,
     data_dir: TestDir,
+    /// Held while the daemon runs (see `QUIET`).
+    _quiet: Option<Quiet>,
 }
+
+/// A daemon's hold on `QUIET`: shared without video; exclusive for a video daemon that runs
+/// the hardware check itself (no report given to it).
+#[allow(dead_code)] // held, never read
+enum Quiet {
+    Shared(std::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(std::sync::RwLockWriteGuard<'static, ()>),
+}
+
+/// The hardware check runs every encoder flat out. It takes this exclusively, and daemons
+/// without video share it, so it never starves a test that times restores, and it measures
+/// a quiet machine. (Video daemons are kept apart from it by `VideoSlot`.)
+static QUIET: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -184,7 +199,7 @@ fn start_with_env(
     extra: &[&str],
     envs: &[(&str, &str)],
 ) -> Daemon {
-    start_at(free_port(), data_dir, &DaemonArgs { slides, headless_outputs, extra, envs })
+    start_at(free_port(), data_dir, &DaemonArgs { slides, headless_outputs, extra, envs, seed_hardware: true })
 }
 
 struct DaemonArgs<'a> {
@@ -192,13 +207,29 @@ struct DaemonArgs<'a> {
     headless_outputs: bool,
     extra: &'a [&'a str],
     envs: &'a [(&'a str, &'a str)],
+    /// Give a video daemon this test run's hardware check report (see `video::seed_hardware`),
+    /// so it doesn't measure the machine again at start.
+    #[cfg_attr(not(feature = "video"), allow(dead_code))] // only read by the video tests
+    seed_hardware: bool,
 }
 
 /// Starts the daemon on `port`. If that port is taken by the time the engine binds it, the
 /// daemon is stopped and started again on a fresh port (up to 5 tries).
 fn start_at(mut port: u16, data_dir: TestDir, args: &DaemonArgs) -> Daemon {
     end_children_with_this_process();
-    let video_slot = (!args.extra.contains(&"--no-video")).then(VideoSlot::take);
+    #[cfg(feature = "video")]
+    if args.seed_hardware && args.extra.contains(&"--video") {
+        video::seed_hardware(&data_dir); // before taking a video slot: the check takes one
+    }
+    let video = !args.extra.contains(&"--no-video");
+    let quiet = if !video {
+        Some(Quiet::Shared(QUIET.read().unwrap_or_else(|p| p.into_inner())))
+    } else if !args.seed_hardware {
+        Some(Quiet::Exclusive(QUIET.write().unwrap_or_else(|p| p.into_inner())))
+    } else {
+        None
+    };
+    let video_slot = video.then(VideoSlot::take);
     for attempt in 1..=5 {
         let addr = format!("127.0.0.1:{port}");
         let (mut watchdog, [engine_starts, outputs_starts, video_starts]) = spawn_watchdog(&data_dir, &addr, args);
@@ -211,6 +242,7 @@ fn start_at(mut port: u16, data_dir: TestDir, args: &DaemonArgs) -> Daemon {
                 video_starts,
                 addr,
                 data_dir,
+                _quiet: quiet,
             };
         }
         println!("attempt {attempt}: port {port} was taken; starting again on another");
@@ -328,22 +360,33 @@ impl Daemon {
     }
 
     /// Sends one command, retrying the connection until the engine answers or time runs out.
+    /// Once the command is written, waits for that command's answer instead of sending it
+    /// again: commands aren't idempotent (a resent `slide.next` moves two slides), and a busy
+    /// engine can be slow to answer. Only a connection that fails or drops before answering
+    /// (no engine yet, or it died) is retried.
     fn send(&self, command: Value, within: Duration) -> Value {
         let deadline = Instant::now() + within;
         let msg = format!("{}\n", json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }));
         loop {
-            let attempt = (|| -> std::io::Result<Value> {
-                let mut s = TcpStream::connect(&self.addr)?;
-                s.set_read_timeout(Some(Duration::from_millis(500)))?;
-                s.write_all(msg.as_bytes())?;
+            // Err((taken, error)): `taken` means the engine has the command; never resend it.
+            let attempt = (|| -> Result<Value, (bool, std::io::Error)> {
+                let mut s = TcpStream::connect(&self.addr).map_err(|e| (false, e))?;
+                s.write_all(msg.as_bytes()).map_err(|e| (false, e))?;
+                let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+                s.set_read_timeout(Some(left)).map_err(|e| (true, e))?;
                 let mut line = String::new();
-                BufReader::new(s).read_line(&mut line)?;
-                serde_json::from_str(&line).map_err(std::io::Error::other)
+                match BufReader::new(s).read_line(&mut line) {
+                    Ok(0) => Err((false, std::io::ErrorKind::UnexpectedEof.into())),
+                    Ok(_) => serde_json::from_str(&line).map_err(|e| (true, std::io::Error::other(e))),
+                    Err(e) if is_timeout(&e) => Err((true, e)),
+                    Err(e) => Err((false, e)),
+                }
             })();
             match attempt {
                 Ok(v) => return v,
-                Err(e) if Instant::now() >= deadline => panic!("engine did not answer in time: {e}"),
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                Err((true, e)) => panic!("engine took the command but did not answer in time: {e}"),
+                Err((false, e)) if Instant::now() >= deadline => panic!("engine did not answer in time: {e}"),
+                Err((false, _)) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
     }
@@ -467,7 +510,8 @@ fn a_daemon_whose_port_is_taken_starts_again_on_another() {
     let port = free_port();
     assert!((20_000..32_768).contains(&port), "test ports stay below the ephemeral range: {port}");
     let _taken = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    let args = DaemonArgs { slides: 5, headless_outputs: false, extra: &["--no-video"], envs: &[] };
+    let args =
+        DaemonArgs { slides: 5, headless_outputs: false, extra: &["--no-video"], envs: &[], seed_hardware: false };
     let d = start_at(port, test_dir("port-taken"), &args);
     assert_ne!(d.addr, format!("127.0.0.1:{port}"), "started again on another port");
     let r = d.send(json!({ "type": "slide.goto", "index": 2 }), Duration::from_secs(5));
@@ -583,24 +627,40 @@ fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
     let deadline = Instant::now() + within;
     let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
     loop {
-        let attempt = (|| -> Result<Value, String> {
-            let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
-            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
-            let req = format!("ws://{addr}/").into_client_request().map_err(|e| e.to_string())?;
-            let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| e.to_string())?;
-            ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| e.to_string())?;
+        // Err((taken, error)): once sent, the command is never sent again, as in `Daemon::send`.
+        let attempt = (|| -> Result<Value, (bool, String)> {
+            let not_taken = |e: &dyn std::fmt::Display| (false, e.to_string());
+            let stream = TcpStream::connect(addr).map_err(|e| not_taken(&e))?;
+            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| not_taken(&e))?;
+            let req = format!("ws://{addr}/").into_client_request().map_err(|e| not_taken(&e))?;
+            let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| not_taken(&e))?;
+            ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| not_taken(&e))?;
+            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            ws.get_ref().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
             loop {
-                if let tungstenite::Message::Text(t) = ws.read().map_err(|e| e.to_string())? {
-                    return serde_json::from_str(&t).map_err(|e| e.to_string());
+                match ws.read() {
+                    Ok(tungstenite::Message::Text(t)) => {
+                        return serde_json::from_str(&t).map_err(|e| (true, e.to_string()));
+                    }
+                    Ok(_) => continue,
+                    Err(tungstenite::Error::Io(e)) if is_timeout(&e) => return Err((true, e.to_string())),
+                    Err(e) => return Err(not_taken(&e)),
                 }
             }
         })();
         match attempt {
             Ok(v) => return v,
-            Err(e) if Instant::now() >= deadline => panic!("engine did not answer over WebSocket in time: {e}"),
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            Err((true, e)) => panic!("engine took the command over WebSocket but did not answer in time: {e}"),
+            Err((false, e)) if Instant::now() >= deadline => {
+                panic!("engine did not answer over WebSocket in time: {e}")
+            }
+            Err((false, _)) => std::thread::sleep(Duration::from_millis(20)),
         }
     }
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 /// Runs `packages/protocol/fixtures/scenarios.json` against the real daemon, over its TCP
@@ -795,6 +855,31 @@ mod video {
         }
     }
 
+    /// This test run's hardware check, measured once for real (no hooks narrowing it, holding
+    /// a video slot so nothing else competes): the report, and whether a setting kept up.
+    fn shared_hardware_check() -> &'static (Vec<u8>, bool) {
+        static CHECK: std::sync::OnceLock<(Vec<u8>, bool)> = std::sync::OnceLock::new();
+        CHECK.get_or_init(|| {
+            let _quiet = QUIET.write().unwrap_or_else(|p| p.into_inner());
+            let _slot = VideoSlot::take();
+            let dir = test_dir("hardware-check");
+            let status = Command::new(env!("CARGO_BIN_EXE_jivvy-video"))
+                .args(["--hardware-check", "--data-dir", dir.to_str().unwrap()])
+                .env_remove("JIVVY_TEST_NO_GPU")
+                .env_remove("JIVVY_TEST_ENCODER")
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            (std::fs::read(dir.join("hardware.json")).expect("the check saved its report"), status.success())
+        })
+    }
+
+    /// Gives a video daemon this run's hardware check report, so the program runs on what was
+    /// measured here and the daemon doesn't measure again at start.
+    pub(super) fn seed_hardware(dir: &std::path::Path) {
+        std::fs::write(dir.join("hardware.json"), &shared_hardware_check().0).unwrap();
+    }
+
     fn start_video(name: &str, media_json: &str) -> Daemon {
         let dir = test_dir(name);
         std::fs::write(dir.join("media.json"), media_json).unwrap();
@@ -853,19 +938,13 @@ mod video {
 
     #[test]
     fn the_hardware_check_picks_a_setting_that_really_keeps_up_and_says_why() {
-        let _slot = VideoSlot::take(); // it runs the encoders flat out
-        let dir = test_dir("hardware-check");
-        let out = Command::new(env!("CARGO_BIN_EXE_jivvy-video"))
-            .args(["--hardware-check", "--data-dir", dir.to_str().unwrap()])
-            // Measured for real: none of the hooks that narrow what is tried. On CI's Windows
-            // runners (no GPU) the D3D12 path is installed but slow, and must lose.
-            .env_remove("JIVVY_TEST_NO_GPU")
-            .env_remove("JIVVY_TEST_ENCODER")
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&std::fs::read(dir.join("hardware.json")).unwrap()).unwrap();
+        // Measured for real: none of the hooks that narrow what is tried. On CI's Windows
+        // runners (no GPU) the D3D12 path is installed but slow, and must lose.
+        let (bytes, kept_up) = shared_hardware_check();
+        let report: Value = serde_json::from_slice(bytes).unwrap();
         println!("{}", report["reason"]);
-        assert!(out.status.success(), "nothing kept up on this machine: {}", report["reason"]);
+        println!("{}", serde_json::to_string(&report["trials"]).unwrap());
+        assert!(*kept_up, "nothing kept up on this machine: {}", report["reason"]);
         let chosen = &report["chosen"];
         let trials = report["trials"].as_array().unwrap();
         let same = |t: &&Value| ["path", "encoder", "width", "height", "fps"].iter().all(|k| t[*k] == chosen[*k]);
@@ -877,6 +956,38 @@ mod video {
             assert!(t["capacityFps"].as_f64().unwrap_or(0.0) < 1.5 * t["fps"].as_f64().unwrap(), "{t}");
         }
         assert!(report["reason"].as_str().unwrap().starts_with("Using "), "{}", report["reason"]);
+    }
+
+    #[test]
+    fn on_first_start_the_check_runs_before_video_and_the_program_uses_its_choice() {
+        let dir = test_dir("first-start");
+        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
+            .unwrap();
+        let video_args = ["--video", env!("CARGO_BIN_EXE_jivvy-video")];
+        // No report yet: the watchdog runs the full check (no hooks) before starting video.
+        let envs = [("JIVVY_TEST_NO_GPU", ""), ("JIVVY_TEST_ENCODER", "")];
+        let args =
+            DaemonArgs { slides: 10, headless_outputs: false, extra: &video_args, envs: &envs, seed_hardware: false };
+        let d = start_at(free_port(), dir, &args);
+        // Slides don't wait for the check.
+        d.next_engine_pid(Duration::from_secs(10));
+        assert_eq!(d.send(json!({ "type": "slide.goto", "index": 2 }), Duration::from_secs(5))["ok"], true);
+
+        let video = d.video_starts.recv_timeout(Duration::from_secs(300)).expect("video started after the check");
+        let report: Value = serde_json::from_slice(&std::fs::read(d.data_dir.join("hardware.json")).unwrap())
+            .expect("video started only once the check had saved its report");
+        let chosen = report["chosen"].clone();
+        assert!(chosen.is_object(), "a setting kept up: {}", report["reason"]);
+        let s = d.media_status(Duration::from_secs(20), "program running on the check's choice", |s| {
+            program(s)["state"] == "running"
+                && program(s)["encoder"] == chosen["encoder"]
+                && program(s)["path"] == chosen["path"]
+        });
+        assert_eq!((&program(&s)["width"], &program(&s)["height"]), (&chosen["width"], &chosen["height"]));
+        assert_eq!(s["hardware"], report["reason"], "the System screen sees why");
+        // Restarted mid-service, video comes straight back: the check never runs again.
+        kill_hard(video);
+        d.video_starts.recv_timeout(RESTORE_TARGET).expect("video restarted without a new check");
     }
 
     #[test]
@@ -907,10 +1018,13 @@ mod video {
     #[test]
     fn the_program_runs_at_full_rate_with_lyrics_that_follow_the_slide() {
         let d = start_video("program-lyrics", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
-        let s = d.media_status(Duration::from_secs(15), "program running at full rate", |s| {
-            program(s)["state"] == "running" && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        // Full rate and real video together: an encoder's bitrate can still be ramping up in the
+        // first second after the frame rate gets there (Media Foundation on CI's runners).
+        let s = d.media_status(Duration::from_secs(15), "program at full rate, encoding real video", |s| {
+            program(s)["state"] == "running"
+                && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+                && program(s)["kbps"].as_f64().unwrap_or(0.0) > 100.0
         });
-        assert!(program(&s)["kbps"].as_f64().unwrap() > 100.0, "encoding real video: {s}");
         assert_eq!(program(&s)["slate"], false);
 
         d.send(json!({ "type": "slide.goto", "index": 6 }), Duration::from_secs(5));
@@ -961,7 +1075,11 @@ mod video {
 
     #[test]
     fn changing_the_program_size_mid_run_comes_back_clean_at_the_new_size() {
-        let d = start_video("program-resize", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
+        // Starts at 1080p whatever the hardware check chose: that's the size it changes from.
+        let d = start_video(
+            "program-resize",
+            r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"},"program":{"width":1920,"height":1080}}"#,
+        );
         d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
         let s = d.media_status(Duration::from_secs(15), "running at 1080p", |s| {
             program(s)["state"] == "running"

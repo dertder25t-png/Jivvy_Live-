@@ -12,7 +12,7 @@ use gstreamer::prelude::*;
 
 use jivvy_daemon::hardware::{self, Path, QUALITIES, Report, Trial};
 use jivvy_daemon::lyrics;
-use jivvy_daemon::program::{EncoderChoice, ProgramConfig, encoder_order};
+use jivvy_daemon::program::{EncoderChoice, PicturePath, ProgramConfig, bitrate_for, encoder_order};
 use jivvy_daemon::{log, now_ms, write_atomic};
 
 use crate::program::{encoder_description, to_composition};
@@ -88,17 +88,15 @@ pub fn run(data_dir: &FsPath, only_encoder: Option<EncoderChoice>, font: &[u8]) 
 /// encoder as fast as they go, and counts what comes out.
 fn measure(path: Path, encoder: EncoderChoice, width: u32, height: u32, fps: u32, font: &[u8]) -> Trial {
     let mut trial = Trial { path, encoder, width, height, fps, capacity_fps: None, detail: String::new() };
-    // The bitrate the program would use at this size.
-    let pixels = (width * height) as f64 / (1920.0 * 1080.0);
-    let base = ProgramConfig::default();
+    let gpu = path == Path::Gpu;
     let cfg = ProgramConfig {
         width,
         height,
         fps,
-        bitrate_kbps: ((base.bitrate_kbps as f64 * pixels) as u32).max(800),
+        bitrate_kbps: bitrate_for(width, height), // what the program would use at this size
         encoder,
+        path: if gpu { PicturePath::Gpu } else { PicturePath::Cpu },
     };
-    let gpu = path == Path::Gpu;
     let overlay = if gpu {
         "d3d12upload ! overlaycomposition name=lyrics ! d3d12overlaycompositor"
     } else {

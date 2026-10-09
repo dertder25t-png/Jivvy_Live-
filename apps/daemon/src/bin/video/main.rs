@@ -36,6 +36,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use jivvy_daemon::client::{self, LevelsSender, Update};
+use jivvy_daemon::hardware;
 use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, RawDevice, Status};
 use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, EncoderChoice, ProgramConfig};
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
@@ -330,6 +331,8 @@ struct Video {
     config: media::MediaConfig,
     // Auto pins and ambiguous names survive restarts, so a restart never switches cameras.
     memory: Memory,
+    /// The hardware check's report (`hardware.json`), read at start.
+    hardware: Option<hardware::Report>,
     problems: Vec<String>,
     last_peak: Vec<f64>,
     last_written: Vec<u8>,
@@ -390,7 +393,9 @@ impl Video {
         }
         // A new program size or encoder rebuilds the program, and the camera with it
         // (it captures at the program size).
-        let program_cfg = self.config.program.sanitized();
+        // media.json's own settings win; the hardware check fills in the rest.
+        let chosen = self.hardware.as_ref().and_then(|r| r.chosen);
+        let program_cfg = hardware::resolve(&self.config.program, self.config.program_set, chosen).sanitized();
         let resized = self
             .program
             .as_ref()
@@ -471,6 +476,7 @@ impl Video {
             program: self.program.as_ref().map(|p| p.status()).unwrap_or_default(),
             stream,
             problems: self.problems.clone(),
+            hardware: self.hardware.as_ref().map(|r| r.reason.clone()).unwrap_or_default(),
         };
         if let Ok(bytes) = serde_json::to_vec_pretty(&status)
             && bytes != self.last_written
@@ -496,6 +502,10 @@ fn main() {
     if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
         fail(&format!("data dir {}: {e}", args.data_dir.display()));
     }
+    // First, so a hardware check started by the watchdog never outlives it either.
+    if args.supervised {
+        exit_when_orphaned("video");
+    }
     if args.hardware_check {
         let font = jivvy_daemon::lyrics::load_font(None).unwrap_or_else(|e| fail(&format!("lyric layer: {e}")));
         let (report, saved) = hwcheck::run(&args.data_dir, args.test_encoder, &font);
@@ -504,9 +514,6 @@ fn main() {
             fail(&format!("hardware check: {e}")); // exits 2: the check isn't done until it's saved
         }
         std::process::exit(if report.chosen.is_some() { 0 } else { 1 });
-    }
-    if args.supervised {
-        exit_when_orphaned("video");
     }
     if args.test_sources {
         log("video", "test sources: every camera and microphone is a test pattern or tone");
@@ -535,6 +542,11 @@ fn main() {
         });
     }
     let memory = Memory::load(&args.data_dir);
+    let hardware = hardware::load(&args.data_dir);
+    match &hardware {
+        Some(r) => log("video", format!("hardware check: {}", r.reason)),
+        None => log("video", "no hardware check yet; using media.json and the installed plugins"),
+    }
     let mut video = Video {
         args,
         levels,
@@ -549,6 +561,7 @@ fn main() {
         devices: Vec::new(),
         config: media::MediaConfig::default(),
         memory,
+        hardware,
         problems: Vec::new(),
         last_peak: Vec::new(),
         last_written: Vec::new(),

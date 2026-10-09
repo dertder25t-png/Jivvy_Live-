@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::program::EncoderChoice;
+use crate::program::{EncoderChoice, PicturePath, ProgramConfig, ProgramSet, bitrate_for};
 
 pub const REPORT_FILE: &str = "hardware.json";
 pub const REPORT_VERSION: u32 = 1;
@@ -93,6 +93,42 @@ pub fn choose(trials: &[Trial], order: &[(Path, EncoderChoice)]) -> Option<Chose
                 .then_some(Chosen { path, encoder, width, height, fps })
         })
     })
+}
+
+/// Reads `hardware.json`; missing, unreadable or from another version means no check yet.
+pub fn load(dir: &std::path::Path) -> Option<Report> {
+    let r: Report = serde_json::from_slice(&std::fs::read(dir.join(REPORT_FILE)).ok()?).ok()?;
+    (r.version == REPORT_VERSION).then_some(r)
+}
+
+/// The program settings to run with: whatever `media.json` sets itself (the tech lead's
+/// override), and the hardware check's choice for the rest. Encoder and path follow the check
+/// when they're `auto`; size and frame rate when `media.json` leaves them out, with the
+/// bitrate scaled to the size unless that's set too. With no check yet, `media.json` as is.
+pub fn resolve(cfg: &ProgramConfig, set: ProgramSet, chosen: Option<Chosen>) -> ProgramConfig {
+    let Some(c) = chosen else { return cfg.clone() };
+    let mut r = cfg.clone();
+    if r.encoder == EncoderChoice::Auto {
+        r.encoder = c.encoder;
+    }
+    if r.path == PicturePath::Auto {
+        r.path = match c.path {
+            Path::Gpu => PicturePath::Gpu,
+            Path::Cpu => PicturePath::Cpu,
+        };
+    }
+    if !set.size {
+        (r.width, r.height) = (c.width, c.height);
+    }
+    if !set.fps {
+        r.fps = c.fps;
+    }
+    if !set.bitrate {
+        // For the size the program will really use: a typo in media.json is clamped first.
+        let size = r.sanitized();
+        r.bitrate_kbps = bitrate_for(size.width, size.height);
+    }
+    r
 }
 
 fn path_words(p: Path) -> &'static str {
@@ -227,6 +263,32 @@ mod tests {
         let trials = [gpu, trial(Path::Cpu, X264, 0, Some(60.0))];
         let c = choose(&trials, &order);
         assert!(reason(&trials, c).contains("didn't work: no D3D12 device"));
+    }
+
+    #[test]
+    fn the_check_fills_in_what_media_json_leaves_out_and_the_tech_lead_wins() {
+        let chosen = Some(Chosen { path: Path::Cpu, encoder: X264, width: 1280, height: 720, fps: 30 });
+        let defaults = ProgramConfig::default();
+
+        let r = resolve(&defaults, ProgramSet::default(), chosen);
+        assert_eq!((r.path, r.encoder, r.width, r.height, r.fps), (PicturePath::Cpu, X264, 1280, 720, 30));
+        assert_eq!(r.bitrate_kbps, 2666, "the 1080p bitrate scaled to 720p");
+
+        // The tech lead asked for 1080p on the graphics chip with Media Foundation: kept.
+        let mine =
+            ProgramConfig { path: PicturePath::Gpu, encoder: Mf, bitrate_kbps: 5000, ..ProgramConfig::default() };
+        let set = ProgramSet { size: true, fps: false, bitrate: true };
+        let r = resolve(&mine, set, chosen);
+        assert_eq!((r.path, r.encoder, r.width, r.height, r.bitrate_kbps), (PicturePath::Gpu, Mf, 1920, 1080, 5000));
+
+        // No check yet: media.json as it is.
+        assert_eq!(resolve(&defaults, ProgramSet::default(), None), defaults);
+
+        // A typo'd size with no bitrate: no overflow, and the bitrate is for the clamped size.
+        let typo = ProgramConfig { width: 100_000, height: 100_000, ..ProgramConfig::default() };
+        let set = ProgramSet { size: true, fps: false, bitrate: false };
+        let r = resolve(&typo, set, chosen);
+        assert_eq!(r.bitrate_kbps, bitrate_for(3840, 2160), "{r:?}");
     }
 
     #[test]

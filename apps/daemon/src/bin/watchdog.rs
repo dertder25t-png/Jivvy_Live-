@@ -6,16 +6,59 @@
 //!
 //! `--data-dir` and `--listen` go to every child (the others connect to the engine there).
 //! `jivvy-video` is skipped when it isn't installed (builds without the `video` feature).
+//! The first time video runs on a machine (no `hardware.json` yet), the hardware check runs
+//! before it, while the engine and outputs are already up (see `first_hardware_check`).
 //! Anything else it doesn't recognise is passed through to the engine.
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use jivvy_daemon::watchdog::{ChildSpec, run};
+use jivvy_daemon::hardware;
+use jivvy_daemon::watchdog::{ChildSpec, run, supervise};
+
+/// A first hardware check that hasn't finished by now is stopped, and video starts anyway.
+const HARDWARE_CHECK_LIMIT: Duration = Duration::from_secs(300);
 
 fn sibling(name: &str) -> PathBuf {
     let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&exe_name))).unwrap_or(exe_name.into())
+}
+
+/// Setup: the first time video runs on this machine (no `hardware.json` yet), measure the
+/// machine so the program starts on a picture path, encoder and quality that keep up. Slides
+/// and outputs are already running; only video waits. It runs only while there's no report, so
+/// a restart mid-service is never delayed; checking again later is a pre-flight action.
+fn first_hardware_check(video: &Path, data_dir: &Path) {
+    if hardware::load(data_dir).is_some() {
+        return;
+    }
+    println!("hardware-check started");
+    let started = Instant::now();
+    // Supervised: it holds our stdin pipe and exits when we do, so a restarted watchdog never
+    // finds an old check still running (two checks would slow each other and race to save).
+    let child = Command::new(video)
+        .args(["--hardware-check", "--supervised", "--data-dir"])
+        .arg(data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null()) // the report goes to hardware.json; the log to our stderr
+        .spawn();
+    let result = match child {
+        Err(e) => format!("could not start ({e})"),
+        Ok(mut c) => loop {
+            match c.try_wait() {
+                Ok(Some(status)) => break format!("{status}"),
+                Ok(None) if started.elapsed() > HARDWARE_CHECK_LIMIT => {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    break format!("stopped after {} s", HARDWARE_CHECK_LIMIT.as_secs());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => break format!("wait failed ({e})"),
+            }
+        },
+    };
+    println!("hardware-check finished secs={} result={result}", started.elapsed().as_secs());
 }
 
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -70,6 +113,12 @@ fn main() {
         // Creating the first WebView can take a few seconds on a slow laptop.
         children.push(ChildSpec { name: "outputs", exe, args, hang_timeout, startup_grace: Duration::from_secs(10) });
     }
+    let data_dir = shared
+        .iter()
+        .position(|a| a == "--data-dir")
+        .and_then(|i| shared.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(jivvy_daemon::default_data_dir);
     match video {
         Some(exe) if exe.exists() => {
             let mut args = [shared, vec!["--connect".into(), listen]].concat();
@@ -79,7 +128,11 @@ fn main() {
             // Start-up loads GStreamer's GPU, encoder and device plugins: about 5 s normally,
             // much longer on a busy machine (e.g. Windows Update at boot). Killing it for a
             // slow start would mean it never starts, so the first heartbeat gets 30 s.
-            children.push(ChildSpec { name: "video", exe, args, hang_timeout, startup_grace: Duration::from_secs(30) });
+            let spec = ChildSpec { name: "video", exe, args, hang_timeout, startup_grace: Duration::from_secs(30) };
+            std::thread::spawn(move || {
+                first_hardware_check(&spec.exe, &data_dir);
+                supervise(spec)
+            });
         }
         Some(exe) => {
             jivvy_daemon::log("watchdog", format!("{} not installed; running without camera and audio", exe.display()))

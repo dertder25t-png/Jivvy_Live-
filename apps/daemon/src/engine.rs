@@ -363,7 +363,9 @@ fn serve_ws_connection(stream: TcpStream, engine: &Mutex<Engine>, access: &WsAcc
                 Some(e.handle_line_from(text.trim(), Some(&outbox)))
             }
             Ok(Message::Binary(_)) => Some(protocol::nack("", ErrorCode::BadMessage, "send JSON as text messages")),
-            Ok(Message::Close(_)) => break Ok(()),
+            // tungstenite has queued the close reply; the flush below sends it, and the next
+            // read reports the connection closed, so the client sees a clean close.
+            Ok(Message::Close(_)) => None,
             Ok(_) => None, // ping, pong: tungstenite answers pings itself
             Err(Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                 None
@@ -387,7 +389,10 @@ fn serve_ws_connection(stream: TcpStream, engine: &Mutex<Engine>, access: &WsAcc
             let bytes = serde_json::to_vec(&ack)?;
             sent = sent.and_then(|_| ws.write(as_message(bytes)));
         }
-        match sent.and_then(|_| ws.flush()) {
+        // Flush even if a write failed (e.g. an event after the client closed), so a queued
+        // close reply still goes out.
+        let flushed = ws.flush();
+        match sent.and(flushed) {
             Ok(()) => {}
             Err(Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
             Err(_) => break Ok(()),
@@ -730,6 +735,23 @@ mod tests {
             Err(tungstenite::Error::Http(r)) => assert_eq!(r.status(), 403),
             other => panic!("an unlisted origin is refused, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn a_client_that_closes_gets_a_clean_close_back() {
+        let (_, ws_addr) = serve_both("ws-close", &[]);
+        let mut ws = ws_connect(ws_addr, None).unwrap();
+        ws_send(&mut ws, r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#);
+        assert_eq!(ws_next(&mut ws)["id"], "s");
+        ws.close(None).unwrap();
+        // The server's close reply ends it cleanly (ConnectionClosed), not a dropped socket.
+        let end = loop {
+            match ws.read() {
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(end, tungstenite::Error::ConnectionClosed), "closed uncleanly: {end}");
     }
 
     #[test]

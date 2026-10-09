@@ -27,15 +27,12 @@ jobs:
       matrix:
         include:
           # No GPU on GitHub's Windows runners: Media Foundation and D3D12 run in software
-          # there at ~7 fps at 1080p, so the program uses the CPU path and x264, as on Linux.
+          # there at ~7 fps. The video tests run the hardware check once and use its choice,
+          # so the program finds the CPU path by measuring, as a church PC without a GPU would.
           - os: windows-latest
             features: "--features video"
-            test_encoder: x264
-            no_gpu: "1"
           - os: ubuntu-latest
             features: "--features video"
-            test_encoder: ""
-            no_gpu: ""
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -109,5 +106,3 @@ jobs:
       - run: cargo test --release ${{ matrix.features }}
         env:
           JIVVY_CHAOS_ITERATIONS: 100
-          JIVVY_TEST_ENCODER: ${{ matrix.test_encoder }}
-          JIVVY_TEST_NO_GPU: ${{ matrix.no_gpu }}

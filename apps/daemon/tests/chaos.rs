@@ -184,7 +184,7 @@ fn start_with_env(
     extra: &[&str],
     envs: &[(&str, &str)],
 ) -> Daemon {
-    start_at(free_port(), data_dir, &DaemonArgs { slides, headless_outputs, extra, envs })
+    start_at(free_port(), data_dir, &DaemonArgs { slides, headless_outputs, extra, envs, seed_hardware: true })
 }
 
 struct DaemonArgs<'a> {
@@ -192,12 +192,20 @@ struct DaemonArgs<'a> {
     headless_outputs: bool,
     extra: &'a [&'a str],
     envs: &'a [(&'a str, &'a str)],
+    /// Give a video daemon this test run's hardware check report (see `video::seed_hardware`),
+    /// so it doesn't measure the machine again at start.
+    #[cfg_attr(not(feature = "video"), allow(dead_code))] // only read by the video tests
+    seed_hardware: bool,
 }
 
 /// Starts the daemon on `port`. If that port is taken by the time the engine binds it, the
 /// daemon is stopped and started again on a fresh port (up to 5 tries).
 fn start_at(mut port: u16, data_dir: TestDir, args: &DaemonArgs) -> Daemon {
     end_children_with_this_process();
+    #[cfg(feature = "video")]
+    if args.seed_hardware && args.extra.contains(&"--video") {
+        video::seed_hardware(&data_dir); // before taking a video slot: the check takes one
+    }
     let video_slot = (!args.extra.contains(&"--no-video")).then(VideoSlot::take);
     for attempt in 1..=5 {
         let addr = format!("127.0.0.1:{port}");
@@ -467,7 +475,8 @@ fn a_daemon_whose_port_is_taken_starts_again_on_another() {
     let port = free_port();
     assert!((20_000..32_768).contains(&port), "test ports stay below the ephemeral range: {port}");
     let _taken = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    let args = DaemonArgs { slides: 5, headless_outputs: false, extra: &["--no-video"], envs: &[] };
+    let args =
+        DaemonArgs { slides: 5, headless_outputs: false, extra: &["--no-video"], envs: &[], seed_hardware: false };
     let d = start_at(port, test_dir("port-taken"), &args);
     assert_ne!(d.addr, format!("127.0.0.1:{port}"), "started again on another port");
     let r = d.send(json!({ "type": "slide.goto", "index": 2 }), Duration::from_secs(5));
@@ -795,6 +804,30 @@ mod video {
         }
     }
 
+    /// This test run's hardware check, measured once for real (no hooks narrowing it, holding
+    /// a video slot so nothing else competes): the report, and whether a setting kept up.
+    fn shared_hardware_check() -> &'static (Vec<u8>, bool) {
+        static CHECK: std::sync::OnceLock<(Vec<u8>, bool)> = std::sync::OnceLock::new();
+        CHECK.get_or_init(|| {
+            let _slot = VideoSlot::take();
+            let dir = test_dir("hardware-check");
+            let status = Command::new(env!("CARGO_BIN_EXE_jivvy-video"))
+                .args(["--hardware-check", "--data-dir", dir.to_str().unwrap()])
+                .env_remove("JIVVY_TEST_NO_GPU")
+                .env_remove("JIVVY_TEST_ENCODER")
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            (std::fs::read(dir.join("hardware.json")).expect("the check saved its report"), status.success())
+        })
+    }
+
+    /// Gives a video daemon this run's hardware check report, so the program runs on what was
+    /// measured here and the daemon doesn't measure again at start.
+    pub(super) fn seed_hardware(dir: &std::path::Path) {
+        std::fs::write(dir.join("hardware.json"), &shared_hardware_check().0).unwrap();
+    }
+
     fn start_video(name: &str, media_json: &str) -> Daemon {
         let dir = test_dir(name);
         std::fs::write(dir.join("media.json"), media_json).unwrap();
@@ -853,19 +886,13 @@ mod video {
 
     #[test]
     fn the_hardware_check_picks_a_setting_that_really_keeps_up_and_says_why() {
-        let _slot = VideoSlot::take(); // it runs the encoders flat out
-        let dir = test_dir("hardware-check");
-        let out = Command::new(env!("CARGO_BIN_EXE_jivvy-video"))
-            .args(["--hardware-check", "--data-dir", dir.to_str().unwrap()])
-            // Measured for real: none of the hooks that narrow what is tried. On CI's Windows
-            // runners (no GPU) the D3D12 path is installed but slow, and must lose.
-            .env_remove("JIVVY_TEST_NO_GPU")
-            .env_remove("JIVVY_TEST_ENCODER")
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&std::fs::read(dir.join("hardware.json")).unwrap()).unwrap();
+        // Measured for real: none of the hooks that narrow what is tried. On CI's Windows
+        // runners (no GPU) the D3D12 path is installed but slow, and must lose.
+        let (bytes, kept_up) = shared_hardware_check();
+        let report: Value = serde_json::from_slice(bytes).unwrap();
         println!("{}", report["reason"]);
-        assert!(out.status.success(), "nothing kept up on this machine: {}", report["reason"]);
+        println!("{}", serde_json::to_string(&report["trials"]).unwrap());
+        assert!(*kept_up, "nothing kept up on this machine: {}", report["reason"]);
         let chosen = &report["chosen"];
         let trials = report["trials"].as_array().unwrap();
         let same = |t: &&Value| ["path", "encoder", "width", "height", "fps"].iter().all(|k| t[*k] == chosen[*k]);
@@ -877,6 +904,38 @@ mod video {
             assert!(t["capacityFps"].as_f64().unwrap_or(0.0) < 1.5 * t["fps"].as_f64().unwrap(), "{t}");
         }
         assert!(report["reason"].as_str().unwrap().starts_with("Using "), "{}", report["reason"]);
+    }
+
+    #[test]
+    fn on_first_start_the_check_runs_before_video_and_the_program_uses_its_choice() {
+        let dir = test_dir("first-start");
+        std::fs::write(dir.join("media.json"), r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#)
+            .unwrap();
+        let video_args = ["--video", env!("CARGO_BIN_EXE_jivvy-video")];
+        // No report yet: the watchdog runs the full check (no hooks) before starting video.
+        let envs = [("JIVVY_TEST_NO_GPU", ""), ("JIVVY_TEST_ENCODER", "")];
+        let args =
+            DaemonArgs { slides: 10, headless_outputs: false, extra: &video_args, envs: &envs, seed_hardware: false };
+        let d = start_at(free_port(), dir, &args);
+        // Slides don't wait for the check.
+        d.next_engine_pid(Duration::from_secs(10));
+        assert_eq!(d.send(json!({ "type": "slide.goto", "index": 2 }), Duration::from_secs(5))["ok"], true);
+
+        let video = d.video_starts.recv_timeout(Duration::from_secs(300)).expect("video started after the check");
+        let report: Value = serde_json::from_slice(&std::fs::read(d.data_dir.join("hardware.json")).unwrap())
+            .expect("video started only once the check had saved its report");
+        let chosen = report["chosen"].clone();
+        assert!(chosen.is_object(), "a setting kept up: {}", report["reason"]);
+        let s = d.media_status(Duration::from_secs(20), "program running on the check's choice", |s| {
+            program(s)["state"] == "running"
+                && program(s)["encoder"] == chosen["encoder"]
+                && program(s)["path"] == chosen["path"]
+        });
+        assert_eq!((&program(&s)["width"], &program(&s)["height"]), (&chosen["width"], &chosen["height"]));
+        assert_eq!(s["hardware"], report["reason"], "the System screen sees why");
+        // Restarted mid-service, video comes straight back: the check never runs again.
+        kill_hard(video);
+        d.video_starts.recv_timeout(RESTORE_TARGET).expect("video restarted without a new check");
     }
 
     #[test]
@@ -961,7 +1020,11 @@ mod video {
 
     #[test]
     fn changing_the_program_size_mid_run_comes_back_clean_at_the_new_size() {
-        let d = start_video("program-resize", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
+        // Starts at 1080p whatever the hardware check chose: that's the size it changes from.
+        let d = start_video(
+            "program-resize",
+            r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"},"program":{"width":1920,"height":1080}}"#,
+        );
         d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
         let s = d.media_status(Duration::from_secs(15), "running at 1080p", |s| {
             program(s)["state"] == "running"

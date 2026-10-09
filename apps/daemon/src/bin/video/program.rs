@@ -14,8 +14,8 @@ use jivvy_daemon::client::LiveState;
 use jivvy_daemon::log;
 use jivvy_daemon::lyrics;
 use jivvy_daemon::program::{
-    AUDIO_CHANNELS, AUDIO_CHUNK, AUDIO_RATE, AudioFifo, EncoderChoice, FrameSource, ProgramConfig, ProgramStatus,
-    Trial, encoder_order, frame_fits, frame_source, frames_due, judge_trial, lines_for, next_frame_at,
+    AUDIO_CHANNELS, AUDIO_CHUNK, AUDIO_RATE, AudioFifo, EncoderChoice, FrameSource, PicturePath, ProgramConfig,
+    ProgramStatus, Trial, encoder_order, frame_fits, frame_source, frames_due, judge_trial, lines_for, next_frame_at,
 };
 
 /// After every encoder failed, wait this long before trying the list again.
@@ -186,7 +186,10 @@ impl Program {
         // Test hook JIVVY_TEST_NO_GPU=1: blend and convert on the CPU even where the D3D12 plugins
         // exist. CI's Windows runners have no GPU, where D3D12 runs in software at ~7 fps.
         let no_gpu = std::env::var("JIVVY_TEST_NO_GPU").is_ok_and(|v| v.trim() == "1");
-        let gpu = !no_gpu && has("d3d12upload") && has("d3d12overlaycompositor") && has("d3d12download");
+        // `cpu` (the hardware check's choice, or the tech lead's) never uses the graphics chip;
+        // `gpu` and `auto` use it when its plugins are installed.
+        let plugins = has("d3d12upload") && has("d3d12overlaycompositor") && has("d3d12download");
+        let gpu = !no_gpu && plugins && cfg.path != PicturePath::Cpu;
         let order = encoder_order(cfg.encoder, has);
         let sources: Arc<Mutex<Sources>> = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
@@ -427,6 +430,7 @@ impl Program {
         ProgramStatus {
             state,
             encoder: encoder.into(),
+            path: if self.gpu { "gpu" } else { "cpu" }.into(),
             width: self.cfg.width,
             height: self.cfg.height,
             fps: self.cfg.fps,

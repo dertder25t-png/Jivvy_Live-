@@ -57,6 +57,20 @@ impl EncoderChoice {
     }
 }
 
+/// Where the program converts the picture and blends the lyric layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PicturePath {
+    /// What the hardware check measured as keeping up (`hardware.json`); before any check,
+    /// the graphics chip when its plugins are installed.
+    #[default]
+    Auto,
+    /// The graphics chip (D3D12 on Windows), when its plugins are installed.
+    Gpu,
+    /// The computer's processor.
+    Cpu,
+}
+
 /// `program` in `media.json`. Every field has a default, so older files keep working.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -66,12 +80,44 @@ pub struct ProgramConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub encoder: EncoderChoice,
+    pub path: PicturePath,
 }
 
 impl Default for ProgramConfig {
     fn default() -> Self {
-        ProgramConfig { width: 1920, height: 1080, fps: 30, bitrate_kbps: 6000, encoder: EncoderChoice::Auto }
+        ProgramConfig {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 6000,
+            encoder: EncoderChoice::Auto,
+            path: PicturePath::Auto,
+        }
     }
+}
+
+/// Which `program` settings `media.json` sets itself. Those are the tech lead's choice and
+/// always win; the rest come from the hardware check (encoder and path use `auto` for that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProgramSet {
+    pub size: bool,
+    pub fps: bool,
+    pub bitrate: bool,
+}
+
+impl ProgramSet {
+    /// From the `program` object of `media.json` as written.
+    pub fn of(program: Option<&serde_json::Value>) -> ProgramSet {
+        let has = |k: &str| program.and_then(|p| p.get(k)).is_some();
+        ProgramSet { size: has("width") || has("height"), fps: has("fps"), bitrate: has("bitrateKbps") }
+    }
+}
+
+/// The video bitrate for a picture size: the default 1080p bitrate scaled by the number of
+/// pixels, at least 800 kbps.
+pub fn bitrate_for(width: u32, height: u32) -> u32 {
+    let pixels = (width * height) as f64 / (1920.0 * 1080.0);
+    ((ProgramConfig::default().bitrate_kbps as f64 * pixels) as u32).max(800)
 }
 
 impl ProgramConfig {
@@ -85,6 +131,7 @@ impl ProgramConfig {
             fps: self.fps.clamp(15, 60),
             bitrate_kbps: self.bitrate_kbps.clamp(500, 20_000),
             encoder: self.encoder,
+            path: self.path,
         }
     }
 
@@ -224,6 +271,8 @@ pub struct ProgramStatus {
     /// "running", "starting" or "failed" (retried every second).
     pub state: &'static str,
     pub encoder: String,
+    /// Where the picture is converted and the lyric layer blended: "gpu" or "cpu".
+    pub path: String,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -263,7 +312,14 @@ mod tests {
     fn config_defaults_and_clamps() {
         let c: ProgramConfig = serde_json::from_str(r#"{"bitrateKbps": 4500}"#).unwrap();
         assert_eq!((c.width, c.height, c.fps, c.bitrate_kbps, c.encoder), (1920, 1080, 30, 4500, EncoderChoice::Auto));
-        let odd = ProgramConfig { width: 1281, height: 9999, fps: 240, bitrate_kbps: 1, encoder: EncoderChoice::X264 };
+        let odd = ProgramConfig {
+            width: 1281,
+            height: 9999,
+            fps: 240,
+            bitrate_kbps: 1,
+            encoder: EncoderChoice::X264,
+            path: PicturePath::Cpu,
+        };
         let s = odd.sanitized();
         assert_eq!((s.width, s.height, s.fps, s.bitrate_kbps), (1280, 2160, 60, 500));
         assert_eq!(ProgramConfig::default().frame_duration(), Duration::from_nanos(33_333_333));

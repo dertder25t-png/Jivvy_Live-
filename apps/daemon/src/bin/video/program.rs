@@ -160,7 +160,7 @@ fn slate(cfg: &ProgramConfig) -> gst::Buffer {
     gst::Buffer::from_mut_slice(data)
 }
 
-fn to_composition(l: lyrics::Layer) -> Option<gst_video::VideoOverlayComposition> {
+pub(crate) fn to_composition(l: lyrics::Layer) -> Option<gst_video::VideoOverlayComposition> {
     let mut buf = gst::Buffer::from_mut_slice(l.bgra);
     gst_video::VideoMeta::add(
         buf.get_mut()?,

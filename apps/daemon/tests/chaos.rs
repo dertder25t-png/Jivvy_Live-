@@ -852,6 +852,34 @@ mod video {
     }
 
     #[test]
+    fn the_hardware_check_picks_a_setting_that_really_keeps_up_and_says_why() {
+        let _slot = VideoSlot::take(); // it runs the encoders flat out
+        let dir = test_dir("hardware-check");
+        let out = Command::new(env!("CARGO_BIN_EXE_jivvy-video"))
+            .args(["--hardware-check", "--data-dir", dir.to_str().unwrap()])
+            // Measured for real: none of the hooks that narrow what is tried. On CI's Windows
+            // runners (no GPU) the D3D12 path is installed but slow, and must lose.
+            .env_remove("JIVVY_TEST_NO_GPU")
+            .env_remove("JIVVY_TEST_ENCODER")
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&std::fs::read(dir.join("hardware.json")).unwrap()).unwrap();
+        println!("{}", report["reason"]);
+        assert!(out.status.success(), "nothing kept up on this machine: {}", report["reason"]);
+        let chosen = &report["chosen"];
+        let trials = report["trials"].as_array().unwrap();
+        let same = |t: &&Value| ["path", "encoder", "width", "height", "fps"].iter().all(|k| t[*k] == chosen[*k]);
+        let ran = trials.iter().find(same).expect("the chosen setting was measured");
+        let (capacity, fps) = (ran["capacityFps"].as_f64().unwrap(), chosen["fps"].as_f64().unwrap());
+        assert!(capacity >= 1.5 * fps, "chosen at {capacity:.1} fps; {} needed", 1.5 * fps);
+        // Anything tried at a better quality fell short.
+        for t in trials.iter().filter(|t| t["height"].as_u64() > chosen["height"].as_u64()) {
+            assert!(t["capacityFps"].as_f64().unwrap_or(0.0) < 1.5 * t["fps"].as_f64().unwrap(), "{t}");
+        }
+        assert!(report["reason"].as_str().unwrap().starts_with("Using "), "{}", report["reason"]);
+    }
+
+    #[test]
     fn with_test_sources_the_whole_daemon_runs_without_any_device() {
         // Names a capture card that isn't here and the default microphone: --test-sources
         // replaces both, so this runs on a machine with no camera or microphone at all.

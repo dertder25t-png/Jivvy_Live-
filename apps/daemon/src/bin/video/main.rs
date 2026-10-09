@@ -2,9 +2,14 @@
 //! Built only with the `video` feature (it needs GStreamer installed).
 //!
 //! jivvy-video [--data-dir DIR] [--connect ADDR] [--supervised] [--test-sources]
+//! jivvy-video --hardware-check [--data-dir DIR]
 //!
 //! `--test-sources` (or `JIVVY_TEST_SOURCES=1`) uses a test pattern and tone for every
 //! camera and microphone, whatever `media.json` names: no devices needed.
+//!
+//! `--hardware-check` measures each picture path and encoder on this machine, writes
+//! `hardware.json` with the setting to use and why (see `hwcheck.rs`), prints it and exits:
+//! 0 when a setting keeps up, 1 when nothing does, 2 when the report can't be saved.
 //!
 //! Camera and microphone run as separate pipelines, so one device failing never stops the
 //! other. A device that is unplugged or fails is retried every second and picked up again
@@ -16,6 +21,7 @@
 //! It draws the lyric layer, encodes once, and is where recording and streaming attach.
 
 mod hls;
+mod hwcheck;
 mod program;
 mod stream;
 mod tiers;
@@ -45,6 +51,7 @@ struct Args {
     connect: String,
     supervised: bool,
     test_sources: bool,
+    hardware_check: bool,
     /// Test hook `JIVVY_TEST_ENCODER=x264|mf`: the encoder to use, whatever `media.json` says.
     /// CI's Windows runners have no GPU, where Media Foundation is a software encoder too slow
     /// for 1080p30.
@@ -65,6 +72,7 @@ fn parse_args() -> Args {
         connect: DEFAULT_LISTEN.into(),
         supervised: false,
         test_sources: media::test_sources_from_env(),
+        hardware_check: false,
         test_encoder: test_encoder_from_env(),
     };
     let mut it = std::env::args().skip(1);
@@ -75,6 +83,7 @@ fn parse_args() -> Args {
             "--connect" => a.connect = val(),
             "--supervised" => a.supervised = true,
             "--test-sources" => a.test_sources = true,
+            "--hardware-check" => a.hardware_check = true,
             other => fail(&format!("unknown flag {other}")),
         }
     }
@@ -486,6 +495,15 @@ fn main() {
     }
     if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
         fail(&format!("data dir {}: {e}", args.data_dir.display()));
+    }
+    if args.hardware_check {
+        let font = jivvy_daemon::lyrics::load_font(None).unwrap_or_else(|e| fail(&format!("lyric layer: {e}")));
+        let (report, saved) = hwcheck::run(&args.data_dir, args.test_encoder, &font);
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        if let Err(e) = saved {
+            fail(&format!("hardware check: {e}")); // exits 2: the check isn't done until it's saved
+        }
+        std::process::exit(if report.chosen.is_some() { 0 } else { 1 });
     }
     if args.supervised {
         exit_when_orphaned("video");

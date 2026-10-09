@@ -231,9 +231,11 @@ impl Memory {
     /// remembered auto pins alone, so the next normal run keeps the same camera and microphone.
     pub fn choose_input(&mut self, sel: &Selection, kind: Kind, devices: &[DeviceInfo], test_sources: bool) -> Choice {
         match sel {
+            // A normal run always goes through `choose`, which also forgets an auto pin when
+            // the input is set to something else (`none` included).
+            _ if !test_sources => self.choose(sel, kind, devices),
             Selection::None => Choice::None,
-            _ if test_sources => Choice::Test,
-            _ => self.choose(sel, kind, devices),
+            _ => Choice::Test,
         }
     }
 
@@ -328,7 +330,15 @@ mod tests {
         );
 
         // Back to a normal run, with the devices listed the other way round: still the pinned one.
-        assert_eq!(m.choose_input(&Selection::Auto, Kind::Camera, &[b, a], false), pinned);
+        assert_eq!(m.choose_input(&Selection::Auto, Kind::Camera, &[b.clone(), a], false), pinned);
+
+        // In a normal run, `none` is a config change like any other: the pin is forgotten, so
+        // `auto` afterwards picks a camera that's here instead of waiting for the old one.
+        assert_eq!(m.choose_input(&Selection::None, Kind::Camera, std::slice::from_ref(&b), false), Choice::None);
+        assert_eq!(
+            m.choose_input(&Selection::Auto, Kind::Camera, std::slice::from_ref(&b), false),
+            Choice::Device { id: "path-b".into(), name: "Capture B".into() }
+        );
     }
 
     fn raw(name: &str, class: &str, props: &[(&str, &str)]) -> RawDevice {

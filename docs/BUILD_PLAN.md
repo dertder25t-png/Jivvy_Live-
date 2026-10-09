@@ -34,13 +34,13 @@ Use proven, mostly free building blocks and write only the parts that make Jivvy
 | --- | --- | --- |
 | Desktop app shell | **Tauri** (decided Oct 6, 2026) | Tray icon, auto-start, updater, output windows on each monitor. See the note below. |
 | Video engine | Rust + GStreamer | Live pipelines with hardware encoders, bitrate changes on the fly, one encode sent to both stream and file |
-| Hardware encoding | Windows Media Foundation (vendor encoder), Intel Quick Sync, NVIDIA NVENC, AMD AMF, Apple VideoToolbox; x264 fallback | Low CPU on cheap laptops; a self-test picks the first encoder that works on each machine, so a bad driver can't stop a service |
+| Hardware encoding | Windows Media Foundation (vendor encoder), Intel Quick Sync, NVIDIA NVENC, AMD AMF, Apple VideoToolbox; x264 fallback | Low CPU on cheap laptops; a hardware check picks the fastest compositing path and encoder that keeps up on each machine (the CPU path and x264 when the graphics can't) and sets the quality to match, so a bad driver or weak GPU can't stop a service |
 | Streaming out | RTMP/RTMPS with auto-reconnect; SRT where a platform accepts it | What YouTube and Facebook take, no server in between |
 | Cloud relay (Pro only) | Cloudflare Stream live inputs with simulcast outputs | Upload once, fan out to up to 50 platforms; about $1 per 1,000 minutes sent, nothing for us to run |
 | Recording | Matroska or fragmented MP4, converted to MP4 after service | A crash never corrupts the file |
 | Lobby TVs | Local HLS from the daemon | Live video over Wi-Fi with no internet use |
 | Web app | SvelteKit or Next.js as an installable PWA, hosted on Cloudflare Pages at app.jivvy.org | One UI for browser, phones and output windows; works offline from cache |
-| Local control | Secure WebSocket on a per-church hostname under d.jivvy.org with a real certificate (the Plex approach) | Browsers block insecure local connections from https pages |
+| Local control | Secure WebSocket on a per-church hostname under d.jivvy.org with a real certificate (the Plex approach) | Browsers block insecure local connections from https pages. When the hostname can't be reached (no internet), a QR code or short code with the computer's local address gets devices in, and devices pair with a code shown on the church computer |
 | Cloud | Supabase: Postgres, Auth, Realtime, Edge Functions | Plans, songs, roles, share links, sync, heartbeats |
 | Media files | Cloudflare R2 | Cheap storage, free downloads for slides and videos |
 | Alerts | Web push and email; SMS optional later | Free channels first |
@@ -169,11 +169,12 @@ Everything a church needs to run a whole service, with every reliability feature
 - [ ] Crash-safe local recording
 - [ ] Local secure command channel (per-church hostname + certificate); certificate renewal stays free forever for every church
   - In progress: the protocol over WebSocket is done (`--listen-ws`, off by default; same envelopes, acks and events as the TCP channel; browsers only from allowed origins). Left: TLS with the per-church certificate and hostname, device pairing, and how devices find the daemon when the internet is down.
+  - Decided (Oct 9, 2026): the per-church hostname stays the normal way in. When it can't be reached (internet down, DNS blocked), the church computer shows a QR code with its local address, plus a short code a phone can type instead of scanning; a device pairs by entering the code shown on the church computer. Nothing about joining or pairing needs the internet.
 - [ ] Streaming, the rest: bandwidth manager Advanced mode, the pre-flight streaming summary and lowered/paused alerts, two-connection support, and the check on a private YouTube event once the channel can go live
 - [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all
 - [ ] Local database on the church computer (SQLite) holding the library, plans, themes and settings. It is the master copy during a service and the only copy for churches without Plus; the cloud is a synced copy, never the source of truth on Sunday
 - [ ] Automatic local backups: a snapshot after every successful save (keep the last 5 good states) plus one per day for 30 days, each integrity-checked, with one-click restore. Backups never run mid-service and never fill the disk (pre-flight warns first)
-- [ ] Encoder self-test and fallback: on install, after driver updates and in pre-flight, encode a few seconds with each available encoder and pick the first that works (Media Foundation, vendor plugin, then x264). The encoder runs where the watchdog can restart it without losing the recording
+- [ ] Hardware check and automatic settings (was "Encoder self-test and fallback"): during setup after download, after driver or hardware changes, and in pre-flight, check the machine and run the real program pipeline for a few seconds on each path: GPU compositing (D3D12 on Windows, Metal on Mac, VA-API/GL on Linux) and the CPU path, with each encoder (Media Foundation, vendor plugins, VideoToolbox, VA-API, x264). Pick the fastest combination that holds the frame rate with headroom; if none does at 1080p30, step the program and recording quality down (720p30, then 480p30) until one does, and show what was chosen and why in plain words. A path or encoder is used only if it measurably keeps up, never just because it is installed (today a PC without a working GPU picks D3D12 and Media Foundation in software and streams at ~7 fps). Must work with no GPU at all, weak integrated graphics, small or cheap eGPUs and older machines, with the CPU path as the backup. Windows first, then Mac and Linux. The tech lead can override; the check never runs during a service window. The encoder runs where the watchdog can restart it without losing the recording
 - [ ] Keyboard and clicker control on the computer itself
 - [ ] Blocks sleep during services; no updates during service windows; signed auto-updates with rollback
 
@@ -194,7 +195,7 @@ Everything a church needs to run a whole service, with every reliability feature
 
 **In-house testing (no churches)**
 
-- [ ] Hardware lab: the founder's laptop plus a ~$300 Windows laptop (repeat the Stage 0 spike on it first), a USB capture card and a USB audio interface; a Mac when Mac support starts
+- [ ] Hardware lab: the founder's laptop plus a ~$300 Windows laptop (repeat the Stage 0 spike on it first), an older machine with weak integrated graphics, a machine (or VM) with no usable GPU, a USB capture card and a USB audio interface; a Mac when Mac support starts
 - [ ] Chaos test suite: every row of the reliability table scripted and passing, against the simulated daemon in CI and the real daemon on the lab machines
 - [ ] Soak test: a 4-hour simulated service (camera, lyrics, stream, recording) on every lab machine
 - [ ] Mock Sundays: run a full service plan end to end, as a church would, every week of Stage 1; each failure gets a write-up and a test that reproduces it
@@ -449,6 +450,8 @@ Growth depends mostly on new sales, since renewals are small. That's the tradeof
 - [x] No calls for now: interested churches join an email waitlist for the alpha testing and launch announcements (Oct 6, 2026)
 - [x] What a license includes without Plus: every local feature released in its first 3 years, kept forever; no cloud features
 - [x] Cloud relay: Cloudflare Stream, Pro tier, Stage 4, with automatic fallback to direct streaming
+- [x] Joining without internet: a QR code with the church computer's local address, or a short code typed instead, as the fallback when the per-church hostname can't be reached; devices pair with a code shown on the church computer (Oct 9, 2026)
+- [x] Hardware: Jivvy Live must run with no GPU, on weak integrated graphics, cheap eGPUs and older machines, on as many platforms as practical. Setup checks the machine and picks GPU or CPU and the recording quality automatically (Oct 9, 2026)
 - [ ] Get a publisher quote for licensed Bible translations before promising them
 - [ ] Whether to offer a founding-church discount during alpha testing (Stage 2)
 - [ ] Revenue split, if any, with MinistryBase for customers who come through their integration

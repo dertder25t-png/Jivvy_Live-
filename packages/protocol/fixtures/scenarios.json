@@ -1,0 +1,76 @@
+{
+  "about": "Shared behavior scenarios: command sequences and the acks they must produce, run against both the simulated daemon (packages/sim-daemon/test/scenarios.test.ts) and the real one (apps/daemon/tests/chaos.rs, shared_scenarios_*), so the two can't drift apart. Each step either sends a command or crashes the engine (it restarts from its snapshot). `expect` is matched as a subset of the ack. Stream steps check `streamWanted`, not `stream`: the simulated daemon simulates the stream itself, while the real engine reports live only once the video process does. New behavior goes here first: protocol, then sim-daemon, then the real daemon. Add scenarios; never change an existing expectation without a protocol version bump.",
+  "scenarios": [
+    {
+      "name": "navigates and clamps at both ends",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "slide.prev" }, "expect": { "ok": true, "state": { "slideIndex": 0 } } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": true, "state": { "slideIndex": 1 } } },
+        { "send": { "type": "slide.goto", "index": 4 }, "expect": { "ok": true, "state": { "slideIndex": 4 } } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": true, "state": { "slideIndex": 4 } } },
+        { "send": { "type": "slide.prev" }, "expect": { "ok": true, "state": { "slideIndex": 3 } } }
+      ]
+    },
+    {
+      "name": "a slide out of range is refused and changes nothing",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "slide.goto", "index": 2 }, "expect": { "ok": true, "state": { "slideIndex": 2 } } },
+        { "send": { "type": "slide.goto", "index": 5 }, "expect": { "ok": false, "code": "bad_arguments" } },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "slideIndex": 2 } } }
+      ]
+    },
+    {
+      "name": "black screens and back, keeping the slide",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "slide.goto", "index": 3 }, "expect": { "ok": true } },
+        { "send": { "type": "output.black", "on": true }, "expect": { "ok": true, "state": { "slideIndex": 3, "black": true } } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": true, "state": { "slideIndex": 4, "black": true } } },
+        { "send": { "type": "output.black", "on": false }, "expect": { "ok": true, "state": { "slideIndex": 4, "black": false } } }
+      ]
+    },
+    {
+      "name": "every ack reports the whole state, state.get included",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "slideIndex": 0, "black": false, "stream": "off", "streamWanted": false } } },
+        { "send": { "type": "slide.goto", "index": 2 }, "expect": { "ok": true, "state": { "slideIndex": 2, "black": false, "stream": "off", "streamWanted": false } } }
+      ]
+    },
+    {
+      "name": "a crash comes back on the same slide and black state",
+      "slides": 10,
+      "steps": [
+        { "send": { "type": "slide.goto", "index": 6 }, "expect": { "ok": true } },
+        { "send": { "type": "output.black", "on": true }, "expect": { "ok": true } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "slideIndex": 6, "black": true } } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": true, "state": { "slideIndex": 7, "black": true } } }
+      ]
+    },
+    {
+      "name": "two crashes in a row lose nothing",
+      "slides": 10,
+      "steps": [
+        { "send": { "type": "slide.goto", "index": 8 }, "expect": { "ok": true } },
+        { "crash": true },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "slideIndex": 8, "black": false } } }
+      ]
+    },
+    {
+      "name": "a wanted stream stays wanted through a crash, and stop is kept too",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "stream.start" }, "expect": { "ok": true, "state": { "streamWanted": true } } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "streamWanted": true } } },
+        { "send": { "type": "stream.stop" }, "expect": { "ok": true, "state": { "streamWanted": false, "stream": "off" } } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "streamWanted": false, "stream": "off" } } }
+      ]
+    }
+  ]
+}

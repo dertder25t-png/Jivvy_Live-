@@ -552,6 +552,49 @@ fn jivvy_ctl_drives_a_running_daemon_in_one_line() {
     assert!(err.contains("unknown command"), "{err}");
 }
 
+/// True if every field in `expected` is in `actual` with the same value (objects compared
+/// the same way, recursively): how the shared scenarios match an ack.
+fn contains(actual: &Value, expected: &Value) -> bool {
+    match (actual, expected) {
+        (Value::Object(a), Value::Object(e)) => e.iter().all(|(k, v)| a.get(k).is_some_and(|av| contains(av, v))),
+        _ => actual == expected,
+    }
+}
+
+#[test]
+fn shared_scenarios_behave_the_same_on_the_real_daemon() {
+    // Also run against the simulated daemon (packages/sim-daemon/test/scenarios.test.ts).
+    const SCENARIOS: &str = include_str!("../../../packages/protocol/fixtures/scenarios.json");
+    let shared: Value = serde_json::from_str(SCENARIOS).unwrap();
+    let scenarios = shared["scenarios"].as_array().unwrap();
+    assert!(scenarios.len() >= 5, "the shared scenarios are there");
+    // Each scenario gets its own daemon; they run side by side.
+    std::thread::scope(|scope| {
+        for (n, scenario) in scenarios.iter().enumerate() {
+            scope.spawn(move || {
+                let name = scenario["name"].as_str().unwrap();
+                let d = start(&format!("scenario-{n}"), scenario["slides"].as_u64().unwrap());
+                let mut engine = d.next_engine_pid(Duration::from_secs(10));
+                for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
+                    if step["crash"] == true {
+                        kill_hard(engine);
+                        engine = d.next_engine_pid(RESTORE_TARGET);
+                        continue;
+                    }
+                    // Waits for a restarted engine to answer, like any client reconnecting.
+                    let ack = d.send(step["send"].clone(), RESTORE_TARGET);
+                    assert!(
+                        contains(&ack, &step["expect"]),
+                        "{name}, step {i} ({}): expected {} in {ack}",
+                        step["send"],
+                        step["expect"]
+                    );
+                }
+            });
+        }
+    });
+}
+
 fn displays(dir: &std::path::Path, names: &[&str]) {
     let list: Vec<Value> = names
         .iter()

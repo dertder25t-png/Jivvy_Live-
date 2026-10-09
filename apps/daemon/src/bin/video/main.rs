@@ -497,6 +497,9 @@ fn main() {
     if let Some(encoder) = args.test_encoder {
         log("video", format!("test hook: encoder {} (JIVVY_TEST_ENCODER)", encoder.name()));
     }
+    if std::env::var("JIVVY_TEST_NO_GPU").is_ok_and(|v| v.trim() == "1") {
+        log("video", "test hook: lyric layer and conversion on the CPU (JIVVY_TEST_NO_GPU)");
+    }
     let levels = LevelsSender::start(args.connect.clone());
     let font: &'static [u8] = match jivvy_daemon::lyrics::load_font(None) {
         Ok(f) => Box::leak(f.into_boxed_slice()),

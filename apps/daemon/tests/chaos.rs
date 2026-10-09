@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -42,7 +42,7 @@ struct Daemon {
     #[allow(dead_code)] // only read by the video tests
     video_starts: Receiver<u32>,
     addr: String,
-    data_dir: PathBuf,
+    data_dir: TestDir,
 }
 
 impl Drop for Daemon {
@@ -79,16 +79,89 @@ impl Drop for VideoSlot {
     }
 }
 
+/// A port for a test daemon or server, from 20000-32767: below the ephemeral ranges (Windows
+/// 49152+, Linux 32768+) that outgoing connections take their local ports from. The tests make
+/// many short connections, and one landing on a daemon's port while it is briefly free (before
+/// the engine binds it, or across an engine restart) would keep the engine off it.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // Each test process starts at its own place, so two runs at once rarely try the same ports.
+    let seed = std::process::id().wrapping_mul(2_654_435_761);
+    for _ in 0..1000 {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = 20_000 + (seed.wrapping_add(n) % 12_768) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port between 20000 and 32767");
 }
 
-fn test_dir(name: &str) -> PathBuf {
+/// A test's folder in the temp directory. Deleted when the test passes; kept, with its path
+/// printed, when it fails, so the daemon's log and files can be read.
+struct TestDir(PathBuf);
+
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("test files kept: {}", self.0.display());
+            return;
+        }
+        // The daemon's children exit a moment after its watchdog (they see its pipe close), and
+        // Windows won't delete a file a process still has open.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::remove_dir_all(&self.0).is_err() && self.0.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn test_dir(name: &str) -> TestDir {
     let dir = std::env::temp_dir().join(format!("jivvy-chaos-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TestDir(dir)
 }
+
+/// Puts this test process in a Windows job object that ends everything in it when the process
+/// ends, so the daemons and MediaMTX servers it starts never outlive it, even when the test
+/// binary is killed outright (an IDE's stop button, Task Manager). `cargo test` does this for
+/// its own children, but not for a test binary run directly. Children join the job as they are
+/// created, so this runs before the first spawn.
+#[cfg(windows)]
+fn end_children_with_this_process() {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: plain Win32 calls on a job handle this function owns. The handle is never
+        // closed: Windows closes it when this process exits, which is what ends the job.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            assert!(!job.is_null(), "CreateJobObjectW failed: {}", std::io::Error::last_os_error());
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let size = std::mem::size_of_val(&info) as u32;
+            let set = SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const info).cast(), size);
+            assert!(set != 0, "SetInformationJobObject failed: {}", std::io::Error::last_os_error());
+            let joined = AssignProcessToJobObject(job, GetCurrentProcess());
+            assert!(joined != 0, "AssignProcessToJobObject failed: {}", std::io::Error::last_os_error());
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn end_children_with_this_process() {}
 
 /// Starts the watchdog without output windows (they're covered by the headless tests)
 /// and without camera/audio (never open the real camera during tests).
@@ -96,31 +169,76 @@ fn start(name: &str, slides: u64) -> Daemon {
     start_in(test_dir(name), slides, false)
 }
 
-fn start_in(data_dir: PathBuf, slides: u64, headless_outputs: bool) -> Daemon {
+fn start_in(data_dir: TestDir, slides: u64, headless_outputs: bool) -> Daemon {
     start_with(data_dir, slides, headless_outputs, &["--no-video"])
 }
 
-fn start_with(data_dir: PathBuf, slides: u64, headless_outputs: bool, extra: &[&str]) -> Daemon {
+fn start_with(data_dir: TestDir, slides: u64, headless_outputs: bool, extra: &[&str]) -> Daemon {
     start_with_env(data_dir, slides, headless_outputs, extra, &[])
 }
 
 fn start_with_env(
-    data_dir: PathBuf,
+    data_dir: TestDir,
     slides: u64,
     headless_outputs: bool,
     extra: &[&str],
     envs: &[(&str, &str)],
 ) -> Daemon {
-    let video_slot = (!extra.contains(&"--no-video")).then(VideoSlot::take);
-    let addr = format!("127.0.0.1:{}", free_port());
-    let outputs_flag = if headless_outputs { "--outputs-headless" } else { "--no-outputs" };
+    start_at(free_port(), data_dir, &DaemonArgs { slides, headless_outputs, extra, envs })
+}
+
+struct DaemonArgs<'a> {
+    slides: u64,
+    headless_outputs: bool,
+    extra: &'a [&'a str],
+    envs: &'a [(&'a str, &'a str)],
+}
+
+/// Starts the daemon on `port`. If that port is taken by the time the engine binds it, the
+/// daemon is stopped and started again on a fresh port (up to 5 tries).
+fn start_at(mut port: u16, data_dir: TestDir, args: &DaemonArgs) -> Daemon {
+    end_children_with_this_process();
+    let video_slot = (!args.extra.contains(&"--no-video")).then(VideoSlot::take);
+    for attempt in 1..=5 {
+        let addr = format!("127.0.0.1:{port}");
+        let (mut watchdog, [engine_starts, outputs_starts, video_starts]) = spawn_watchdog(&data_dir, &addr, args);
+        if engine_bound(&data_dir, &addr) != Some(false) {
+            return Daemon {
+                watchdog,
+                _video_slot: video_slot,
+                engine_starts,
+                outputs_starts,
+                video_starts,
+                addr,
+                data_dir,
+            };
+        }
+        println!("attempt {attempt}: port {port} was taken; starting again on another");
+        let _ = watchdog.kill();
+        let _ = watchdog.wait();
+        // Its engine exits when it sees the watchdog gone; wait so it never shares the folder.
+        if let Ok(pid) = engine_starts.recv_timeout(Duration::from_secs(1)) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pid_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        port = free_port();
+    }
+    let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default();
+    panic!("the engine could not get a port in 5 tries\n{log}");
+}
+
+/// The watchdog, and its engine, outputs and video start events (pids, in that order).
+fn spawn_watchdog(data_dir: &Path, addr: &str, args: &DaemonArgs) -> (Child, [Receiver<u32>; 3]) {
+    let outputs_flag = if args.headless_outputs { "--outputs-headless" } else { "--no-outputs" };
     let mut watchdog = Command::new(env!("CARGO_BIN_EXE_jivvy-watchdog"))
         .args(["--engine", env!("CARGO_BIN_EXE_jivvy-engine"), "--outputs", env!("CARGO_BIN_EXE_jivvy-outputs")])
-        .args(["--data-dir", data_dir.to_str().unwrap(), "--listen", &addr, "--slides", &slides.to_string()])
+        .args(["--data-dir", data_dir.to_str().unwrap(), "--listen", addr, "--slides", &args.slides.to_string()])
         .arg(outputs_flag)
-        .args(extra)
+        .args(args.extra)
         .env("JIVVY_TEST_HOOKS", "1")
-        .envs(envs.iter().copied())
+        .envs(args.envs.iter().copied())
         .stdout(Stdio::piped())
         // The daemon's log goes to a file in its data directory, shown when a check fails.
         .stderr(if std::env::var_os("JIVVY_TEST_STDERR").is_some() {
@@ -149,7 +267,29 @@ fn start_with_env(
             }
         }
     });
-    Daemon { watchdog, _video_slot: video_slot, engine_starts, outputs_starts, video_starts, addr, data_dir }
+    (watchdog, [engine_starts, outputs_starts, video_starts])
+}
+
+/// Whether the engine got its port, read from the daemon's log: `Some(false)` if the port was
+/// taken. `None` when the log isn't in a file (`JIVVY_TEST_STDERR`) or says neither in time;
+/// the test's own checks then report what went wrong.
+fn engine_bound(data_dir: &Path, addr: &str) -> Option<bool> {
+    if std::env::var_os("JIVVY_TEST_STDERR").is_some() {
+        return None;
+    }
+    let (listening, taken) = (format!("[engine] listening on {addr}"), format!("[engine] bind {addr} failed"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap_or_default();
+        if log.contains(&listening) {
+            return Some(true);
+        }
+        if log.contains(&taken) {
+            return Some(false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
 }
 
 impl Daemon {
@@ -303,6 +443,79 @@ fn corrupted_state_file_falls_back_to_the_previous_snapshot() {
     assert_eq!(r["state"]["slideIndex"], json!(2));
 }
 
+#[test]
+fn a_test_folder_is_deleted_when_the_test_passes_and_kept_when_it_fails() {
+    let passed = test_dir("dir-passed");
+    std::fs::write(passed.join("daemon.log"), b"ok").unwrap();
+    let passed_path = passed.to_path_buf();
+    drop(passed);
+    assert!(!passed_path.exists(), "a passing test's folder is deleted");
+
+    let failed_path = std::env::temp_dir().join(format!("jivvy-chaos-dir-failed-{}", std::process::id()));
+    let failed = std::panic::catch_unwind(|| {
+        let dir = test_dir("dir-failed");
+        std::fs::write(dir.join("daemon.log"), b"what went wrong").unwrap();
+        panic!("a failing check (expected by this test)");
+    });
+    assert!(failed.is_err());
+    assert!(failed_path.join("daemon.log").exists(), "a failing test's folder is kept");
+    std::fs::remove_dir_all(&failed_path).unwrap();
+}
+
+#[test]
+fn a_daemon_whose_port_is_taken_starts_again_on_another() {
+    let port = free_port();
+    assert!((20_000..32_768).contains(&port), "test ports stay below the ephemeral range: {port}");
+    let _taken = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let args = DaemonArgs { slides: 5, headless_outputs: false, extra: &["--no-video"], envs: &[] };
+    let d = start_at(port, test_dir("port-taken"), &args);
+    assert_ne!(d.addr, format!("127.0.0.1:{port}"), "started again on another port");
+    let r = d.send(json!({ "type": "slide.goto", "index": 2 }), Duration::from_secs(5));
+    assert_eq!(r["ok"], json!(true), "the restarted daemon answers: {r}");
+}
+
+/// Run by `a_killed_test_run_leaves_no_daemon_behind` in a child test process: starts a
+/// daemon, reports its engine's pid, then waits to be killed.
+#[test]
+#[ignore = "helper for a_killed_test_run_leaves_no_daemon_behind"]
+fn helper_daemon_that_waits_to_be_killed() {
+    if std::env::var_os("JIVVY_CHAOS_HELPER").is_none() {
+        return;
+    }
+    let d = start("killed-run", 5);
+    println!("engine pid={}", d.next_engine_pid(Duration::from_secs(10)));
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_killed_test_run_leaves_no_daemon_behind() {
+    end_children_with_this_process();
+    let mut run = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "helper_daemon_that_waits_to_be_killed", "--ignored", "--nocapture"])
+        .env("JIVVY_CHAOS_HELPER", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let engine: u32 = BufReader::new(run.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|l| l.strip_prefix("engine pid=").map(|p| p.trim().parse().unwrap()))
+        .expect("the helper started a daemon");
+
+    // Killed outright, as by an IDE's stop button: no destructors run in the test process.
+    kill_hard(run.id());
+    let _ = run.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(engine) {
+        assert!(Instant::now() < deadline, "the daemon outlived the killed test run");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Its folder has no test left to delete it.
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("jivvy-chaos-killed-run-{}", run.id())));
+}
+
 fn displays(dir: &std::path::Path, names: &[&str]) {
     let list: Vec<Value> = names
         .iter()
@@ -355,13 +568,13 @@ fn outputs_keep_the_last_slide_while_the_engine_restarts_then_follow_again() {
 fn killed_outputs_process_comes_back_on_the_current_slide() {
     let dir = test_dir("outputs-kill");
     displays(&dir, &["OPERATOR", "PROJECTOR"]);
-    let d = start_in(dir.clone(), 10, true);
+    let d = start_in(dir, 10, true);
     d.next_engine_pid(Duration::from_secs(10));
     let outputs = d.next_outputs_pid(Duration::from_secs(10));
     d.send(json!({ "type": "slide.goto", "index": 3 }), Duration::from_secs(5));
     d.outputs_status(Duration::from_secs(5), "slide 3", |s| s["shown"]["slideIndex"] == 3);
 
-    std::fs::remove_file(dir.join("outputs-status.json")).unwrap();
+    std::fs::remove_file(d.data_dir.join("outputs-status.json")).unwrap();
     let killed_at = Instant::now();
     kill_hard(outputs);
     d.next_outputs_pid(RESTORE_TARGET);
@@ -378,7 +591,7 @@ fn monitors_coming_and_going_never_put_an_output_on_the_operators_screen() {
         r#"{"version":1,"outputs":[{"id":"proj","monitor":"PROJECTOR","width":1280,"height":720}]}"#,
     )
     .unwrap();
-    let d = start_in(dir.clone(), 10, true);
+    let d = start_in(dir, 10, true);
     d.next_outputs_pid(Duration::from_secs(10));
     let s = d.outputs_status(Duration::from_secs(5), "projector output", |s| output_ids(s) == ["proj"]);
     assert_eq!(
@@ -386,14 +599,14 @@ fn monitors_coming_and_going_never_put_an_output_on_the_operators_screen() {
         (json!(1280), json!(720))
     );
 
-    displays(&dir, &["OPERATOR"]);
+    displays(&d.data_dir, &["OPERATOR"]);
     let s = d.outputs_status(Duration::from_secs(3), "projector unplugged", |s| output_ids(s).is_empty());
     assert!(s["problems"][0]["message"].as_str().unwrap().contains("not connected"));
 
-    displays(&dir, &["OPERATOR", "PROJECTOR"]);
+    displays(&d.data_dir, &["OPERATOR", "PROJECTOR"]);
     d.outputs_status(Duration::from_secs(3), "projector plugged back in", |s| output_ids(s) == ["proj"]);
 
-    std::fs::write(dir.join("outputs.json"), "{ half-saved").unwrap();
+    std::fs::write(d.data_dir.join("outputs.json"), "{ half-saved").unwrap();
     let s = d.outputs_status(Duration::from_secs(3), "a broken config reported", |s| {
         s["problems"].as_array().is_some_and(|p| !p.is_empty())
     });
@@ -614,25 +827,42 @@ mod video {
         p
     }
 
+    fn read_log(config: &std::path::Path) -> String {
+        std::fs::read_to_string(config.with_extension("log")).unwrap_or_default()
+    }
+
     impl MediaMtx {
+        /// A MediaMTX on fresh ports. If one is taken by the time MediaMTX binds it, MediaMTX
+        /// exits at once and is started again on others (up to 5 tries).
         fn start(dir: &std::path::Path) -> MediaMtx {
-            let (rtmp, api) = (free_port(), free_port());
             let config = dir.join("mediamtx.yml");
-            std::fs::write(
-                &config,
-                format!(
-                    "logLevel: warn\napi: true\napiAddress: 127.0.0.1:{api}\nrtmp: true\nrtmpAddress: 127.0.0.1:{rtmp}\n\
-                     rtsp: false\nhls: false\nwebrtc: false\nsrt: false\nmoq: false\nplayback: false\n\
-                     paths:\n  all_others:\n"
-                ),
-            )
-            .unwrap();
-            let mut m = MediaMtx { child: None, config, rtmp, api };
-            m.restart();
-            m
+            for _ in 0..5 {
+                let (rtmp, api) = (free_port(), free_port());
+                std::fs::write(
+                    &config,
+                    format!(
+                        "logLevel: warn\napi: true\napiAddress: 127.0.0.1:{api}\nrtmp: true\nrtmpAddress: 127.0.0.1:{rtmp}\n\
+                         rtsp: false\nhls: false\nwebrtc: false\nsrt: false\nmoq: false\nplayback: false\n\
+                         paths:\n  all_others:\n"
+                    ),
+                )
+                .unwrap();
+                let mut m = MediaMtx { child: None, config: config.clone(), rtmp, api };
+                if m.try_start() {
+                    return m;
+                }
+            }
+            panic!("MediaMTX could not get its ports in 5 tries; its log:\n{}", read_log(&config));
         }
 
+        /// Starts MediaMTX again on the same ports, as a server coming back after an outage.
         fn restart(&mut self) {
+            assert!(self.try_start(), "MediaMTX exited at start; its log:\n{}", read_log(&self.config));
+        }
+
+        /// Starts MediaMTX and waits for its API: false if it exited first (a port was taken).
+        fn try_start(&mut self) -> bool {
+            end_children_with_this_process();
             let child = std::fs::File::create(self.config.with_extension("log")).and_then(|log| {
                 let err = log.try_clone()?;
                 Command::new(mediamtx_exe()).arg(&self.config).stdout(log).stderr(err).spawn()
@@ -640,12 +870,14 @@ mod video {
             self.child = Some(child.expect("MediaMTX starts"));
             let deadline = Instant::now() + Duration::from_secs(10);
             while self.get_paths().is_none() {
-                if Instant::now() > deadline {
-                    let log = std::fs::read_to_string(self.config.with_extension("log")).unwrap_or_default();
-                    panic!("MediaMTX API didn't come up; its log:\n{log}");
+                if self.child.as_mut().is_some_and(|c| c.try_wait().is_ok_and(|s| s.is_some())) {
+                    self.child = None;
+                    return false;
                 }
+                assert!(Instant::now() < deadline, "MediaMTX API didn't come up; its log:\n{}", read_log(&self.config));
                 std::thread::sleep(Duration::from_millis(50));
             }
+            true
         }
 
         fn kill(&mut self) {

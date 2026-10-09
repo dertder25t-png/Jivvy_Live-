@@ -26,10 +26,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # No GPU on GitHub's Windows runners: Media Foundation there is a software encoder
+          # that manages ~6 fps at 1080p, so the program uses x264, as on Linux.
           - os: windows-latest
             features: "--features video"
+            test_encoder: x264
           - os: ubuntu-latest
             features: "--features video"
+            test_encoder: ""
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -103,3 +107,4 @@ jobs:
       - run: cargo test --release ${{ matrix.features }}
         env:
           JIVVY_CHAOS_ITERATIONS: 100
+          JIVVY_TEST_ENCODER: ${{ matrix.test_encoder }}

@@ -31,7 +31,7 @@ use gstreamer_app as gst_app;
 
 use jivvy_daemon::client::{self, LevelsSender, Update};
 use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, RawDevice, Status};
-use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, ProgramConfig};
+use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, EncoderChoice, ProgramConfig};
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
 use program::{Feed, Program};
 use stream::Streamer;
@@ -45,6 +45,18 @@ struct Args {
     connect: String,
     supervised: bool,
     test_sources: bool,
+    /// Test hook `JIVVY_TEST_ENCODER=x264|mf`: the encoder to use, whatever `media.json` says.
+    /// CI's Windows runners have no GPU, where Media Foundation is a software encoder too slow
+    /// for 1080p30.
+    test_encoder: Option<EncoderChoice>,
+}
+
+fn test_encoder_from_env() -> Option<EncoderChoice> {
+    let name = std::env::var("JIVVY_TEST_ENCODER").ok().filter(|v| !v.trim().is_empty())?;
+    match serde_json::from_value(serde_json::Value::String(name.trim().to_ascii_lowercase())) {
+        Ok(e) => Some(e),
+        Err(_) => fail(&format!("JIVVY_TEST_ENCODER must be auto, mf, qsv or x264, not {name:?}")),
+    }
 }
 
 fn parse_args() -> Args {
@@ -53,6 +65,7 @@ fn parse_args() -> Args {
         connect: DEFAULT_LISTEN.into(),
         supervised: false,
         test_sources: media::test_sources_from_env(),
+        test_encoder: test_encoder_from_env(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -356,8 +369,15 @@ impl Video {
         let elapsed = self.last_rescan.map(|t| now.duration_since(t));
         self.problems.clear();
         match media::load_config(&self.args.data_dir) {
-            Ok(c) if self.args.test_sources => self.config = c.with_test_sources(),
-            Ok(c) => self.config = c,
+            Ok(mut c) => {
+                if self.args.test_sources {
+                    c = c.with_test_sources();
+                }
+                if let Some(encoder) = self.args.test_encoder {
+                    c.program.encoder = encoder;
+                }
+                self.config = c;
+            }
             Err(e) => self.problems.push(format!("{e}; keeping the last good setup")),
         }
         // A new program size or encoder rebuilds the program, and the camera with it
@@ -473,6 +493,9 @@ fn main() {
     }
     if args.test_sources {
         log("video", "test sources: every camera and microphone is a test pattern or tone");
+    }
+    if let Some(encoder) = args.test_encoder {
+        log("video", format!("test hook: encoder {} (JIVVY_TEST_ENCODER)", encoder.name()));
     }
     let levels = LevelsSender::start(args.connect.clone());
     let font: &'static [u8] = match jivvy_daemon::lyrics::load_font(None) {

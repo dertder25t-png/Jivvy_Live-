@@ -35,10 +35,12 @@ fn first_hardware_check(video: &Path, data_dir: &Path) {
     }
     println!("hardware-check started");
     let started = Instant::now();
+    // Supervised: it holds our stdin pipe and exits when we do, so a restarted watchdog never
+    // finds an old check still running (two checks would slow each other and race to save).
     let child = Command::new(video)
-        .args(["--hardware-check", "--data-dir"])
+        .args(["--hardware-check", "--supervised", "--data-dir"])
         .arg(data_dir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null()) // the report goes to hardware.json; the log to our stderr
         .spawn();
     let result = match child {

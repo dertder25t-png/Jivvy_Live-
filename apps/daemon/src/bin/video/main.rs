@@ -502,6 +502,10 @@ fn main() {
     if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
         fail(&format!("data dir {}: {e}", args.data_dir.display()));
     }
+    // First, so a hardware check started by the watchdog never outlives it either.
+    if args.supervised {
+        exit_when_orphaned("video");
+    }
     if args.hardware_check {
         let font = jivvy_daemon::lyrics::load_font(None).unwrap_or_else(|e| fail(&format!("lyric layer: {e}")));
         let (report, saved) = hwcheck::run(&args.data_dir, args.test_encoder, &font);
@@ -510,9 +514,6 @@ fn main() {
             fail(&format!("hardware check: {e}")); // exits 2: the check isn't done until it's saved
         }
         std::process::exit(if report.chosen.is_some() { 0 } else { 1 });
-    }
-    if args.supervised {
-        exit_when_orphaned("video");
     }
     if args.test_sources {
         log("video", "test sources: every camera and microphone is a test pattern or tone");

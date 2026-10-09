@@ -124,7 +124,9 @@ pub fn resolve(cfg: &ProgramConfig, set: ProgramSet, chosen: Option<Chosen>) -> 
         r.fps = c.fps;
     }
     if !set.bitrate {
-        r.bitrate_kbps = bitrate_for(r.width, r.height);
+        // For the size the program will really use: a typo in media.json is clamped first.
+        let size = r.sanitized();
+        r.bitrate_kbps = bitrate_for(size.width, size.height);
     }
     r
 }
@@ -281,6 +283,12 @@ mod tests {
 
         // No check yet: media.json as it is.
         assert_eq!(resolve(&defaults, ProgramSet::default(), None), defaults);
+
+        // A typo'd size with no bitrate: no overflow, and the bitrate is for the clamped size.
+        let typo = ProgramConfig { width: 100_000, height: 100_000, ..ProgramConfig::default() };
+        let set = ProgramSet { size: true, fps: false, bitrate: false };
+        let r = resolve(&typo, set, chosen);
+        assert_eq!(r.bitrate_kbps, bitrate_for(3840, 2160), "{r:?}");
     }
 
     #[test]

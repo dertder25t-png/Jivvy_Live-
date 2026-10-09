@@ -114,9 +114,9 @@ impl ProgramSet {
 }
 
 /// The video bitrate for a picture size: the default 1080p bitrate scaled by the number of
-/// pixels, at least 800 kbps.
+/// pixels, at least 800 kbps. Never overflows, whatever the size.
 pub fn bitrate_for(width: u32, height: u32) -> u32 {
-    let pixels = (width * height) as f64 / (1920.0 * 1080.0);
+    let pixels = (width as u64 * height as u64) as f64 / (1920.0 * 1080.0);
     ((ProgramConfig::default().bitrate_kbps as f64 * pixels) as u32).max(800)
 }
 
@@ -306,6 +306,14 @@ mod tests {
         let linux = |e: &str| e == "x264enc";
         assert_eq!(encoder_order(EncoderChoice::Mf, linux), [EncoderChoice::X264]);
         assert!(encoder_order(EncoderChoice::Auto, |_| false).is_empty());
+    }
+
+    #[test]
+    fn the_bitrate_follows_the_picture_size_and_never_overflows() {
+        assert_eq!(bitrate_for(1920, 1080), ProgramConfig::default().bitrate_kbps);
+        assert_eq!(bitrate_for(1280, 720), 2666);
+        assert_eq!(bitrate_for(320, 180), 800, "never below 800 kbps");
+        assert!(bitrate_for(u32::MAX, u32::MAX) > 0, "a typo'd size never panics");
     }
 
     #[test]

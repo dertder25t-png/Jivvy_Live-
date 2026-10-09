@@ -43,7 +43,22 @@ struct Daemon {
     video_starts: Receiver<u32>,
     addr: String,
     data_dir: TestDir,
+    /// Held while the daemon runs (see `QUIET`).
+    _quiet: Option<Quiet>,
 }
+
+/// A daemon's hold on `QUIET`: shared without video; exclusive for a video daemon that runs
+/// the hardware check itself (no report given to it).
+#[allow(dead_code)] // held, never read
+enum Quiet {
+    Shared(std::sync::RwLockReadGuard<'static, ()>),
+    Exclusive(std::sync::RwLockWriteGuard<'static, ()>),
+}
+
+/// The hardware check runs every encoder flat out. It takes this exclusively, and daemons
+/// without video share it, so it never starves a test that times restores, and it measures
+/// a quiet machine. (Video daemons are kept apart from it by `VideoSlot`.)
+static QUIET: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -206,7 +221,15 @@ fn start_at(mut port: u16, data_dir: TestDir, args: &DaemonArgs) -> Daemon {
     if args.seed_hardware && args.extra.contains(&"--video") {
         video::seed_hardware(&data_dir); // before taking a video slot: the check takes one
     }
-    let video_slot = (!args.extra.contains(&"--no-video")).then(VideoSlot::take);
+    let video = !args.extra.contains(&"--no-video");
+    let quiet = if !video {
+        Some(Quiet::Shared(QUIET.read().unwrap_or_else(|p| p.into_inner())))
+    } else if !args.seed_hardware {
+        Some(Quiet::Exclusive(QUIET.write().unwrap_or_else(|p| p.into_inner())))
+    } else {
+        None
+    };
+    let video_slot = video.then(VideoSlot::take);
     for attempt in 1..=5 {
         let addr = format!("127.0.0.1:{port}");
         let (mut watchdog, [engine_starts, outputs_starts, video_starts]) = spawn_watchdog(&data_dir, &addr, args);
@@ -219,6 +242,7 @@ fn start_at(mut port: u16, data_dir: TestDir, args: &DaemonArgs) -> Daemon {
                 video_starts,
                 addr,
                 data_dir,
+                _quiet: quiet,
             };
         }
         println!("attempt {attempt}: port {port} was taken; starting again on another");
@@ -336,22 +360,33 @@ impl Daemon {
     }
 
     /// Sends one command, retrying the connection until the engine answers or time runs out.
+    /// Once the command is written, waits for that command's answer instead of sending it
+    /// again: commands aren't idempotent (a resent `slide.next` moves two slides), and a busy
+    /// engine can be slow to answer. Only a connection that fails or drops before answering
+    /// (no engine yet, or it died) is retried.
     fn send(&self, command: Value, within: Duration) -> Value {
         let deadline = Instant::now() + within;
         let msg = format!("{}\n", json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }));
         loop {
-            let attempt = (|| -> std::io::Result<Value> {
-                let mut s = TcpStream::connect(&self.addr)?;
-                s.set_read_timeout(Some(Duration::from_millis(500)))?;
-                s.write_all(msg.as_bytes())?;
+            // Err((taken, error)): `taken` means the engine has the command; never resend it.
+            let attempt = (|| -> Result<Value, (bool, std::io::Error)> {
+                let mut s = TcpStream::connect(&self.addr).map_err(|e| (false, e))?;
+                s.write_all(msg.as_bytes()).map_err(|e| (false, e))?;
+                let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+                s.set_read_timeout(Some(left)).map_err(|e| (true, e))?;
                 let mut line = String::new();
-                BufReader::new(s).read_line(&mut line)?;
-                serde_json::from_str(&line).map_err(std::io::Error::other)
+                match BufReader::new(s).read_line(&mut line) {
+                    Ok(0) => Err((false, std::io::ErrorKind::UnexpectedEof.into())),
+                    Ok(_) => serde_json::from_str(&line).map_err(|e| (true, std::io::Error::other(e))),
+                    Err(e) if is_timeout(&e) => Err((true, e)),
+                    Err(e) => Err((false, e)),
+                }
             })();
             match attempt {
                 Ok(v) => return v,
-                Err(e) if Instant::now() >= deadline => panic!("engine did not answer in time: {e}"),
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                Err((true, e)) => panic!("engine took the command but did not answer in time: {e}"),
+                Err((false, e)) if Instant::now() >= deadline => panic!("engine did not answer in time: {e}"),
+                Err((false, _)) => std::thread::sleep(Duration::from_millis(20)),
             }
         }
     }
@@ -592,24 +627,40 @@ fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
     let deadline = Instant::now() + within;
     let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
     loop {
-        let attempt = (|| -> Result<Value, String> {
-            let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
-            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
-            let req = format!("ws://{addr}/").into_client_request().map_err(|e| e.to_string())?;
-            let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| e.to_string())?;
-            ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| e.to_string())?;
+        // Err((taken, error)): once sent, the command is never sent again, as in `Daemon::send`.
+        let attempt = (|| -> Result<Value, (bool, String)> {
+            let not_taken = |e: &dyn std::fmt::Display| (false, e.to_string());
+            let stream = TcpStream::connect(addr).map_err(|e| not_taken(&e))?;
+            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| not_taken(&e))?;
+            let req = format!("ws://{addr}/").into_client_request().map_err(|e| not_taken(&e))?;
+            let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| not_taken(&e))?;
+            ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| not_taken(&e))?;
+            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            ws.get_ref().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
             loop {
-                if let tungstenite::Message::Text(t) = ws.read().map_err(|e| e.to_string())? {
-                    return serde_json::from_str(&t).map_err(|e| e.to_string());
+                match ws.read() {
+                    Ok(tungstenite::Message::Text(t)) => {
+                        return serde_json::from_str(&t).map_err(|e| (true, e.to_string()));
+                    }
+                    Ok(_) => continue,
+                    Err(tungstenite::Error::Io(e)) if is_timeout(&e) => return Err((true, e.to_string())),
+                    Err(e) => return Err(not_taken(&e)),
                 }
             }
         })();
         match attempt {
             Ok(v) => return v,
-            Err(e) if Instant::now() >= deadline => panic!("engine did not answer over WebSocket in time: {e}"),
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            Err((true, e)) => panic!("engine took the command over WebSocket but did not answer in time: {e}"),
+            Err((false, e)) if Instant::now() >= deadline => {
+                panic!("engine did not answer over WebSocket in time: {e}")
+            }
+            Err((false, _)) => std::thread::sleep(Duration::from_millis(20)),
         }
     }
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 /// Runs `packages/protocol/fixtures/scenarios.json` against the real daemon, over its TCP
@@ -809,6 +860,7 @@ mod video {
     fn shared_hardware_check() -> &'static (Vec<u8>, bool) {
         static CHECK: std::sync::OnceLock<(Vec<u8>, bool)> = std::sync::OnceLock::new();
         CHECK.get_or_init(|| {
+            let _quiet = QUIET.write().unwrap_or_else(|p| p.into_inner());
             let _slot = VideoSlot::take();
             let dir = test_dir("hardware-check");
             let status = Command::new(env!("CARGO_BIN_EXE_jivvy-video"))
@@ -966,10 +1018,13 @@ mod video {
     #[test]
     fn the_program_runs_at_full_rate_with_lyrics_that_follow_the_slide() {
         let d = start_video("program-lyrics", r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#);
-        let s = d.media_status(Duration::from_secs(15), "program running at full rate", |s| {
-            program(s)["state"] == "running" && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+        // Full rate and real video together: an encoder's bitrate can still be ramping up in the
+        // first second after the frame rate gets there (Media Foundation on CI's runners).
+        let s = d.media_status(Duration::from_secs(15), "program at full rate, encoding real video", |s| {
+            program(s)["state"] == "running"
+                && program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+                && program(s)["kbps"].as_f64().unwrap_or(0.0) > 100.0
         });
-        assert!(program(&s)["kbps"].as_f64().unwrap() > 100.0, "encoding real video: {s}");
         assert_eq!(program(&s)["slate"], false);
 
         d.send(json!({ "type": "slide.goto", "index": 6 }), Duration::from_secs(5));

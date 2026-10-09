@@ -23,7 +23,11 @@ const RESTORE_TARGET: Duration = Duration::from_secs(3);
 /// `.\dev.ps1 test` and releases run the full 100.
 fn chaos_iterations() -> u64 {
     match std::env::var("JIVVY_CHAOS_ITERATIONS") {
-        Ok(n) => n.trim().parse().expect("JIVVY_CHAOS_ITERATIONS must be a whole number"),
+        // Zero would pass without a single kill, so it is refused like any bad value.
+        Ok(n) => match n.trim().parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => panic!("JIVVY_CHAOS_ITERATIONS must be a whole number of at least 1, got {n:?}"),
+        },
         Err(_) if std::env::var_os("CI").is_some() => 100,
         Err(_) => 10,
     }

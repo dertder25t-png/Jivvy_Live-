@@ -1,8 +1,9 @@
 # Daemon dev commands. GStreamer's paths are set for this process only, and only for the
 # commands that need the `video` feature (jivvy-video). Usage: .\dev.ps1 <command>
-#   .\dev.ps1 fast      -> FAST tier: unit tests (lib + bins) and the chaos tests without video,
+#   .\dev.ps1 fast      -> FAST tier: unit tests (lib + bins, not jivvy-video) and the chaos tests without video,
 #                          debug build, kill test at JIVVY_CHAOS_ITERATIONS (default 10). No GStreamer.
-#   .\dev.ps1 slow      -> SLOW tier: the video and streaming chaos tests (release, --features video)
+#   .\dev.ps1 slow      -> SLOW tier: jivvy-video unit tests and the video and streaming chaos tests
+#                          (release, --features video)
 #   .\dev.ps1 build     -> cargo build --release --features video
 #   .\dev.ps1 test      -> FULL: cargo test --release --features video, engine killed 100 times
 #   .\dev.ps1 <args>    -> cargo <args> with GStreamer's paths set
@@ -28,18 +29,22 @@ try {
   switch ($Rest[0]) {
     'fast' {
       $kills = if ($env:JIVVY_CHAOS_ITERATIONS) { $env:JIVVY_CHAOS_ITERATIONS } else { '10' }
-      Show-Tier 'FAST' "unit tests (lib + bins) and chaos tests without video, engine killed $kills times" 'video, streaming (run .\dev.ps1 slow)'
+      Show-Tier 'FAST' "unit tests (lib + bins, not jivvy-video) and chaos tests without video, engine killed $kills times" 'video and streaming tests, jivvy-video unit tests (run .\dev.ps1 slow)'
       cargo test @($Rest | Select-Object -Skip 1)
       $code = $LASTEXITCODE
-      Show-Tier 'FAST' "finished, exit $code" 'video, streaming (run .\dev.ps1 slow)'
+      Show-Tier 'FAST' "finished, exit $code" 'video and streaming tests, jivvy-video unit tests (run .\dev.ps1 slow)'
       exit $code
     }
     'slow' {
       Use-GStreamer
-      Show-Tier 'SLOW' 'video and streaming chaos tests (GStreamer test sources, MediaMTX, fake YouTube)' $null
-      # Extra args go to the test binary, e.g. .\dev.ps1 slow --nocapture
-      cargo test --release --features video --test chaos -- video:: @($Rest | Select-Object -Skip 1)
+      Show-Tier 'SLOW' 'jivvy-video unit tests, then the video and streaming chaos tests (GStreamer test sources, MediaMTX, fake YouTube)' $null
+      # Extra args go to the test binaries, e.g. .\dev.ps1 slow --nocapture
+      cargo test --release --features video --bin jivvy-video -- @($Rest | Select-Object -Skip 1)
       $code = $LASTEXITCODE
+      if ($code -eq 0) {
+        cargo test --release --features video --test chaos -- video:: @($Rest | Select-Object -Skip 1)
+        $code = $LASTEXITCODE
+      }
       Show-Tier 'SLOW' "finished, exit $code" $null
       exit $code
     }

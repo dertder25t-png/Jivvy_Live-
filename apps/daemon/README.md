@@ -131,7 +131,7 @@ cargo run --release --bin jivvy-watchdog -- --data-dir .\tmp --listen 127.0.0.1:
 
 ```powershell
 .\dev.ps1 fast           # FAST tier: unit tests + chaos tests without camera/audio, debug, engine killed 10 times (no GStreamer needed)
-.\dev.ps1 slow           # SLOW tier: the video and streaming chaos tests only (GStreamer + MediaMTX)
+.\dev.ps1 slow           # SLOW tier: jivvy-video unit tests + the video and streaming chaos tests (GStreamer + MediaMTX)
 .\dev.ps1 test           # FULL: everything, release, engine killed 100 times (what CI runs)
 cargo test --release      # unit tests + chaos tests without camera/audio
 .\dev.ps1 build          # builds jivvy-video too

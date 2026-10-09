@@ -130,10 +130,14 @@ cargo run --release --bin jivvy-watchdog -- --data-dir .\tmp --listen 127.0.0.1:
 ## Test
 
 ```powershell
-cargo test --release      # unit tests + chaos tests (about 3 minutes), without camera/audio
-.\dev.ps1 test           # the same plus the video tests (sets GStreamer's paths for this process)
+.\dev.ps1 fast           # FAST tier: unit tests + chaos tests without camera/audio, debug, engine killed 10 times (no GStreamer needed)
+.\dev.ps1 slow           # SLOW tier: the video and streaming chaos tests only (GStreamer + MediaMTX)
+.\dev.ps1 test           # FULL: everything, release, engine killed 100 times (what CI runs)
+cargo test --release      # unit tests + chaos tests without camera/audio
 .\dev.ps1 build          # builds jivvy-video too
 ```
+
+The kill test kills the engine `JIVVY_CHAOS_ITERATIONS` times: 10 by default locally, 100 in CI (GitHub sets `CI`), in `.\dev.ps1 test` and before releases. Use the fast tier while iterating. A fast pass never covers video: run `.\dev.ps1 slow` before any PR that touches video, stream, bandwidth, HLS or tiers code (CI runs it on every PR and nightly either way).
 
 CI runs the video tests on Linux; the Windows CI job builds without the `video` feature until GStreamer is installed there.
 

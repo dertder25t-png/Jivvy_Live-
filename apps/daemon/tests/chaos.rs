@@ -18,6 +18,17 @@ use serde_json::{Value, json};
 
 const RESTORE_TARGET: Duration = Duration::from_secs(3);
 
+/// How many times the kill test kills the engine: `JIVVY_CHAOS_ITERATIONS` if set, else the
+/// reliability table's full 100 in CI (GitHub Actions sets `CI`) and 10 for a quick local run.
+/// `.\dev.ps1 test` and releases run the full 100.
+fn chaos_iterations() -> u64 {
+    match std::env::var("JIVVY_CHAOS_ITERATIONS") {
+        Ok(n) => n.trim().parse().expect("JIVVY_CHAOS_ITERATIONS must be a whole number"),
+        Err(_) if std::env::var_os("CI").is_some() => 100,
+        Err(_) => 10,
+    }
+}
+
 struct Daemon {
     watchdog: Child,
     /// Held while this daemon runs a video process (see `VIDEO_SLOTS`).
@@ -223,7 +234,8 @@ fn engine_killed_100_times_comes_back_on_the_same_slide_in_under_3_seconds() {
     let d = start("kill100", 10);
     let mut pid = d.next_engine_pid(Duration::from_secs(10));
     let mut worst = Duration::ZERO;
-    for i in 0..100u64 {
+    let kills = chaos_iterations();
+    for i in 0..kills {
         let (slide, black) = (i * 7 % 10, i % 3 == 0);
         let r = d.send(json!({ "type": "slide.goto", "index": slide }), Duration::from_secs(5));
         assert_eq!(r["ok"], json!(true), "goto failed: {r}");
@@ -239,7 +251,7 @@ fn engine_killed_100_times_comes_back_on_the_same_slide_in_under_3_seconds() {
         assert_eq!(r["state"]["slideIndex"], json!(slide), "kill {i}: wrong slide");
         assert_eq!(r["state"]["black"], json!(black), "kill {i}: wrong black state");
     }
-    println!("100 kills; slowest return to the same slide: {worst:?}");
+    println!("{kills} kills; slowest return to the same slide: {worst:?}");
 }
 
 #[test]

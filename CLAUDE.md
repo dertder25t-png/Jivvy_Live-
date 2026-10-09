@@ -27,7 +27,7 @@ Daemon (in `apps/daemon`): `.\dev.ps1 check` (fmt, clippy, fast tier, npm typech
 - Before every push: `.\dev.ps1 check`.
 - Once per PR: `.\dev.ps1 test-full`, and `.\dev.ps1 slow` before any PR touching video, stream, bandwidth, HLS or tiers code. CI runs everything on Windows and Linux at full strength either way.
 - New behavior goes in this order: `packages/protocol` (command and fixtures), then `packages/sim-daemon`, then the real daemon. Describe it in `packages/protocol/fixtures/scenarios.json` first; both daemons must pass it.
-- Never shorten a chaos test's outage or "nothing happens" waits or loosen a reliability target (3 s restore, 25 fps, 15 s catch-up) to make a test pass; report the margin instead.
+- Never shorten a chaos test's outage or "nothing happens" waits, loosen a reliability target from the plan (back on the same slide within 3 s, stream recovers by itself from a blip under 30 s, no-audio or stream-down alert within 15 s), or loosen a chaos test's threshold (program at 25 fps or more, YouTube HLS caught up within 15 s of the connection returning) to make a test pass; report the margin instead.
 - Run the daemon without a camera or microphone with `--test-sources`.
 
 ## Brand

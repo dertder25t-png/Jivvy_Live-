@@ -1,7 +1,10 @@
 //! `jivvy-video`: camera / capture card and audio input. Normally started by `jivvy-watchdog`.
 //! Built only with the `video` feature (it needs GStreamer installed).
 //!
-//! jivvy-video [--data-dir DIR] [--connect ADDR] [--supervised]
+//! jivvy-video [--data-dir DIR] [--connect ADDR] [--supervised] [--test-sources]
+//!
+//! `--test-sources` (or `JIVVY_TEST_SOURCES=1`) uses a test pattern and tone for every
+//! camera and microphone, whatever `media.json` names: no devices needed.
 //!
 //! Camera and microphone run as separate pipelines, so one device failing never stops the
 //! other. A device that is unplugged or fails is retried every second and picked up again
@@ -41,10 +44,16 @@ struct Args {
     data_dir: PathBuf,
     connect: String,
     supervised: bool,
+    test_sources: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { data_dir: default_data_dir(), connect: DEFAULT_LISTEN.into(), supervised: false };
+    let mut a = Args {
+        data_dir: default_data_dir(),
+        connect: DEFAULT_LISTEN.into(),
+        supervised: false,
+        test_sources: media::test_sources_from_env(),
+    };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
@@ -52,6 +61,7 @@ fn parse_args() -> Args {
             "--data-dir" => a.data_dir = val().into(),
             "--connect" => a.connect = val(),
             "--supervised" => a.supervised = true,
+            "--test-sources" => a.test_sources = true,
             other => fail(&format!("unknown flag {other}")),
         }
     }
@@ -346,6 +356,7 @@ impl Video {
         let elapsed = self.last_rescan.map(|t| now.duration_since(t));
         self.problems.clear();
         match media::load_config(&self.args.data_dir) {
+            Ok(c) if self.args.test_sources => self.config = c.with_test_sources(),
             Ok(c) => self.config = c,
             Err(e) => self.problems.push(format!("{e}; keeping the last good setup")),
         }
@@ -459,6 +470,9 @@ fn main() {
     }
     if args.supervised {
         exit_when_orphaned("video");
+    }
+    if args.test_sources {
+        log("video", "test sources: every camera and microphone is a test pattern or tone");
     }
     let levels = LevelsSender::start(args.connect.clone());
     let font: &'static [u8] = match jivvy_daemon::lyrics::load_font(None) {

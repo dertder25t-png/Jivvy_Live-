@@ -124,6 +124,29 @@ pub struct MediaConfig {
     pub program: crate::program::ProgramConfig,
 }
 
+/// Environment variable for test sources, the same as `--test-sources`: `JIVVY_TEST_SOURCES=1`.
+pub const TEST_SOURCES_ENV: &str = "JIVVY_TEST_SOURCES";
+
+/// Whether the environment asks for test sources (`JIVVY_TEST_SOURCES=1`).
+pub fn test_sources_from_env() -> bool {
+    std::env::var(TEST_SOURCES_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
+impl MediaConfig {
+    /// Test sources (`--test-sources`): every camera and microphone becomes a generated test
+    /// pattern or tone, whatever `media.json` names, so the whole daemon runs on a machine
+    /// with no camera, capture card or microphone. An input set to `none` stays off, and the
+    /// program settings are kept.
+    pub fn with_test_sources(mut self) -> MediaConfig {
+        for input in [&mut self.camera, &mut self.microphone] {
+            if *input != Selection::None {
+                *input = Selection::Test;
+            }
+        }
+        self
+    }
+}
+
 /// Reads `media.json`; missing means defaults. Invalid is an error and the caller keeps
 /// what it is already using.
 pub fn load_config(dir: &Path) -> Result<MediaConfig, String> {
@@ -283,6 +306,18 @@ pub struct Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sources_replace_every_device_but_leave_an_input_that_is_off() {
+        let camera = Selection::Device { id: "usb-1".into(), name: "Blackmagic ATEM".into() };
+        let c = MediaConfig { version: CONFIG_VERSION, camera, microphone: Selection::Auto, ..Default::default() };
+        let t = c.clone().with_test_sources();
+        assert_eq!((t.camera, t.microphone), (Selection::Test, Selection::Test));
+        assert_eq!(t.program, c.program, "program settings kept");
+
+        let slides_only = MediaConfig { camera: Selection::None, ..c }.with_test_sources();
+        assert_eq!((slides_only.camera, slides_only.microphone), (Selection::None, Selection::Test));
+    }
 
     fn raw(name: &str, class: &str, props: &[(&str, &str)]) -> RawDevice {
         RawDevice {

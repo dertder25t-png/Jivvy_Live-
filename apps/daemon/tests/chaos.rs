@@ -714,6 +714,27 @@ mod video {
         d.media_status(Duration::from_secs(3), "camera running", |s| s["camera"]["state"] == "running");
     }
 
+    #[test]
+    fn with_test_sources_the_whole_daemon_runs_without_any_device() {
+        // Names a capture card that isn't here and the default microphone: --test-sources
+        // replaces both, so this runs on a machine with no camera or microphone at all.
+        let dir = test_dir("test-sources");
+        std::fs::write(
+            dir.join("media.json"),
+            r#"{"version":1,"camera":{"use":"device","id":"no-such-path","name":"Blackmagic ATEM"},"microphone":{"use":"auto"}}"#,
+        )
+        .unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video"), "--test-sources"]);
+        let s = d.media_status(Duration::from_secs(15), "camera, microphone and program on test sources", |s| {
+            s["camera"]["state"] == "running"
+                && s["microphone"]["state"] == "running"
+                && program(s)["state"] == "running"
+                && program(s)["slate"] == false
+        });
+        assert_eq!(s["camera"]["choice"]["source"], "test", "{}", s["camera"]);
+        d.wait_for_levels(Duration::from_secs(5), is_test_tone);
+    }
+
     fn program(s: &Value) -> &Value {
         &s["program"]
     }

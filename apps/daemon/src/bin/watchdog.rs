@@ -1,7 +1,8 @@
 //! `jivvy-watchdog`: starts and supervises `jivvy-engine`, `jivvy-outputs` and `jivvy-video`.
 //!
 //! jivvy-watchdog [--data-dir DIR] [--listen ADDR] [--no-outputs | --outputs-headless] [--no-video]
-//!                [--engine PATH] [--outputs PATH] [--video PATH] [--hang-timeout-ms N] [engine args...]
+//!                [--engine PATH] [--outputs PATH] [--video PATH] [--hang-timeout-ms N] [--test-sources]
+//!                [engine args...]
 //!
 //! `--data-dir` and `--listen` go to every child (the others connect to the engine there).
 //! `jivvy-video` is skipped when it isn't installed (builds without the `video` feature).
@@ -25,6 +26,7 @@ fn main() {
     let mut engine = sibling("jivvy-engine");
     let mut outputs = Some(sibling("jivvy-outputs"));
     let mut outputs_headless = false;
+    let mut test_sources = false;
     let mut video = Some(sibling("jivvy-video"));
     let mut hang_timeout = Duration::from_secs(2);
     let mut shared: Vec<String> = Vec::new();
@@ -40,6 +42,8 @@ fn main() {
             "--outputs-headless" => outputs_headless = true,
             "--video" => video = Some(value(&mut args, "--video").into()),
             "--no-video" => video = None,
+            // Camera and microphone from test sources: runs on any machine (see jivvy-video).
+            "--test-sources" => test_sources = true,
             "--hang-timeout-ms" => {
                 hang_timeout =
                     Duration::from_millis(value(&mut args, "--hang-timeout-ms").parse().expect("a number of ms"))
@@ -68,7 +72,10 @@ fn main() {
     }
     match video {
         Some(exe) if exe.exists() => {
-            let args = [shared, vec!["--connect".into(), listen]].concat();
+            let mut args = [shared, vec!["--connect".into(), listen]].concat();
+            if test_sources {
+                args.push("--test-sources".into());
+            }
             // Start-up loads GStreamer's GPU, encoder and device plugins: about 5 s normally,
             // much longer on a busy machine (e.g. Windows Update at boot). Killing it for a
             // slow start would mean it never starts, so the first heartbeat gets 30 s.

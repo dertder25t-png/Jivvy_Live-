@@ -898,20 +898,9 @@ mod video {
                 std::fs::write(
                     &config,
                     format!(
-                        "logLevel: warn
-api: true
-apiAddress: 127.0.0.1:{api}
-rtmp: true
-rtmpAddress: 127.0.0.1:{rtmp}
-                         rtsp: false
-hls: false
-webrtc: false
-srt: false
-moq: false
-playback: false
-                         paths:
-  all_others:
-"
+                        "logLevel: warn\napi: true\napiAddress: 127.0.0.1:{api}\nrtmp: true\nrtmpAddress: 127.0.0.1:{rtmp}\n\
+                         rtsp: false\nhls: false\nwebrtc: false\nsrt: false\nmoq: false\nplayback: false\n\
+                         paths:\n  all_others:\n"
                     ),
                 )
                 .unwrap();
@@ -920,21 +909,12 @@ playback: false
                     return m;
                 }
             }
-            panic!(
-                "MediaMTX could not get its ports in 5 tries; its log:
-{}",
-                read_log(&config)
-            );
+            panic!("MediaMTX could not get its ports in 5 tries; its log:\n{}", read_log(&config));
         }
 
         /// Starts MediaMTX again on the same ports, as a server coming back after an outage.
         fn restart(&mut self) {
-            assert!(
-                self.try_start(),
-                "MediaMTX exited at start; its log:
-{}",
-                read_log(&self.config)
-            );
+            assert!(self.try_start(), "MediaMTX exited at start; its log:\n{}", read_log(&self.config));
         }
 
         /// Starts MediaMTX and waits for its API: false if it exited first (a port was taken).
@@ -951,12 +931,7 @@ playback: false
                     self.child = None;
                     return false;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "MediaMTX API didn't come up; its log:
-{}",
-                    read_log(&self.config)
-                );
+                assert!(Instant::now() < deadline, "MediaMTX API didn't come up; its log:\n{}", read_log(&self.config));
                 std::thread::sleep(Duration::from_millis(50));
             }
             true

@@ -69,6 +69,62 @@ pub struct Report {
     pub chosen: Option<Chosen>,
     /// The choice in plain words, for the tech lead.
     pub reason: String,
+    /// What could change the answer (see `fingerprint`), so a new graphics card or driver, or a
+    /// different computer, is noticed. Empty in reports written before it existed.
+    #[serde(default)]
+    pub fingerprint: String,
+}
+
+/// Virtual and remote display adapters (Parsec, Remote Desktop) come and go without any change
+/// to the graphics hardware, so they're left out of the fingerprint.
+fn is_real_adapter(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !(n.contains("virtual display") || n.contains("remote display"))
+}
+
+/// What the fingerprint is made of.
+#[derive(Debug, Clone, Copy)]
+pub struct Machine<'a> {
+    pub os: &'a str,
+    pub arch: &'a str,
+    /// The processor model, e.g. "Intel(R) Core(TM) i5-8250U"; empty if unknown.
+    pub cpu: &'a str,
+    pub cores: usize,
+    /// GStreamer's core version.
+    pub gstreamer: &'a str,
+    /// `element=plugin version` (or `element=missing`) for each element the check measures with.
+    pub plugins: &'a [String],
+    /// Graphics adapters with their driver versions.
+    pub adapters: &'a [String],
+}
+
+/// Everything that could change which setting keeps up: the OS and architecture, the processor
+/// model and core count, GStreamer's version and the version of each plugin the check measures
+/// with (installing, removing or updating one changes what can run without changing GStreamer's
+/// core), and the graphics adapters with their driver versions. Lists are compared in any
+/// order. Equal fingerprints mean the old measurement still applies; a different one means
+/// measure again.
+pub fn fingerprint(m: &Machine) -> String {
+    let sorted = |items: &[String], keep: fn(&str) -> bool| {
+        let mut v: Vec<&str> = items.iter().map(|a| a.trim()).filter(|a| !a.is_empty() && keep(a)).collect();
+        v.sort_unstable();
+        v.join(" | ")
+    };
+    format!(
+        "{}/{}; {} ({} cores); {}; plugins: {}; graphics: {}",
+        m.os,
+        m.arch,
+        m.cpu.trim(),
+        m.cores,
+        m.gstreamer,
+        sorted(m.plugins, |_| true),
+        sorted(m.adapters, is_real_adapter)
+    )
+}
+
+/// Whether the saved report no longer fits this machine (or predates fingerprints).
+pub fn needs_recheck(report: &Report, current: &str) -> bool {
+    report.fingerprint != current
 }
 
 /// The settings to try at each quality, in order of preference: the graphics chip before the
@@ -292,6 +348,102 @@ mod tests {
     }
 
     #[test]
+    fn a_new_driver_card_or_computer_means_measure_again() {
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let plugins = v(&["x264enc=1.28.6", "mfh264enc=1.28.6", "d3d12upload=1.28.6"]);
+        let adapters = v(&["Intel UHD 32.0.101.8860", "AMD RX 6700 XT 32.0.21045"]);
+        let machine =
+            |cpu: &'static str, cores, gst: &'static str, plugins: &'static [String], adapters: &'static [String]| {
+                fingerprint(&Machine { os: "windows", arch: "x86_64", cpu, cores, gstreamer: gst, plugins, adapters })
+            };
+        let (plugins, adapters): (&'static [String], &'static [String]) =
+            (Box::leak(plugins.into_boxed_slice()), Box::leak(adapters.into_boxed_slice()));
+        let base = machine("Intel(R) Core(TM) i5-8250U", 8, "1.28.6", plugins, adapters);
+
+        // The same machine: lists in another order, stray spaces, a virtual display (Parsec,
+        // Remote Desktop) appearing or not: none of that is a hardware change.
+        let reordered = v(&["d3d12upload=1.28.6", "x264enc=1.28.6 ", "mfh264enc=1.28.6"]);
+        let adapters2 = v(&[
+            " AMD RX 6700 XT 32.0.21045",
+            "Parsec Virtual Display Adapter 0.45.0.0",
+            "Intel UHD 32.0.101.8860 ",
+            "",
+        ]);
+        assert_eq!(
+            base,
+            machine(
+                "Intel(R) Core(TM) i5-8250U ",
+                8,
+                "1.28.6",
+                Box::leak(reordered.into_boxed_slice()),
+                Box::leak(adapters2.into_boxed_slice())
+            )
+        );
+
+        let leak = |items: &[&str]| -> &'static [String] { Box::leak(v(items).into_boxed_slice()) };
+        for (what, changed) in [
+            (
+                "another processor with the same core count",
+                machine("Intel(R) Core(TM) i3-7100U", 8, "1.28.6", plugins, adapters),
+            ),
+            ("a different number of cores", machine("Intel(R) Core(TM) i5-8250U", 4, "1.28.6", plugins, adapters)),
+            ("GStreamer updated", machine("Intel(R) Core(TM) i5-8250U", 8, "1.29.0", plugins, adapters)),
+            (
+                "a plugin updated on its own",
+                machine(
+                    "Intel(R) Core(TM) i5-8250U",
+                    8,
+                    "1.28.6",
+                    leak(&["x264enc=1.28.7", "mfh264enc=1.28.6", "d3d12upload=1.28.6"]),
+                    adapters,
+                ),
+            ),
+            (
+                "a plugin removed",
+                machine(
+                    "Intel(R) Core(TM) i5-8250U",
+                    8,
+                    "1.28.6",
+                    leak(&["x264enc=1.28.6", "mfh264enc=missing", "d3d12upload=1.28.6"]),
+                    adapters,
+                ),
+            ),
+            (
+                "a graphics driver updated",
+                machine(
+                    "Intel(R) Core(TM) i5-8250U",
+                    8,
+                    "1.28.6",
+                    plugins,
+                    leak(&["Intel UHD 32.0.101.9999", "AMD RX 6700 XT 32.0.21045"]),
+                ),
+            ),
+            (
+                "a graphics card removed",
+                machine("Intel(R) Core(TM) i5-8250U", 8, "1.28.6", plugins, leak(&["Intel UHD 32.0.101.8860"])),
+            ),
+        ] {
+            assert_ne!(base, changed, "{what} must count as a change");
+        }
+        let mut r = Report {
+            version: REPORT_VERSION,
+            checked_at_ms: 1,
+            os: "windows".into(),
+            cpus: 4,
+            trials: vec![],
+            chosen: None,
+            reason: String::new(),
+            fingerprint: base.clone(),
+        };
+        assert!(!needs_recheck(&r, &base));
+        assert!(needs_recheck(&r, "another machine"));
+        r.fingerprint.clear(); // a report from before fingerprints: measured once more, then it has one
+        assert!(needs_recheck(&r, &base));
+        let old = r#"{"version":1,"checkedAtMs":1,"os":"windows","cpus":4,"trials":[],"chosen":null,"reason":""}"#;
+        assert_eq!(serde_json::from_str::<Report>(old).unwrap().fingerprint, "");
+    }
+
+    #[test]
     fn the_report_round_trips_as_json() {
         let trials = vec![trial(Path::Cpu, X264, 0, Some(60.0))];
         let chosen = choose(&trials, &candidates(false, &[X264]));
@@ -303,6 +455,7 @@ mod tests {
             reason: reason(&trials, chosen),
             trials,
             chosen,
+            fingerprint: "test".into(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"capacityFps\":60.0") && json.contains("\"path\":\"cpu\""), "{json}");

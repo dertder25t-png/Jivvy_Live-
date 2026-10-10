@@ -2,19 +2,21 @@
 //!
 //! jivvy-watchdog [--data-dir DIR] [--listen ADDR] [--no-outputs | --outputs-headless] [--no-video]
 //!                [--engine PATH] [--outputs PATH] [--video PATH] [--hang-timeout-ms N] [--test-sources]
+//!                [--recheck-hardware | --no-hardware-check]
 //!                [engine args...]
 //!
 //! `--data-dir` and `--listen` go to every child (the others connect to the engine there).
 //! `jivvy-video` is skipped when it isn't installed (builds without the `video` feature).
-//! The first time video runs on a machine (no `hardware.json` yet), the hardware check runs
-//! before it, while the engine and outputs are already up (see `first_hardware_check`).
+//! Before video starts, the hardware check runs if there's no `hardware.json` yet or this machine
+//! no longer matches the one it was made on (a new graphics card or driver, another computer),
+//! while the engine and outputs are already up (see `hardware_check`). `--recheck-hardware`
+//! measures again whatever the report says; `--no-hardware-check` skips it.
 //! Anything else it doesn't recognise is passed through to the engine.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use jivvy_daemon::hardware;
 use jivvy_daemon::watchdog::{ChildSpec, run, supervise};
 
 /// A first hardware check that hasn't finished by now is stopped, and video starts anyway.
@@ -25,21 +27,35 @@ fn sibling(name: &str) -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&exe_name))).unwrap_or(exe_name.into())
 }
 
-/// Setup: the first time video runs on this machine (no `hardware.json` yet), measure the
-/// machine so the program starts on a picture path, encoder and quality that keep up. Slides
-/// and outputs are already running; only video waits. It runs only while there's no report, so
-/// a restart mid-service is never delayed; checking again later is a pre-flight action.
-fn first_hardware_check(video: &Path, data_dir: &Path) {
-    if hardware::load(data_dir).is_some() {
+/// When the hardware check runs before video.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckMode {
+    /// No report yet, or this machine differs from the one it was made on (the default).
+    IfChanged,
+    /// Whatever the report says (`--recheck-hardware`).
+    Always,
+    /// Never (`--no-hardware-check`): video uses the report as it is.
+    Never,
+}
+
+/// Setup: make sure the program starts on a picture path, encoder and quality that keep up on
+/// *this* machine. Slides and outputs are already running; only video waits, and only when the
+/// machine changed (or never was measured). A check that finds nothing changed takes about a
+/// second, so a restart mid-service is not held up.
+fn hardware_check(video: &Path, data_dir: &Path, mode: CheckMode) {
+    if mode == CheckMode::Never {
         return;
     }
     println!("hardware-check started");
     let started = Instant::now();
     // Supervised: it holds our stdin pipe and exits when we do, so a restarted watchdog never
     // finds an old check still running (two checks would slow each other and race to save).
-    let child = Command::new(video)
-        .args(["--hardware-check", "--supervised", "--data-dir"])
-        .arg(data_dir)
+    let mut cmd = Command::new(video);
+    cmd.args(["--hardware-check", "--supervised", "--data-dir"]).arg(data_dir);
+    if mode == CheckMode::IfChanged {
+        cmd.arg("--if-changed");
+    }
+    let child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::null()) // the report goes to hardware.json; the log to our stderr
         .spawn();
@@ -70,6 +86,7 @@ fn main() {
     let mut outputs = Some(sibling("jivvy-outputs"));
     let mut outputs_headless = false;
     let mut test_sources = false;
+    let mut check_mode = CheckMode::IfChanged;
     let mut video = Some(sibling("jivvy-video"));
     let mut hang_timeout = Duration::from_secs(2);
     let mut shared: Vec<String> = Vec::new();
@@ -87,6 +104,8 @@ fn main() {
             "--no-video" => video = None,
             // Camera and microphone from test sources: runs on any machine (see jivvy-video).
             "--test-sources" => test_sources = true,
+            "--recheck-hardware" => check_mode = CheckMode::Always,
+            "--no-hardware-check" => check_mode = CheckMode::Never,
             "--hang-timeout-ms" => {
                 hang_timeout =
                     Duration::from_millis(value(&mut args, "--hang-timeout-ms").parse().expect("a number of ms"))
@@ -130,7 +149,7 @@ fn main() {
             // slow start would mean it never starts, so the first heartbeat gets 30 s.
             let spec = ChildSpec { name: "video", exe, args, hang_timeout, startup_grace: Duration::from_secs(30) };
             std::thread::spawn(move || {
-                first_hardware_check(&spec.exe, &data_dir);
+                hardware_check(&spec.exe, &data_dir, check_mode);
                 supervise(spec)
             });
         }

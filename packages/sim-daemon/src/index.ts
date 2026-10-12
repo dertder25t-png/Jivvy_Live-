@@ -130,15 +130,27 @@ export class SimDaemon implements DaemonLike {
   /** Kill the engine. It restarts from the last snapshot on the same slide. */
   crash(): void {
     if (this.state.restarting) return;
-    // Nothing is written while the video process is down; the file set is resumed when it returns.
-    this.state = { ...this.state, restarting: true, recording: this.wantRecording ? "waiting" : "off" };
+    // Only the engine dies: the video process keeps writing the same recording file.
+    this.state = { ...this.state, restarting: true };
     this.emit();
     this.setTimer(() => {
       this.state = { ...this.snapshot, restarting: false, uplink: this.state.uplink, diskFreeGb: this.state.diskFreeGb };
       this.state.stream = this.wantStream ? (this.state.uplink === "down" ? "reconnecting" : "live") : "off";
-      // The video process comes back writing a new file in the same set; nothing already recorded is touched.
-      if (this.wantRecording) this.state = { ...this.state, recording: "recording", recordingParts: this.state.recordingParts + 1 };
       this.emit();
+    }, this.restartMs);
+  }
+
+  /**
+   * Kill the video process. Nothing is written while it is down; it comes back writing a new
+   * file in the same set, and nothing already recorded is touched.
+   */
+  crashVideo(): void {
+    if (!this.wantRecording || this.state.recording !== "recording") return;
+    this.state = { ...this.state, recording: "waiting" };
+    this.emit();
+    this.setTimer(() => {
+      if (!this.wantRecording) return;
+      this.set({ recording: "recording", recordingParts: this.state.recordingParts + 1 });
     }, this.restartMs);
   }
 

@@ -130,12 +130,7 @@ fn run(data_dir: &Path, feed: &Arc<Feed>, info: &Arc<Mutex<RecordingInfo>>) {
             }
             Some(false) => {
                 // Over: the next recording starts a new set, and this one can be converted.
-                recording::finish(data_dir);
-                update(info, |i| {
-                    (i.wanted, i.status, i.set, i.file, i.parts, i.bytes) =
-                        (false, "off", String::new(), String::new(), 0, 0);
-                    i.detail.clear();
-                });
+                end_recording(data_dir, info);
                 attempt = 0;
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
@@ -145,7 +140,13 @@ fn run(data_dir: &Path, feed: &Arc<Feed>, info: &Arc<Mutex<RecordingInfo>>) {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| session(data_dir, feed, info, &mut settings)))
             .unwrap_or_else(|_| Err("the recorder crashed".into()));
         match result {
-            Ok(_) => attempt = 0,
+            // Seen stopping: close the set now, so a start that follows at once begins a new
+            // one instead of carrying on in this one.
+            Ok(End::Stopped) => {
+                attempt = 0;
+                end_recording(data_dir, info);
+            }
+            Ok(End::Changed) => attempt = 0,
             Err(e) => {
                 attempt += 1;
                 log("video", format!("recording: {e}; carrying on in a new file"));
@@ -159,6 +160,15 @@ fn run(data_dir: &Path, feed: &Arc<Feed>, info: &Arc<Mutex<RecordingInfo>>) {
             }
         }
     }
+}
+
+/// The recording is over: closes the set and clears what the screen shows about it.
+fn end_recording(data_dir: &Path, info: &Mutex<RecordingInfo>) {
+    recording::finish(data_dir);
+    update(info, |i| {
+        (i.wanted, i.status, i.set, i.file, i.parts, i.bytes) = (false, "off", String::new(), String::new(), 0, 0);
+        i.detail.clear();
+    });
 }
 
 /// Why a part ended without a failure.

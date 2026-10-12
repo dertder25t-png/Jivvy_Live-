@@ -55,11 +55,16 @@ describe("SimDaemon", () => {
     expect(await send({ type: "state.get" })).toMatchObject({ ok: true, state: { slideIndex: 2, black: false, stream: "off", streamWanted: false } });
   });
 
-  it("recording: crash resumes into the same file set and slides never notice", async () => {
+  it("recording: an engine crash never interrupts it, a video crash resumes into the same file set", async () => {
     const { d, send, fire } = setup();
     expect(await send({ type: "recording.start" })).toMatchObject({ ok: true, state: { recording: "recording", recordingWanted: true } });
     expect(d.getState().recordingParts).toBe(1);
     d.crash();
+    expect(d.getState().recording).toBe("recording");
+    fire();
+    expect(d.getState()).toMatchObject({ recording: "recording", recordingParts: 1 });
+
+    d.crashVideo();
     expect(d.getState().recording).toBe("waiting");
     fire();
     expect(d.getState()).toMatchObject({ recording: "recording", recordingParts: 2 });

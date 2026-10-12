@@ -33,6 +33,16 @@ pub enum Command {
     MediaLevels(Levels),
     #[serde(rename = "stream.report")]
     StreamReport { status: StreamStatus },
+    #[serde(rename = "recording.start")]
+    RecordingStart,
+    #[serde(rename = "recording.stop")]
+    RecordingStop,
+    #[serde(rename = "recording.report")]
+    RecordingReport {
+        status: RecordingStatus,
+        #[serde(rename = "lowDisk")]
+        low_disk: bool,
+    },
 }
 
 /// Audio input levels in dBFS, one entry per channel.
@@ -87,6 +97,16 @@ pub enum StreamStatus {
     Reconnecting,
 }
 
+/// `Waiting`: a recording was asked for but nothing is being written yet (starting, or
+/// resuming after a crash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingStatus {
+    Off,
+    Recording,
+    Waiting,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateSnapshot {
@@ -95,6 +115,11 @@ pub struct StateSnapshot {
     pub stream: StreamStatus,
     /// The operator asked for the stream to be on (it may be reconnecting).
     pub stream_wanted: bool,
+    pub recording: RecordingStatus,
+    /// The operator asked for the recording to be on (it may be resuming).
+    pub recording_wanted: bool,
+    /// The disk the recording goes to has under 10 GB free.
+    pub recording_low_disk: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -177,6 +202,17 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "stream.stop" => Command::StreamStop,
         "state.get" => Command::StateGet,
         "state.subscribe" => Command::StateSubscribe,
+        "recording.start" => Command::RecordingStart,
+        "recording.stop" => Command::RecordingStop,
+        "recording.report" => {
+            let status = match obj.get("status").and_then(Value::as_str) {
+                Some("off") => RecordingStatus::Off,
+                Some("recording") => RecordingStatus::Recording,
+                Some("waiting") => RecordingStatus::Waiting,
+                _ => return Err((ErrorCode::BadArguments, "recording.report needs status off, recording or waiting")),
+            };
+            Command::RecordingReport { status, low_disk: obj.get("lowDisk").and_then(Value::as_bool) == Some(true) }
+        }
         "stream.report" => match obj.get("status").and_then(Value::as_str) {
             Some("off") => Command::StreamReport { status: StreamStatus::Off },
             Some("live") => Command::StreamReport { status: StreamStatus::Live },
@@ -263,16 +299,32 @@ mod tests {
 
     #[test]
     fn acks_serialize_like_the_typescript_ones() {
-        let state = StateSnapshot { slide_index: 2, black: false, stream: StreamStatus::Off, stream_wanted: false };
+        let state = StateSnapshot {
+            slide_index: 2,
+            black: false,
+            stream: StreamStatus::Off,
+            stream_wanted: false,
+            recording: RecordingStatus::Off,
+            recording_wanted: false,
+            recording_low_disk: false,
+        };
         assert_eq!(
             serde_json::to_string(&ack("x", Some(state))).unwrap(),
-            r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":2,"black":false,"stream":"off","streamWanted":false}}"#
+            r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":2,"black":false,"stream":"off","streamWanted":false,"recording":"off","recordingWanted":false,"recordingLowDisk":false}}"#
         );
         assert_eq!(serde_json::to_string(&ack("x", None)).unwrap(), r#"{"v":1,"id":"x","ok":true}"#);
-        let state = StateSnapshot { slide_index: 1, black: true, stream: StreamStatus::Live, stream_wanted: true };
+        let state = StateSnapshot {
+            slide_index: 1,
+            black: true,
+            stream: StreamStatus::Live,
+            stream_wanted: true,
+            recording: RecordingStatus::Recording,
+            recording_wanted: true,
+            recording_low_disk: true,
+        };
         assert_eq!(
             serde_json::to_string(&state_event(state)).unwrap(),
-            r#"{"v":1,"event":"state","state":{"slideIndex":1,"black":true,"stream":"live","streamWanted":true}}"#
+            r#"{"v":1,"event":"state","state":{"slideIndex":1,"black":true,"stream":"live","streamWanted":true,"recording":"recording","recordingWanted":true,"recordingLowDisk":true}}"#
         );
         assert_eq!(
             serde_json::to_string(&nack("x", ErrorCode::Unavailable, "no")).unwrap(),

@@ -305,6 +305,7 @@ pub struct Status {
     pub connected: bool,
     pub program: crate::program::ProgramStatus,
     pub stream: crate::stream::StreamStatus,
+    pub recording: crate::recording::RecordingInfo,
     pub problems: Vec<String>,
     /// The hardware check's choice in plain words (`hardware.json`), empty before any check.
     pub hardware: String,

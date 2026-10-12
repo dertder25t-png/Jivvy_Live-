@@ -391,8 +391,14 @@ mod tests {
 
     #[test]
     fn stream_text_follows_the_slide_and_black() {
-        assert_eq!(lines_for(Some(LiveState { slide_index: 2, black: false, stream_wanted: false })), ["Slide 3"]);
-        assert!(lines_for(Some(LiveState { slide_index: 2, black: true, stream_wanted: false })).is_empty());
+        assert_eq!(
+            lines_for(Some(LiveState { slide_index: 2, black: false, stream_wanted: false, recording_wanted: false })),
+            ["Slide 3"]
+        );
+        assert!(
+            lines_for(Some(LiveState { slide_index: 2, black: true, stream_wanted: false, recording_wanted: false }))
+                .is_empty()
+        );
         assert!(lines_for(None).is_empty());
     }
 }

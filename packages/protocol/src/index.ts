@@ -35,7 +35,21 @@ export type Command =
    * it was asked for is actually reaching the platforms, about once a second. UIs read the
    * result as `stream` in the state; they never send this.
    */
-  | { type: "stream.report"; status: StreamStatus };
+  | { type: "stream.report"; status: StreamStatus }
+  /**
+   * Added in v1 without a version bump. Start or stop the local recording. Like the stream,
+   * the wish is saved: after a crash the recording resumes into the same set of files.
+   * Older daemons answer unknown_command.
+   */
+  | { type: "recording.start" }
+  | { type: "recording.stop" }
+  /**
+   * Added in v1 without a version bump. The daemon's video process reports whether the
+   * recording it was asked for is actually being written, and whether the disk is running
+   * low, about once a second. UIs read the result as `recording` and `recordingLowDisk` in
+   * the state; they never send this.
+   */
+  | { type: "recording.report"; status: RecordingStatus; lowDisk?: boolean };
 
 export type CommandType = Command["type"];
 
@@ -87,6 +101,8 @@ function parseCommand(raw: unknown): CommandResult {
     case "slide.prev":
     case "stream.start":
     case "stream.stop":
+    case "recording.start":
+    case "recording.stop":
     case "state.get":
     case "state.subscribe":
       return { ok: true, command: { type: raw.type } };
@@ -104,6 +120,10 @@ function parseCommand(raw: unknown): CommandResult {
       if (raw.status !== "off" && raw.status !== "live" && raw.status !== "reconnecting")
         return { ok: false, code: "bad_arguments", message: "stream.report needs status off, live or reconnecting" };
       return { ok: true, command: { type: "stream.report", status: raw.status } };
+    case "recording.report":
+      if (raw.status !== "off" && raw.status !== "recording" && raw.status !== "waiting")
+        return { ok: false, code: "bad_arguments", message: "recording.report needs status off, recording or waiting" };
+      return { ok: true, command: { type: "recording.report", status: raw.status, lowDisk: raw.lowDisk === true } };
     case "output.black":
       if (typeof raw.on !== "boolean")
         return { ok: false, code: "bad_arguments", message: "output.black needs boolean on" };
@@ -140,6 +160,9 @@ export function makeEnvelope(command: Command, opts: { id?: string; now?: number
 
 export type StreamStatus = "off" | "live" | "reconnecting";
 
+/** `waiting`: a recording was asked for but nothing is being written yet (starting, or resuming after a crash). */
+export type RecordingStatus = "off" | "recording" | "waiting";
+
 /** What every screen needs to show the live service. Sent on acks so a UI never has to guess. */
 export interface StateSnapshot {
   slideIndex: number;
@@ -147,6 +170,12 @@ export interface StateSnapshot {
   stream: StreamStatus;
   /** Added in v1: the operator asked for the stream to be on (it may be reconnecting). */
   streamWanted?: boolean;
+  /** Added in v1: whether the local recording is being written. Older daemons leave it out. */
+  recording?: RecordingStatus;
+  /** Added in v1: the operator asked for the recording to be on (it may be resuming). */
+  recordingWanted?: boolean;
+  /** Added in v1: the disk the recording goes to has under 10 GB free. */
+  recordingLowDisk?: boolean;
 }
 
 export type Ack =

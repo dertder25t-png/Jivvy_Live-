@@ -19,6 +19,7 @@ pub mod media;
 pub mod outputs;
 pub mod program;
 pub mod protocol;
+pub mod recording;
 pub mod snapshot;
 pub mod stream;
 pub mod watchdog;

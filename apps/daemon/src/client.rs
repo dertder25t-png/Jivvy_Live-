@@ -18,6 +18,9 @@ pub struct LiveState {
     /// The operator asked for the stream to be on. Older engines don't send it.
     #[serde(default)]
     pub stream_wanted: bool,
+    /// The operator asked for the recording to be on. Older engines don't send it.
+    #[serde(default)]
+    pub recording_wanted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +104,12 @@ impl LevelsSender {
         self.command(serde_json::json!({ "type": "stream.report", "status": status }));
     }
 
+    /// Queues a recording report: its status ("off", "recording" or "waiting") and whether
+    /// the disk is running low.
+    pub fn report_recording(&self, status: &str, low_disk: bool) {
+        self.command(serde_json::json!({ "type": "recording.report", "status": status, "lowDisk": low_disk }));
+    }
+
     fn command(&self, command: serde_json::Value) {
         let _ = self.tx.try_send(serde_json::json!({ "v": 1, "id": "vp", "ts": 0, "command": command }));
     }
@@ -169,7 +178,7 @@ mod tests {
     #[test]
     fn reads_state_from_acks_and_events_and_ignores_the_rest() {
         let s = state_in(r#"{"v":1,"event":"state","state":{"slideIndex":4,"black":true,"stream":"off"}}"#);
-        assert_eq!(s, Some(LiveState { slide_index: 4, black: true, stream_wanted: false }));
+        assert_eq!(s, Some(LiveState { slide_index: 4, black: true, stream_wanted: false, recording_wanted: false }));
         assert!(state_in(r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":0,"black":false}}"#).is_some());
         assert_eq!(state_in(r#"{"v":1,"event":"something.new"}"#), None);
         assert_eq!(state_in("garbage"), None);
@@ -238,8 +247,14 @@ mod tests {
         std::thread::spawn(move || follow(&a, move |u| tx.send(u).unwrap()));
         let next = || rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(next(), Update::Connected);
-        assert_eq!(next(), Update::State(LiveState { slide_index: 0, black: false, stream_wanted: false }));
+        assert_eq!(
+            next(),
+            Update::State(LiveState { slide_index: 0, black: false, stream_wanted: false, recording_wanted: false })
+        );
         engine.lock().unwrap().handle_line(r#"{"v":1,"id":"r","ts":1,"command":{"type":"slide.goto","index":7}}"#);
-        assert_eq!(next(), Update::State(LiveState { slide_index: 7, black: false, stream_wanted: false }));
+        assert_eq!(
+            next(),
+            Update::State(LiveState { slide_index: 7, black: false, stream_wanted: false, recording_wanted: false })
+        );
     }
 }

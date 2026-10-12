@@ -16,6 +16,7 @@ jivvy-ctl [--connect ADDR] COMMAND      (ADDR defaults to 127.0.0.1:47800)
   state                print the engine's state
   watch                print every state change and event until Ctrl+C
   stream start|stop    start or stop streaming
+  record start|stop    start or stop the local recording
 
 Prints the engine's answer as one JSON line; exits 1 if the engine refused the command
 or can't be reached, 2 for a usage mistake.";
@@ -54,6 +55,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
         ["watch"] => json!({ "type": "state.subscribe" }),
         ["stream", "start"] => json!({ "type": "stream.start" }),
         ["stream", "stop"] => json!({ "type": "stream.stop" }),
+        ["record", "start"] => json!({ "type": "recording.start" }),
+        ["record", "stop"] => json!({ "type": "recording.stop" }),
         [] => return Err(USAGE.into()),
         other => return Err(format!("unknown command: {}\n\n{USAGE}", other.join(" "))),
     };
@@ -86,6 +89,8 @@ mod tests {
             ("watch", json!({ "type": "state.subscribe" })),
             ("stream start", json!({ "type": "stream.start" })),
             ("stream stop", json!({ "type": "stream.stop" })),
+            ("record start", json!({ "type": "recording.start" })),
+            ("record stop", json!({ "type": "recording.stop" })),
         ];
         for (words, command) in cases {
             let inv = parse_words(words).unwrap();

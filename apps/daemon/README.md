@@ -9,8 +9,6 @@ The church-computer side of Jivvy Live. See `docs/BUILD_PLAN.md` (Stage 1, Daemo
 - **`jivvy-outputs`** shows the state fullscreen on the projector and TVs. It follows the engine over the command channel like any other device, so **an engine restart never blanks a screen**: windows keep the last slide until the engine is back.
 - **`jivvy-video`** (built with `--features video`; needs GStreamer) captures the camera or capture card and the audio input, sends audio levels to the engine for live meters, and builds the **program feed**: lyrics composited over the camera and encoded once, for the recording and the stream. Skipped by the watchdog when not installed.
 
-Recording plugs into the engine in a later Stage 1 item.
-
 ## Output windows
 
 Borderless, always-on-top fullscreen windows placed in physical pixels on each monitor, so per-monitor DPI scaling and monitors left of or above the primary work (the GameWall DisplayHost pattern). Each window is a WebView showing `src/bin/output.html`, which works offline and hides the cursor.
@@ -32,7 +30,7 @@ Until run sheets reach the engine, an output shows "Slide N" (or nothing when bl
 
 ## Camera and audio input
 
-Camera and microphone run as separate GStreamer pipelines, so one failing never stops the other. Today they only capture (and measure); the lyric layer, encoder, recording and stream attach to them in the next Stage 1 items.
+Camera and microphone run as separate GStreamer pipelines, so one failing never stops the other. Today they only capture (and measure); the program feed, recording and stream are built from them (below).
 
 - **Devices:** listed in `media-status.json` with a stable id. Speaker "loopback" inputs are left out, the Windows default microphone is marked `default`, and a camera reported by two Windows APIs is listed once (Media Foundation preferred). Two identical USB cameras stay two.
 - **`media.json`** chooses inputs; without it the first camera and the default microphone are used:
@@ -50,17 +48,30 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
 
 ## Program feed (what the stream and recording carry)
 
-`camera ─┐                                   ┌─> recording (next item)`
+`camera ─┐                                   ┌─> recording`
 `        ├─> pacer ─> lyric layer ─> encode ─┤`
-`mic ────┘                                   └─> stream (item after)`
+`mic ────┘                                   └─> stream`
 
 - **Never stops because an input does.** The capture pipelines hand frames and audio to a clock-driven pacer that pushes exactly 30 frames a second (configurable) into the program: the newest camera frame, or a black slate when the camera is missing or has sent nothing for 500 ms, and a steady run of audio (the microphone, padded with silence; never more than 200 ms of backlog). Unplugging the camera mid-service switches to the slate without a dropped frame.
 - **Lyric layer** drawn natively in Rust (from the spike) only when the text changes, composited on the GPU (Direct3D 12) where available, on the CPU otherwise. Shows "Slide N" until run sheets reach the engine; nothing while the screen is black.
 - **Encoded once:** H.264 + AAC, then a tee the recording and the stream will branch from. Encoder order: the configured one first, then Media Foundation, then x264. Each gets 4 seconds to produce a frame; a failure mid-service restarts from the preferred one. Quick Sync only when asked for by name (it crashed in the spike).
 - **Settings** in `media.json` (all optional): `"program": { "width": 1920, "height": 1080, "fps": 30, "bitrateKbps": 6000, "encoder": "auto", "path": "auto" }`; `encoder` is `auto`, `mf`, `qsv` or `x264`, `path` is `auto`, `gpu` or `cpu`. Whatever is left out, or `auto`, comes from the hardware check (below); whatever is set wins: that's the tech lead's override.
 - **Status** in `media-status.json` → `program`: encoder, picture path (`gpu`/`cpu`), frames per second out, bitrate, whether the slate is on, and the lyric text on screen; `hardware` holds the hardware check's reason in plain words.
-- **Cost on the founder's laptop:** the whole video process (camera, microphone, program on Media Foundation, plus a debug file) at **0.21 cores, 1.3% of the machine**, 29.8 fps, 6.4 Mbps.
-- Developer aid until the recording item lands: `JIVVY_DEBUG_PROGRAM_FILE=path.mkv` also writes the program to a file.
+- **Cost on the founder's laptop:** the whole video process (camera, microphone, program on Media Foundation) at **0.21 cores, 1.3% of the machine**, 29.8 fps, 6.4 Mbps.
+
+## Recording (crash-safe, local)
+
+`recording.start` and `recording.stop` (protocol commands, saved like the stream's: after an engine or video crash the recording is still wanted and carries on). The engine's state says `recording` (`off`, `recording`, or `waiting` while nothing is being written yet), `recordingWanted` and `recordingLowDisk`; `jivvy-ctl record start|stop` tries it by hand. Nothing here depends on the cloud, and the recorder is a branch like a stream destination: handed copies of the encoded packets on its own thread, never able to slow the program or a stream (if the disk can't keep up, that file is closed and the next one starts).
+
+- **Matroska, written as a stream.** Cluster by cluster, no index or duration to fix up at the end, and every write goes straight to the file, so a killed process leaves a file that plays up to its last moments (the muxer's open cluster, about a second). A part is only reported as `recording` once bytes are really in it.
+- **A recording is a set of files.** `recordings/2026-10-10_15-30-12Z/part-001.mkv`, `part-002.mkv`, ... (UTC time of the start; the web app will label them by service). A new part starts whenever the video process starts again while the recording is still wanted, after a failure of the disk or muxer, or when the program changes size or encoder under it. A crash never touches what was already written, and `recording-current.json` tells the next process which set to carry on in. Stopping the recording closes the set.
+- **MP4 after the service.** While neither the recording nor the stream is wanted, each part of a finished set is copied (no re-encoding) into `part-001.mp4`, read back, and only if it holds the same frames is the Matroska original removed. It stops the moment a recording or stream is asked for; a part that can't be converted is left as it is. Parts become separate MP4s (joining them into one is a later nicety).
+- **Warns at 10 GB free.** `recording.report` carries `lowDisk` to every screen (`recordingLowDisk`) and `media-status.json` → `recording` shows `freeGb`. The recording carries on until the disk is full; then it waits ("The disk is full...") and resumes by itself, in a new file, once there's room.
+- **Settings** in `recording.json` (optional): `{ "version": 1, "folder": "D:/Recordings", "warnFreeGb": 10 }`. A relative folder is inside the data folder (default `recordings`). A broken file keeps the last good settings and says so under `problems`.
+- **Status** in `media-status.json` → `recording`: `status`, `detail` (plain words), `set`, `file`, `parts`, `bytes`, `freeGb`, `lowDisk`, `converting`, `converted`.
+- `jivvy-video --verify-recording FILE` reads a recording back and decodes all of it (exit 0 if it plays): what the chaos tests use to prove no file is ever corrupted.
+
+Not tested: a power cut (the chaos tests kill processes). Data the operating system hadn't flushed to the disk by then is lost, and how the file looks after that depends on the filesystem.
 
 ## Hardware check
 
@@ -141,7 +152,7 @@ $env:JIVVY_TEST_SOURCES = '1'; .\dev.ps1 run --release --features video --bin ji
 To try features by hand against a running daemon, `jivvy-ctl` sends one command and prints the engine's answer (the same newline-delimited JSON as every client, on 127.0.0.1:47800 or `--connect ADDR`):
 
 ```powershell
-.\dev.ps1 ctl next          # also: back, goto 3, black, black off, state, watch, stream start, stream stop
+.\dev.ps1 ctl next          # also: back, goto 3, black, black off, state, watch, stream start, stream stop, record start, record stop
 .\dev.ps1 ctl state
 ```
 

@@ -2055,4 +2055,250 @@ mod video {
         assert_eq!(spool_files(&d), 0, "its backlog is skipped");
         yt.assert_no_violations();
     }
+
+    // ---- Local recording ----
+
+    const TEST_MEDIA: &str = r#"{"version":1,"camera":{"use":"test"},"microphone":{"use":"test"}}"#;
+
+    fn recording(s: &Value) -> &Value {
+        &s["recording"]
+    }
+
+    /// The recording is being written: bytes are in the file.
+    fn writing(s: &Value) -> bool {
+        recording(s)["status"] == "recording" && recording(s)["bytes"].as_u64().unwrap_or(0) > 0
+    }
+
+    /// What the engine tells every screen about the recording.
+    fn engine_recording(d: &Daemon) -> Value {
+        d.send(json!({ "type": "state.get" }), Duration::from_secs(5))["state"].clone()
+    }
+
+    /// Reads a recording (Matroska or MP4) back and decodes all of it, as a player would.
+    /// Returns what was found; panics if it doesn't play.
+    fn must_play(file: &Path) -> Value {
+        let out = Command::new(env!("CARGO_BIN_EXE_jivvy-video")).arg("--verify-recording").arg(file).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{} does not play: {text}", file.display());
+        serde_json::from_str(text.trim()).unwrap()
+    }
+
+    fn files_in(dir: &Path, ext: &str) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == ext))
+            // A file being converted is not a part yet.
+            .filter(|p| !p.to_string_lossy().contains("converting"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The one recording folder inside `recordings/`: a crash must never split a recording
+    /// across sets.
+    fn only_set(d: &Daemon) -> PathBuf {
+        let sets: Vec<PathBuf> = std::fs::read_dir(d.data_dir.join("recordings"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(sets.len(), 1, "one recording, one set: {sets:?}");
+        sets[0].clone()
+    }
+
+    #[test]
+    fn a_recording_killed_over_and_over_never_corrupts_a_file_and_carries_on_in_the_same_set() {
+        let d = start_video("recording-kills", TEST_MEDIA);
+        let mut video = d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
+        let ack = d.send(json!({ "type": "recording.start" }), Duration::from_secs(5));
+        assert_eq!(ack["state"]["recordingWanted"], true);
+        let s = d.media_status(Duration::from_secs(30), "recording", writing);
+        let set = recording(&s)["set"].as_str().unwrap().to_string();
+
+        let kills = 3u64;
+        let mut played_frames = 0;
+        for kill in 1..=kills {
+            let s = d.media_status(Duration::from_secs(30), "recording", writing);
+            let file = PathBuf::from(recording(&s)["file"].as_str().unwrap());
+            assert_eq!(recording(&s)["set"], set.as_str(), "the same set after every restart");
+            let writing_since = Instant::now();
+            // Slides keep working while it records.
+            std::thread::sleep(Duration::from_secs(4));
+            assert_eq!(d.send(json!({ "type": "slide.next" }), Duration::from_secs(3))["ok"], true);
+            let recorded = writing_since.elapsed();
+
+            kill_hard(video);
+            // Right after the kill the file is whatever the dead process left. It must play.
+            let found = must_play(&file);
+            let seconds = found["durationMs"].as_f64().unwrap() / 1000.0;
+            println!(
+                "kill {kill}: {} holds {seconds:.1} s, {} frames, and plays",
+                file.display(),
+                found["videoFrames"]
+            );
+            // A crash costs at most the last moments (the muxer's open cluster), never the file.
+            assert!(
+                seconds >= recorded.as_secs_f64() - 3.0,
+                "{} lost more than the last moments: {seconds:.1} s of {:.1} s",
+                file.display(),
+                recorded.as_secs_f64()
+            );
+            played_frames += found["videoFrames"].as_u64().unwrap();
+
+            video = d.video_starts.recv_timeout(RESTORE_TARGET).expect("video restarted");
+            // Nobody is told it is recording while nothing is being written.
+            let s = d.media_status(Duration::from_secs(60), "recording again", |s| {
+                writing(s) && recording(s)["parts"].as_u64().unwrap() > kill
+            });
+            assert_ne!(
+                PathBuf::from(recording(&s)["file"].as_str().unwrap()),
+                file,
+                "a new file, the old one untouched"
+            );
+            assert_eq!(engine_recording(&d)["recordingWanted"], true);
+        }
+
+        // Stopped: the set is closed, and its parts are converted to MP4 once nothing is live.
+        let ack = d.send(json!({ "type": "recording.stop" }), Duration::from_secs(5));
+        assert_eq!(ack["state"]["recordingWanted"], false);
+        d.media_status(Duration::from_secs(10), "recording off", |s| recording(s)["status"] == "off");
+        let dir = only_set(&d);
+        let parts = files_in(&dir, "mkv").len() + files_in(&dir, "mp4").len();
+        assert!(parts as u64 > kills, "{parts} parts for {kills} kills");
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while (!files_in(&dir, "mkv").is_empty() || files_in(&dir, "mp4").len() != parts) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let mp4s = files_in(&dir, "mp4");
+        assert!(files_in(&dir, "mkv").is_empty() && mp4s.len() == parts, "converted: {mp4s:?}\n{}", d.log_tail());
+        let frames: u64 = mp4s.iter().map(|f| must_play(f)["videoFrames"].as_u64().unwrap()).sum();
+        assert!(frames >= played_frames, "the MP4s hold {frames} frames; the killed parts alone had {played_frames}");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("converting"))
+            .collect();
+        assert!(leftovers.is_empty(), "no half-converted file is left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_recording_carries_on_through_an_engine_crash_in_the_same_file() {
+        let d = start_video("recording-engine-crash", TEST_MEDIA);
+        let engine = d.next_engine_pid(Duration::from_secs(10));
+        d.send(json!({ "type": "recording.start" }), Duration::from_secs(5));
+        let before = d.media_status(Duration::from_secs(30), "recording", writing);
+        kill_hard(engine);
+        d.next_engine_pid(RESTORE_TARGET);
+        // The restarted engine still knows it was asked to record, and says "recording" again
+        // as soon as the video process reports in.
+        assert_eq!(engine_recording(&d)["recordingWanted"], true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine_recording(&d)["recording"] != "recording" {
+            assert!(Instant::now() < deadline, "the restarted engine never saw the recording\n{}", d.log_tail());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let after = d.media_status(Duration::from_secs(10), "still the same file, growing", |s| {
+            recording(s)["file"] == recording(&before)["file"]
+                && recording(s)["bytes"].as_u64() > recording(&before)["bytes"].as_u64()
+        });
+        assert_eq!(recording(&after)["parts"], 1, "no new part: the video process never stopped");
+    }
+
+    #[test]
+    fn the_recorder_warns_when_the_disk_is_low_keeps_recording_and_stops_warning_when_there_is_room() {
+        let dir = test_dir("recording-low-disk");
+        std::fs::write(dir.join("media.json"), TEST_MEDIA).unwrap();
+        // A million GB must be free: this disk never has that.
+        std::fs::write(dir.join("recording.json"), r#"{"version":1,"warnFreeGb":1000000}"#).unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
+        d.send(json!({ "type": "recording.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(30), "recording with a low-disk warning", |s| {
+            writing(s) && recording(s)["lowDisk"] == true
+        });
+        assert!(recording(&s)["freeGb"].as_f64().is_some_and(|g| g > 0.0), "the free space is reported: {s}");
+        let warned = |d: &Daemon| {
+            let st = engine_recording(d);
+            (st["recording"].clone(), st["recordingLowDisk"].clone())
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while warned(&d) != (json!("recording"), json!(true)) {
+            assert!(Instant::now() < deadline, "every screen should see the warning: {:?}", warned(&d));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let bytes = recording(&s)["bytes"].as_u64().unwrap();
+        d.media_status(Duration::from_secs(10), "still recording", |s| recording(s)["bytes"].as_u64().unwrap() > bytes);
+
+        // A settings file broken half-way keeps what worked, and says so.
+        std::fs::write(d.data_dir.join("recording.json"), "{ half-saved").unwrap();
+        let s = d.media_status(Duration::from_secs(5), "a broken config reported", |s| {
+            recording(s)["problems"].as_array().is_some_and(|p| !p.is_empty())
+        });
+        assert_eq!(recording(&s)["lowDisk"], true, "the last good settings are kept");
+
+        // Room again.
+        std::fs::write(d.data_dir.join("recording.json"), r#"{"version":1,"warnFreeGb":0}"#).unwrap();
+        d.media_status(Duration::from_secs(5), "warning cleared", |s| {
+            recording(s)["lowDisk"] == false && recording(s)["status"] == "recording"
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while warned(&d) != (json!("recording"), json!(false)) {
+            assert!(Instant::now() < deadline, "the warning should clear on every screen: {:?}", warned(&d));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn a_recording_folder_that_cannot_be_used_never_touches_the_program_and_starts_when_fixed() {
+        let dir = test_dir("recording-bad-folder");
+        std::fs::write(dir.join("media.json"), TEST_MEDIA).unwrap();
+        // The recordings folder is a file: nothing can be created inside it.
+        std::fs::write(dir.join("not-a-folder"), b"x").unwrap();
+        std::fs::write(dir.join("recording.json"), r#"{"version":1,"folder":"not-a-folder"}"#).unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
+        d.send(json!({ "type": "recording.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(30), "waiting with a reason", |s| {
+            recording(s)["status"] == "waiting"
+                && recording(s)["detail"].as_str().is_some_and(|t| t.contains("recordings folder"))
+        });
+        assert_eq!(recording(&s)["bytes"], 0);
+        // Stays that way for a while without ever being told it is recording, and the program
+        // never notices: it keeps its frame rate and the slides keep working.
+        std::thread::sleep(Duration::from_secs(4));
+        let s = d.media_status(Duration::from_secs(10), "program at full rate", |s| {
+            program(s)["state"] == "running" && program(s)["outFps"].as_f64().unwrap_or(0.0) >= 25.0
+        });
+        assert_eq!(recording(&s)["status"], "waiting");
+        assert_eq!(engine_recording(&d)["recording"], "waiting");
+        assert_eq!(d.send(json!({ "type": "slide.next" }), Duration::from_secs(3))["ok"], true);
+
+        // Fixed: it starts by itself, with nobody asking again.
+        std::fs::write(d.data_dir.join("recording.json"), r#"{"version":1}"#).unwrap();
+        d.media_status(Duration::from_secs(30), "recording by itself once the folder works", writing);
+        assert_eq!(files_in(&only_set(&d), "mkv").len(), 1);
+    }
+
+    #[test]
+    fn recordings_go_where_recording_json_says() {
+        let dir = test_dir("recording-folder");
+        let elsewhere = test_dir("recording-elsewhere");
+        std::fs::write(dir.join("media.json"), TEST_MEDIA).unwrap();
+        std::fs::write(
+            dir.join("recording.json"),
+            json!({ "version": 1, "folder": elsewhere.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        let d = start_with(dir, 10, false, &["--video", env!("CARGO_BIN_EXE_jivvy-video")]);
+        d.send(json!({ "type": "recording.start" }), Duration::from_secs(5));
+        let s = d.media_status(Duration::from_secs(30), "recording", writing);
+        let file = PathBuf::from(recording(&s)["file"].as_str().unwrap());
+        assert!(file.starts_with(&*elsewhere), "{} should be under {}", file.display(), elsewhere.display());
+        d.send(json!({ "type": "recording.stop" }), Duration::from_secs(5));
+        d.media_status(Duration::from_secs(10), "off", |s| recording(s)["status"] == "off");
+        assert!(!d.data_dir.join("recordings").exists(), "nothing in the default folder");
+    }
 }

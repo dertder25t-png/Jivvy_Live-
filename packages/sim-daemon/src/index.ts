@@ -1,4 +1,6 @@
-import { ack, nack, type Ack, type DaemonLike, type Envelope, type StateSnapshot, type StreamStatus } from "@jivvy/protocol";
+import {
+  ack, nack, type Ack, type DaemonLike, type Envelope, type RecordingStatus, type StateSnapshot, type StreamStatus,
+} from "@jivvy/protocol";
 
 /**
  * In-memory stand-in for the church-computer daemon. Powers the browser demo and chaos tests.
@@ -6,16 +8,24 @@ import { ack, nack, type Ack, type DaemonLike, type Envelope, type StateSnapshot
  * the same slide (plan: "back on the same slide in under 3 seconds").
  */
 
-export type { StreamStatus };
+export type { RecordingStatus, StreamStatus };
+
+/** The recorder warns when the disk has less than this free (plan: "warns at 10 GB left"). */
+export const LOW_DISK_GB = 10;
 export type Uplink = "ok" | "down" | "slow";
 
 export interface DaemonState {
   slideIndex: number;
   black: boolean;
   stream: StreamStatus;
+  recording: RecordingStatus;
   uplink: Uplink;
   /** True while the engine process is "down" and restarting. */
   restarting: boolean;
+  /** Free space on the recording disk, GB. */
+  diskFreeGb: number;
+  /** Files in the current recording. A crash starts another one in the same set, so none is ever lost. */
+  recordingParts: number;
 }
 
 export interface SimOptions {
@@ -29,13 +39,17 @@ export interface SimOptions {
 type Listener = (s: Readonly<DaemonState>) => void;
 
 export class SimDaemon implements DaemonLike {
-  private state: DaemonState = { slideIndex: 0, black: false, stream: "off", uplink: "ok", restarting: false };
+  private state: DaemonState = {
+    slideIndex: 0, black: false, stream: "off", recording: "off", uplink: "ok", restarting: false,
+    diskFreeGb: 500, recordingParts: 0,
+  };
   /** Last persisted snapshot; survives crash(). */
   private snapshot: DaemonState = { ...this.state };
   private listeners = new Set<Listener>();
   private readonly restartMs: number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private wantStream = false;
+  private wantRecording = false;
 
   constructor(private readonly opts: SimOptions) {
     this.restartMs = opts.restartMs ?? 1500;
@@ -70,10 +84,20 @@ export class SimDaemon implements DaemonLike {
         this.wantStream = false;
         this.set({ stream: "off" });
         break;
+      case "recording.start":
+        // Asking again changes nothing: it carries on into the same files.
+        if (!this.wantRecording) this.set({ recording: "recording", recordingParts: 1 });
+        this.wantRecording = true;
+        break;
+      case "recording.stop":
+        this.wantRecording = false;
+        this.set({ recording: "off", recordingParts: 0 });
+        break;
       case "state.get":
       case "state.subscribe": // in memory, subscribers use subscribe(); the ack is the same
       case "media.levels": // the simulated daemon has no audio input to relay
       case "stream.report": // it simulates the stream itself (setUplink)
+      case "recording.report": // and the recording (setDiskFree, crash)
         break;
     }
     return ack(e.id, this.snapshotForUi());
@@ -81,8 +105,11 @@ export class SimDaemon implements DaemonLike {
 
   /** The protocol's view of the state, as the real daemon reports it. */
   snapshotForUi(): StateSnapshot {
-    const { slideIndex, black, stream } = this.state;
-    return { slideIndex, black, stream, streamWanted: this.wantStream };
+    const { slideIndex, black, stream, recording, diskFreeGb } = this.state;
+    return {
+      slideIndex, black, stream, streamWanted: this.wantStream,
+      recording, recordingWanted: this.wantRecording, recordingLowDisk: this.wantRecording && diskFreeGb < LOW_DISK_GB,
+    };
   }
 
   // ---- Failure injection (the demo's "failure buttons") ----
@@ -95,14 +122,22 @@ export class SimDaemon implements DaemonLike {
     });
   }
 
+  /** Set the free space on the recording disk. Under 10 GB the state warns; the recording carries on. */
+  setDiskFree(gb: number): void {
+    this.set({ diskFreeGb: gb });
+  }
+
   /** Kill the engine. It restarts from the last snapshot on the same slide. */
   crash(): void {
     if (this.state.restarting) return;
-    this.state = { ...this.state, restarting: true };
+    // Nothing is written while the video process is down; the file set is resumed when it returns.
+    this.state = { ...this.state, restarting: true, recording: this.wantRecording ? "waiting" : "off" };
     this.emit();
     this.setTimer(() => {
-      this.state = { ...this.snapshot, restarting: false, uplink: this.state.uplink };
+      this.state = { ...this.snapshot, restarting: false, uplink: this.state.uplink, diskFreeGb: this.state.diskFreeGb };
       this.state.stream = this.wantStream ? (this.state.uplink === "down" ? "reconnecting" : "live") : "off";
+      // The video process comes back writing a new file in the same set; nothing already recorded is touched.
+      if (this.wantRecording) this.state = { ...this.state, recording: "recording", recordingParts: this.state.recordingParts + 1 };
       this.emit();
     }, this.restartMs);
   }

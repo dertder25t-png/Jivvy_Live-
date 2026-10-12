@@ -123,7 +123,7 @@ fn description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
     } else {
         "overlaycomposition name=lyrics"
     };
-    let mut d = format!(
+    format!(
         "appsrc name=vsrc is-live=true format=time do-timestamp=false block=false \
            caps=video/x-raw,format=NV12,width={w},height={h},framerate={fps}/1 \
          ! {overlay} ! tee name=raw allow-not-linked=true \
@@ -141,15 +141,7 @@ fn description(enc: EncoderChoice, cfg: &ProgramConfig, gpu: bool) -> String {
         enc = encoder_description(enc, cfg, gpu),
         to_system =
             if gpu { "d3d12download ! video/x-raw,format=NV12" } else { "videoconvert ! video/x-raw,format=NV12" },
-    );
-    // Developer aid until the recording item lands: also write the program to a file.
-    if let Ok(path) = std::env::var("JIVVY_DEBUG_PROGRAM_FILE") {
-        d.push_str(&format!(
-            " matroskamux name=dbg streamable=true ! filesink location=\"{}\" vt. ! queue ! dbg. at. ! queue ! dbg.",
-            path.replace('\\', "/")
-        ));
-    }
-    d
+    )
 }
 
 /// A black NV12 frame for when there is no camera picture.

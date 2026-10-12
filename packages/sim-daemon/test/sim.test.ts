@@ -55,6 +55,40 @@ describe("SimDaemon", () => {
     expect(await send({ type: "state.get" })).toMatchObject({ ok: true, state: { slideIndex: 2, black: false, stream: "off", streamWanted: false } });
   });
 
+  it("recording: crash resumes into the same file set and slides never notice", async () => {
+    const { d, send, fire } = setup();
+    expect(await send({ type: "recording.start" })).toMatchObject({ ok: true, state: { recording: "recording", recordingWanted: true } });
+    expect(d.getState().recordingParts).toBe(1);
+    d.crash();
+    expect(d.getState().recording).toBe("waiting");
+    fire();
+    expect(d.getState()).toMatchObject({ recording: "recording", recordingParts: 2 });
+    expect(d.snapshotForUi()).toMatchObject({ recording: "recording", recordingWanted: true });
+    await send({ type: "recording.stop" });
+    expect(d.snapshotForUi()).toMatchObject({ recording: "off", recordingWanted: false });
+    // Stopped and started again is a new recording, not a continuation.
+    await send({ type: "recording.start" });
+    expect(d.getState().recordingParts).toBe(1);
+  });
+
+  it("recording: a nearly full disk warns at 10 GB and the recording carries on", async () => {
+    const { d, send } = setup();
+    await send({ type: "recording.start" });
+    d.setDiskFree(10);
+    expect(d.snapshotForUi().recordingLowDisk).toBe(false);
+    d.setDiskFree(9.9);
+    expect(d.snapshotForUi()).toMatchObject({ recording: "recording", recordingLowDisk: true });
+    expect(await send({ type: "slide.next" })).toMatchObject({ ok: true, state: { recordingLowDisk: true } });
+    d.setDiskFree(200);
+    expect(d.snapshotForUi().recordingLowDisk).toBe(false);
+  });
+
+  it("recording: a low disk with no recording is no warning here (pre-flight checks the disk separately)", async () => {
+    const { d } = setup();
+    d.setDiskFree(1);
+    expect(d.snapshotForUi().recordingLowDisk).toBe(false);
+  });
+
   it("notifies subscribers and supports unsubscribe", async () => {
     const { d, send } = setup();
     let n = 0;

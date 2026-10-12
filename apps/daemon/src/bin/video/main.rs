@@ -3,6 +3,7 @@
 //!
 //! jivvy-video [--data-dir DIR] [--connect ADDR] [--supervised] [--test-sources]
 //! jivvy-video --hardware-check [--if-changed] [--data-dir DIR]
+//! jivvy-video --verify-recording FILE
 //!
 //! `--test-sources` (or `JIVVY_TEST_SOURCES=1`) uses a test pattern and tone for every
 //! camera and microphone, whatever `media.json` names: no devices needed.
@@ -12,6 +13,9 @@
 //! 0 when a setting keeps up, 1 when nothing does, 2 when the report can't be saved.
 //! `--if-changed` measures only when there's no report or the machine differs from the one
 //! it was made on (a new graphics card or driver, another computer); otherwise it exits 0.
+//!
+//! `--verify-recording` reads a recording (Matroska or MP4) back and decodes all of it, prints
+//! what it found and exits 0 if it plays, 1 if it doesn't.
 //!
 //! Camera and microphone run as separate pipelines, so one device failing never stops the
 //! other. A device that is unplugged or fails is retried every second and picked up again
@@ -25,6 +29,8 @@
 mod hls;
 mod hwcheck;
 mod program;
+mod recorder;
+mod remux;
 mod stream;
 mod tiers;
 
@@ -43,6 +49,7 @@ use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, R
 use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, EncoderChoice, ProgramConfig};
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
 use program::{Feed, Program};
+use recorder::Recorder;
 use stream::Streamer;
 
 const TICK: Duration = Duration::from_millis(250);
@@ -57,6 +64,8 @@ struct Args {
     hardware_check: bool,
     /// With `--hardware-check`: only measure if there's no report or it no longer fits this machine.
     if_changed: bool,
+    /// `--verify-recording FILE`: read a recording back and say whether it plays.
+    verify_recording: Option<PathBuf>,
     /// Test hook `JIVVY_TEST_ENCODER=x264|mf`: the encoder to use, whatever `media.json` says.
     /// CI's Windows runners have no GPU, where Media Foundation is a software encoder too slow
     /// for 1080p30.
@@ -79,6 +88,7 @@ fn parse_args() -> Args {
         test_sources: media::test_sources_from_env(),
         hardware_check: false,
         if_changed: false,
+        verify_recording: None,
         test_encoder: test_encoder_from_env(),
     };
     let mut it = std::env::args().skip(1);
@@ -91,6 +101,7 @@ fn parse_args() -> Args {
             "--test-sources" => a.test_sources = true,
             "--hardware-check" => a.hardware_check = true,
             "--if-changed" => a.if_changed = true,
+            "--verify-recording" => a.verify_recording = Some(val().into()),
             other => fail(&format!("unknown flag {other}")),
         }
     }
@@ -330,8 +341,11 @@ struct Video {
     program: Option<Program>,
     streamer: Streamer,
     tiers: tiers::Tiers,
+    recorder: Recorder,
     /// The stream status last reported to the engine, and when.
     stream_reported: Option<(&'static str, Instant)>,
+    /// The same for the recording: its status and whether the disk is low.
+    recording_reported: Option<((&'static str, bool), Instant)>,
     inputs: [Input; 2],
     devices: Vec<DeviceInfo>,
     config: media::MediaConfig,
@@ -473,6 +487,14 @@ impl Video {
             self.levels.report_stream(stream.status);
             self.stream_reported = Some((stream.status, Instant::now()));
         }
+        let recording = self.recorder.info();
+        if self
+            .recording_reported
+            .is_none_or(|(s, at)| s != (recording.status, recording.low_disk) || at.elapsed() >= Duration::from_secs(1))
+        {
+            self.levels.report_recording(recording.status, recording.low_disk);
+            self.recording_reported = Some(((recording.status, recording.low_disk), Instant::now()));
+        }
         let status = Status {
             devices: self.devices.clone(),
             camera: self.inputs[0].status(),
@@ -481,6 +503,7 @@ impl Video {
             connected: self.levels.delivering(),
             program: self.program.as_ref().map(|p| p.status()).unwrap_or_default(),
             stream,
+            recording,
             problems: self.problems.clone(),
             hardware: self.hardware.as_ref().map(|r| r.reason.clone()).unwrap_or_default(),
         };
@@ -528,6 +551,18 @@ fn main() {
         }
         std::process::exit(if report.chosen.is_some() { 0 } else { 1 });
     }
+    if let Some(file) = &args.verify_recording {
+        match remux::verify(file, true, &std::sync::atomic::AtomicBool::new(false)) {
+            Ok(v) => {
+                println!("{}", serde_json::to_string(&v).unwrap_or_default());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("{}", serde_json::json!({ "error": e }));
+                std::process::exit(1);
+            }
+        }
+    }
     if args.test_sources {
         log("video", "test sources: every camera and microphone is a test pattern or tone");
     }
@@ -560,6 +595,7 @@ fn main() {
         Some(r) => log("video", format!("hardware check: {}", r.reason)),
         None => log("video", "no hardware check yet; using media.json and the installed plugins"),
     }
+    let recorder = Recorder::start(args.data_dir.clone(), feed.clone());
     let mut video = Video {
         args,
         levels,
@@ -569,7 +605,9 @@ fn main() {
         program: None,
         streamer: Streamer::new(),
         tiers: tiers::Tiers::default(),
+        recorder,
         stream_reported: None,
+        recording_reported: None,
         inputs: [Input::new(Kind::Camera), Input::new(Kind::Microphone)],
         devices: Vec::new(),
         config: media::MediaConfig::default(),

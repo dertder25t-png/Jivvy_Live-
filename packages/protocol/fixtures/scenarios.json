@@ -1,5 +1,5 @@
 {
-  "about": "Shared behavior scenarios: command sequences and the acks they must produce, run against both the simulated daemon (packages/sim-daemon/test/scenarios.test.ts) and the real one (apps/daemon/tests/chaos.rs, shared_scenarios_*), so the two can't drift apart. Each step either sends a command or crashes the engine (it restarts from its snapshot). `expect` is matched as a subset of the ack. Stream steps check `streamWanted`, not `stream`: the simulated daemon simulates the stream itself, while the real engine reports live only once the video process does. New behavior goes here first: protocol, then sim-daemon, then the real daemon. Add scenarios; never change an existing expectation without a protocol version bump.",
+  "about": "Shared behavior scenarios: command sequences and the acks they must produce, run against both the simulated daemon (packages/sim-daemon/test/scenarios.test.ts) and the real one (apps/daemon/tests/chaos.rs, shared_scenarios_*), so the two can't drift apart. Each step either sends a command or crashes the engine (it restarts from its snapshot). `expect` is matched as a subset of the ack. Stream steps check `streamWanted`, not `stream`, and recording steps `recordingWanted`, not `recording`: the simulated daemon simulates both itself, while the real engine reports them only once the video process does. New behavior goes here first: protocol, then sim-daemon, then the real daemon. Add scenarios; never change an existing expectation without a protocol version bump.",
   "scenarios": [
     {
       "name": "navigates and clamps at both ends",
@@ -70,6 +70,52 @@
         { "send": { "type": "stream.stop" }, "expect": { "ok": true, "state": { "streamWanted": false, "stream": "off" } } },
         { "crash": true },
         { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "streamWanted": false, "stream": "off" } } }
+      ]
+    },
+    {
+      "name": "a recording is off until asked for, and every ack says so",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "recording": "off", "recordingWanted": false, "recordingLowDisk": false } } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": true, "state": { "recording": "off", "recordingWanted": false, "recordingLowDisk": false } } }
+      ]
+    },
+    {
+      "name": "a wanted recording stays wanted through a crash, and stop is kept too",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "recording.start" }, "expect": { "ok": true, "state": { "recordingWanted": true } } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "recordingWanted": true } } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "recordingWanted": true } } },
+        { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false, "recording": "off" } } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "recordingWanted": false, "recording": "off" } } }
+      ]
+    },
+    {
+      "name": "the recording and the stream are separate: stopping one never touches the other",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "recording.start" }, "expect": { "ok": true, "state": { "recordingWanted": true, "streamWanted": false } } },
+        { "send": { "type": "stream.start" }, "expect": { "ok": true, "state": { "recordingWanted": true, "streamWanted": true } } },
+        { "send": { "type": "stream.stop" }, "expect": { "ok": true, "state": { "recordingWanted": true, "streamWanted": false } } },
+        { "send": { "type": "stream.start" }, "expect": { "ok": true, "state": { "recordingWanted": true, "streamWanted": true } } },
+        { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false, "streamWanted": true } } },
+        { "crash": true },
+        { "send": { "type": "state.get" }, "expect": { "ok": true, "state": { "recordingWanted": false, "streamWanted": true } } }
+      ]
+    },
+    {
+      "name": "starting a recording twice, or stopping one that isn't running, is harmless",
+      "slides": 5,
+      "steps": [
+        { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false } } },
+        { "send": { "type": "recording.start" }, "expect": { "ok": true, "state": { "recordingWanted": true } } },
+        { "send": { "type": "recording.start" }, "expect": { "ok": true, "state": { "recordingWanted": true } } },
+        { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false } } },
+        { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false } } }
       ]
     }
   ]

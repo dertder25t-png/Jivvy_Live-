@@ -11,7 +11,7 @@ use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{self, Ack, Command, ErrorCode, StateSnapshot, StreamStatus};
+use crate::protocol::{self, Ack, Command, ErrorCode, RecordingStatus, StateSnapshot, StreamStatus};
 use crate::snapshot::{Snapshot, Store};
 
 /// Longest line accepted on the command channel; protocol messages are tiny.
@@ -21,6 +21,8 @@ const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
 /// restarting): screens see "reconnecting", never a stale "live".
 pub const STREAM_REPORT_STALE: Duration = Duration::from_secs(3);
+/// The same for the recording: a silent video process is never shown as recording.
+pub const RECORDING_REPORT_STALE: Duration = Duration::from_secs(3);
 
 /// Where messages for one connection go. All writes to a socket go through its outbox so
 /// acks and events never interleave mid-line.
@@ -44,6 +46,9 @@ pub struct Engine {
     subscribers: Vec<Outbox>,
     /// The video process's latest report on the stream, and when it came.
     stream_report: Option<(StreamStatus, Instant)>,
+    /// The video process's latest report on the recording: its status, whether the disk is
+    /// running low, and when it came.
+    recording_report: Option<(RecordingStatus, bool, Instant)>,
     /// The view subscribers last received, so `tick` only sends real changes.
     last_sent: Option<StateSnapshot>,
 }
@@ -54,7 +59,15 @@ impl Engine {
         let mut state = state;
         // A snapshot from a longer run sheet must not point past the end of this one.
         state.slide_index = state.slide_index.min(slide_count - 1);
-        Engine { state, store, slide_count, subscribers: Vec::new(), stream_report: None, last_sent: None }
+        Engine {
+            state,
+            store,
+            slide_count,
+            subscribers: Vec::new(),
+            stream_report: None,
+            recording_report: None,
+            last_sent: None,
+        }
     }
 
     pub fn state(&self) -> &Snapshot {
@@ -75,16 +88,29 @@ impl Engine {
             }
             (true, _) => StreamStatus::Reconnecting,
         };
+        // Recording only while the video process keeps saying it is writing; the disk
+        // warning needs the same fresh report, and only matters while recording is wanted.
+        let fresh =
+            self.recording_report.filter(|(_, _, at)| now.saturating_duration_since(*at) < RECORDING_REPORT_STALE);
+        let (recording, recording_low_disk) = match (self.state.recording_wanted, fresh) {
+            (false, _) => (RecordingStatus::Off, false),
+            (true, Some((RecordingStatus::Recording, low, _))) => (RecordingStatus::Recording, low),
+            (true, Some((_, low, _))) => (RecordingStatus::Waiting, low),
+            (true, None) => (RecordingStatus::Waiting, false),
+        };
         StateSnapshot {
             slide_index: self.state.slide_index,
             black: self.state.black,
             stream,
             stream_wanted: self.state.stream_wanted,
+            recording,
+            recording_wanted: self.state.recording_wanted,
+            recording_low_disk,
         }
     }
 
     /// Called a few times a second: tells subscribers when the view changed by itself
-    /// (a stream report going stale).
+    /// (a stream or recording report going stale).
     pub fn tick(&mut self) {
         self.tick_at(Instant::now());
     }
@@ -128,6 +154,14 @@ impl Engine {
             Command::StreamReport { status } => {
                 // Live status, not saved: it only means anything while it keeps coming.
                 self.stream_report = Some((status, Instant::now()));
+                self.tick();
+                return protocol::ack(id, None);
+            }
+            // Saved like the stream: a crash mid-service resumes the recording by itself.
+            Command::RecordingStart => next.recording_wanted = true,
+            Command::RecordingStop => next.recording_wanted = false,
+            Command::RecordingReport { status, low_disk } => {
+                self.recording_report = Some((status, low_disk, Instant::now()));
                 self.tick();
                 return protocol::ack(id, None);
             }
@@ -437,7 +471,13 @@ mod tests {
     fn every_ack_reports_state_and_changes_are_saved_before_the_ack() {
         let (mut e, dir) = engine("save", 10);
         let r = send(&mut e, json!({ "type": "slide.goto", "index": 7 }));
-        assert_eq!(r["state"], json!({ "slideIndex": 7, "black": false, "stream": "off", "streamWanted": false }));
+        assert_eq!(
+            r["state"],
+            json!({
+                "slideIndex": 7, "black": false, "stream": "off", "streamWanted": false,
+                "recording": "off", "recordingWanted": false, "recordingLowDisk": false
+            })
+        );
         send(&mut e, json!({ "type": "output.black", "on": true }));
         let (snap, _) = Store::new(&dir).unwrap().load();
         assert_eq!((snap.slide_index, snap.black), (7, true));
@@ -487,6 +527,72 @@ mod tests {
         assert_eq!(restarted.view().stream, StreamStatus::Reconnecting);
         send(&mut restarted, json!({ "type": "stream.stop" }));
         assert_eq!(restarted.view().stream, StreamStatus::Off);
+    }
+
+    #[test]
+    fn the_recording_is_shown_only_while_reports_keep_coming_and_wanted_survives_a_restart() {
+        let (mut e, dir) = engine("recording", 3);
+        let view = |e: &mut Engine| send(e, json!({ "type": "state.get" }))["state"].clone();
+        let report = |e: &mut Engine, status: &str, low: bool| {
+            send(e, json!({ "type": "recording.report", "status": status, "lowDisk": low }))
+        };
+        assert_eq!(view(&mut e)["recording"], json!("off"));
+        // A report with nothing asked for changes nothing: no recording, no warning.
+        report(&mut e, "recording", true);
+        let v = view(&mut e);
+        assert_eq!((v["recording"].clone(), v["recordingLowDisk"].clone()), (json!("off"), json!(false)));
+
+        send(&mut e, json!({ "type": "recording.start" }));
+        let v = view(&mut e);
+        assert_eq!((v["recording"].clone(), v["recordingWanted"].clone()), (json!("recording"), json!(true)));
+        let later = Instant::now() + RECORDING_REPORT_STALE + Duration::from_millis(1);
+        let silent = e.view_at(later);
+        assert_eq!(silent.recording, RecordingStatus::Waiting, "a silent video process is never shown recording");
+        assert!(!silent.recording_low_disk, "and its old warning goes with it");
+        report(&mut e, "waiting", false);
+        assert_eq!(view(&mut e)["recording"], json!("waiting"));
+        report(&mut e, "recording", false);
+        assert_eq!(view(&mut e)["recordingLowDisk"], json!(false));
+
+        // Wanted is saved; the live report is not.
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut restarted = Engine::new(store, snap, 3);
+        assert!(restarted.view().recording_wanted);
+        assert_eq!(restarted.view().recording, RecordingStatus::Waiting, "until the video process says otherwise");
+        send(&mut restarted, json!({ "type": "recording.stop" }));
+        assert_eq!(restarted.view().recording, RecordingStatus::Off);
+        assert!(!restarted.view().recording_wanted);
+    }
+
+    #[test]
+    fn a_state_saved_by_an_older_daemon_still_loads_with_the_recording_off() {
+        let (mut e, dir) = engine("old-state", 3);
+        send(&mut e, json!({ "type": "slide.goto", "index": 2 }));
+        let store = Store::new(&dir).unwrap();
+        let mut old: Value = serde_json::from_slice(&std::fs::read(store.current_path()).unwrap()).unwrap();
+        assert!(old.as_object_mut().unwrap().remove("recordingWanted").is_some());
+        std::fs::write(store.current_path(), old.to_string()).unwrap();
+        let (snap, source) = store.load();
+        assert_eq!((source, snap.slide_index, snap.recording_wanted), (crate::snapshot::Source::Current, 2, false));
+    }
+
+    #[test]
+    fn the_low_disk_warning_reaches_subscribers_and_clears_when_space_returns() {
+        let (mut e, _) = engine("low-disk", 3);
+        let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
+        e.handle_line_from(
+            r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#,
+            Some(&Outbox::new(tx, None)),
+        );
+        send(&mut e, json!({ "type": "recording.start" }));
+        send(&mut e, json!({ "type": "recording.report", "status": "recording", "lowDisk": true }));
+        let events: Vec<Value> = rx.try_iter().map(|b| serde_json::from_slice(&b).unwrap()).collect();
+        let last = &events.last().unwrap()["state"];
+        assert_eq!((last["recording"].clone(), last["recordingLowDisk"].clone()), (json!("recording"), json!(true)));
+        send(&mut e, json!({ "type": "recording.report", "status": "recording", "lowDisk": false }));
+        let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(ev["state"]["recordingLowDisk"], json!(false));
     }
 
     #[test]
@@ -562,7 +668,10 @@ mod tests {
         let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(
             ev,
-            json!({ "v": 1, "event": "state", "state": { "slideIndex": 5, "black": false, "stream": "off", "streamWanted": false } })
+            json!({ "v": 1, "event": "state", "state": {
+                "slideIndex": 5, "black": false, "stream": "off", "streamWanted": false,
+                "recording": "off", "recordingWanted": false, "recordingLowDisk": false
+            } })
         );
         assert!(rx.try_recv().is_err());
 

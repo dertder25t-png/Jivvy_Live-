@@ -21,12 +21,23 @@ pub struct Snapshot {
     pub black: bool,
     /// The operator asked for the stream to be on; a restart resumes it.
     pub stream_wanted: bool,
+    /// The operator asked for the recording to be on; a restart resumes it into the same
+    /// set of files. Missing in files saved by an older daemon, which means off.
+    #[serde(default)]
+    pub recording_wanted: bool,
     pub saved_at: u64,
 }
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Snapshot { version: SNAPSHOT_VERSION, slide_index: 0, black: false, stream_wanted: false, saved_at: 0 }
+        Snapshot {
+            version: SNAPSHOT_VERSION,
+            slide_index: 0,
+            black: false,
+            stream_wanted: false,
+            recording_wanted: false,
+            saved_at: 0,
+        }
     }
 }
 

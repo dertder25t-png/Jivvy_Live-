@@ -37,6 +37,7 @@ video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:ureq"
 
 [dependencies]
 ab_glyph = "0.2"
+fs4 = "1.1.0"
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
 gstreamer-video = { version = "0.25", optional = true }

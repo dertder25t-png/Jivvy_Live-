@@ -2183,11 +2183,25 @@ mod video {
     }
 
     /// What the program really sends (kbps).
+    /// What the program really sends once settled (kbps): the median of five readings a
+    /// second apart. One reading at start-up can catch the encoder's first burst (a CI
+    /// runner once read 15 Mbps from a 3 Mbps program).
     fn program_kbps(d: &Daemon) -> f64 {
-        let s = d.media_status(Duration::from_secs(20), "program running", |s| {
-            program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0 && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
-        });
-        program(&s)["kbps"].as_f64().unwrap()
+        let mut readings: Vec<f64> = (0..5)
+            .map(|i| {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let s = d.media_status(Duration::from_secs(20), "program running", |s| {
+                    program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+                        && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
+                });
+                program(&s)["kbps"].as_f64().unwrap()
+            })
+            .collect();
+        readings.sort_by(f64::total_cmp);
+        println!("program kbps readings {readings:?}");
+        readings[2]
     }
 
     #[test]

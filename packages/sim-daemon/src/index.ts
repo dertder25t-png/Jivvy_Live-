@@ -1,6 +1,6 @@
 import {
-  ack, alertEvent, authMessage, MAX_PENDING_PAIRINGS, nack, PAIRING_WINDOW_MS, PROTOCOL_VERSION, streamAlerts,
-  type Ack, type Alert, type CommandType, type DaemonEvent, type DaemonLike, type DeviceInfo, type Envelope,
+  ack, alertEvent, authMessage, MAX_PENDING_PAIRINGS, nack, PAIRING_WINDOW_MS, preflightSummary, PROTOCOL_VERSION,
+  streamAlerts, type Ack, type Alert, type CommandType, type Preflight, type PreflightDestination, type DaemonEvent, type DaemonLike, type DeviceInfo, type Envelope,
   type PairingStatus, type RecordingStatus, type StateSnapshot, type StreamDestination, type StreamStatus,
 } from "@jivvy/protocol";
 
@@ -45,6 +45,11 @@ export interface SimOptions {
   destinations?: Array<{ id: string; name: string; whenShort?: "lower" | "audioOnly" | "pause" }>;
 }
 
+/** How long the simulated upload test takes, ms (the real one sends for about 5 s). */
+export const PREFLIGHT_MS = 5000;
+/** Simulated upload speeds, kbps. */
+const UPLINK_KBPS = { ok: 20_000, slow: 1_500 } as const;
+
 /** The simulated program's quality, and what the main platform drops to on a slow upload. */
 const FULL = "1080p";
 const SLOW = "480p";
@@ -52,7 +57,7 @@ const SLOW = "480p";
 /** What a paired device may do: run the service. Settings, pairing and reports are not theirs. */
 const DEVICE_COMMANDS: ReadonlySet<CommandType> = new Set<CommandType>([
   "slide.next", "slide.prev", "slide.goto", "output.black", "stream.start", "stream.stop",
-  "recording.start", "recording.stop", "state.get", "state.subscribe",
+  "recording.start", "recording.stop", "state.get", "state.subscribe", "stream.preflight",
 ]);
 
 interface PairedDevice extends DeviceInfo {
@@ -91,6 +96,10 @@ export class SimDaemon implements DaemonLike {
   private connections = new Set<DeviceConnection>();
   private pairingListeners = new Set<(p: PairingStatus) => void>();
   private alertListeners = new Set<(a: Alert) => void>();
+  private preflightListeners = new Set<(p: Preflight) => void>();
+  /** The last upload test that worked, for when the next one can't run. */
+  private lastMeasured?: { kbps: number; at: number };
+  private measuring = false;
   /** The platforms as last shown, to tell what changed. */
   private shownDestinations: StreamDestination[] = [];
 
@@ -112,6 +121,51 @@ export class SimDaemon implements DaemonLike {
       if (this.pending.length !== before) this.pairingChanged();
     });
     return c;
+  }
+
+  /** Pre-flight results, as every subscriber gets them. */
+  onPreflight(fn: (p: Preflight) => void): () => void {
+    this.preflightListeners.add(fn);
+    return () => this.preflightListeners.delete(fn);
+  }
+
+  /** What each platform would get at `kbps`, like the bandwidth manager's choice. */
+  private preflightFor(kbps: number): PreflightDestination[] {
+    const slow = kbps < UPLINK_KBPS.ok;
+    return (this.opts.destinations ?? []).map(({ id, name, whenShort }, i) => {
+      if (!slow) return { id, name, quality: FULL };
+      if (whenShort === "audioOnly") return { id, name, quality: "audio" };
+      if (whenShort === "pause") return { id, name, quality: "" };
+      return { id, name, quality: i === 0 ? SLOW : "" };
+    });
+  }
+
+  private startPreflight(): Preflight {
+    const measuring: Preflight = { status: "measuring", destinations: [], summary: "Measuring the internet upload..." };
+    if (this.measuring) return measuring;
+    this.measuring = true;
+    this.setTimer(() => {
+      this.measuring = false;
+      let result: Preflight;
+      if (this.state.uplink !== "down") {
+        const kbps = UPLINK_KBPS[this.state.uplink];
+        this.lastMeasured = { kbps, at: this.now() };
+        const destinations = this.preflightFor(kbps);
+        result = { status: "done", uploadKbps: kbps, measured: true, measuredAt: this.now(), destinations, summary: preflightSummary(destinations) };
+      } else if (this.lastMeasured) {
+        const destinations = this.preflightFor(this.lastMeasured.kbps);
+        result = {
+          status: "done", uploadKbps: this.lastMeasured.kbps, measured: false, measuredAt: this.lastMeasured.at, destinations,
+          summary: preflightSummary(destinations),
+          message: "Couldn't test the upload just now (no internet?); this is the last speed measured.",
+        };
+      } else {
+        result = { status: "failed", destinations: [], summary: "", message: "Couldn't test the upload: check the internet connection." };
+      }
+      for (const l of this.preflightListeners) l(result);
+      for (const conn of this.connections) if (conn.deviceId) conn.emit({ v: PROTOCOL_VERSION, event: "preflight", preflight: result });
+    }, PREFLIGHT_MS);
+    return measuring;
   }
 
   /** Alerts (a platform lowered, paused or resumed), as every subscriber gets them. */
@@ -200,6 +254,10 @@ export class SimDaemon implements DaemonLike {
       case "auth.hello":
       case "auth.prove":
         return nack(e.id, "bad_arguments", "the church computer doesn't need to pair");
+      case "stream.preflight":
+        // The test would take the stream's bandwidth.
+        if (this.wantStream) return nack(e.id, "unavailable", "the upload test can't run while streaming");
+        return ack(e.id, this.snapshotForUi(), { preflight: this.startPreflight() });
 
       case "slide.next": this.set({ slideIndex: Math.min(this.state.slideIndex + 1, this.opts.slideCount - 1) }); break;
       case "slide.prev": this.set({ slideIndex: Math.max(this.state.slideIndex - 1, 0) }); break;

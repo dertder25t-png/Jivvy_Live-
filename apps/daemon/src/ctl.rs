@@ -21,6 +21,7 @@ jivvy-ctl [--connect ADDR] COMMAND      (ADDR defaults to 127.0.0.1:47800)
   pair close           stop accepting pairing requests
   pair approve ID      pair the device whose request has this id, once its code matches
   pair deny ID         turn a pairing request down
+  preflight            test the upload and say what each platform will get (about 5 s)
   devices              list paired devices
   devices remove ID    unpair a device; its open connections end at once
 
@@ -34,6 +35,8 @@ pub struct Invocation {
     pub command: Value,
     /// Keep printing events after the ack (`watch`).
     pub watch: bool,
+    /// Wait for one event with this name after the ack, print it, and stop (`preflight`).
+    pub until: Option<&'static str>,
 }
 
 /// Reads `jivvy-ctl`'s arguments (without the program name).
@@ -68,12 +71,14 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
         ["pair", "approve", id] => json!({ "type": "pair.approve", "requestId": id }),
         ["pair", "deny", id] => json!({ "type": "pair.deny", "requestId": id }),
         ["devices"] => json!({ "type": "device.list" }),
+        ["preflight"] => json!({ "type": "stream.preflight" }),
         ["devices", "remove", id] => json!({ "type": "device.remove", "deviceId": id }),
         [] => return Err(USAGE.into()),
         other => return Err(format!("unknown command: {}\n\n{USAGE}", other.join(" "))),
     };
     let watch = command["type"] == "state.subscribe";
-    Ok(Invocation { addr, command, watch })
+    let until = (command["type"] == "stream.preflight").then_some("preflight");
+    Ok(Invocation { addr, command, watch, until })
 }
 
 /// The command wrapped in a protocol envelope, as one line.
@@ -108,6 +113,7 @@ mod tests {
             ("pair approve r1", json!({ "type": "pair.approve", "requestId": "r1" })),
             ("pair deny r1", json!({ "type": "pair.deny", "requestId": "r1" })),
             ("devices", json!({ "type": "device.list" })),
+            ("preflight", json!({ "type": "stream.preflight" })),
             ("devices remove d1", json!({ "type": "device.remove", "deviceId": "d1" })),
         ];
         for (words, command) in cases {

@@ -2,6 +2,7 @@
 //!
 //! jivvy-engine [--data-dir DIR] [--listen ADDR] [--slides N] [--supervised]
 //!              [--listen-ws ADDR] [--ws-origin ORIGIN]... [--ws-cert PEM --ws-key PEM]
+//!              [--upload-test-url URL]
 //!
 //! `--listen-ws` also serves the protocol over WebSocket (off by default). Browsers may use
 //! it only from an origin given with `--ws-origin`; programs always may. With `--ws-cert` and
@@ -27,6 +28,7 @@ fn main() {
     let mut listen_ws: Option<String> = None;
     let mut ws_access = engine::WsAccess::default();
     let (mut ws_cert, mut ws_key): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+    let mut upload_test_url: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
@@ -45,6 +47,8 @@ fn main() {
             "--ws-origin" => ws_access.origins.push(val()),
             "--ws-cert" => ws_cert = Some(PathBuf::from(val())),
             "--ws-key" => ws_key = Some(PathBuf::from(val())),
+            // Pre-flight's upload test (tests point it at a local stand-in).
+            "--upload-test-url" => upload_test_url = Some(val()),
             other => fail(&format!("unknown flag {other}")),
         }
     }
@@ -59,6 +63,13 @@ fn main() {
     let (snap, source) = store.load();
     log("engine", format!("resuming slide {} black={} from {source:?} snapshot", snap.slide_index, snap.black));
     let engine = Arc::new(Mutex::new(Engine::new(store, snap, slides)));
+    {
+        let mut e = engine.lock().unwrap();
+        e.set_handle(Arc::downgrade(&engine));
+        if let Some(url) = upload_test_url {
+            e.set_upload_test_url(url);
+        }
+    }
 
     if supervised {
         // The watchdog holds our stdin open; end-of-file means it is gone, so exit

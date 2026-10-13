@@ -603,6 +603,72 @@ fn jivvy_ctl_drives_a_running_daemon_in_one_line() {
     assert!(err.contains("unknown command"), "{err}");
 }
 
+/// A stand-in for the pre-flight upload-test endpoint: reads a chunked upload, answers how
+/// many bytes arrived, as live.jivvy.org/api/upload-test does.
+fn upload_test_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut out = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let mut line = String::new();
+                while r.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    line.clear();
+                }
+                let mut total = 0usize;
+                loop {
+                    let mut size = String::new();
+                    if r.read_line(&mut size).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+                    let mut chunk = vec![0u8; n + 2];
+                    if std::io::Read::read_exact(&mut r, &mut chunk).is_err() {
+                        return;
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                let body = format!(r#"{{"ok":true,"bytes":{total}}}"#);
+                let _ = write!(out, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/api/upload-test")
+}
+
+#[test]
+fn preflight_from_jivvy_ctl_says_what_each_platform_will_get() {
+    let dir = test_dir("preflight");
+    std::fs::write(
+        dir.join("stream.json"),
+        r#"{"version":1,"destinations":[{"id":"youtube","name":"YouTube","url":"rtmps://h:443/live2","key":"k"},
+            {"id":"facebook","name":"Facebook","url":"rtmps://f:443/rtmp/","key":"k"}]}"#,
+    )
+    .unwrap();
+    let url = upload_test_endpoint();
+    let d = start_with(dir, 10, false, &["--no-video", "--upload-test-url", &url]);
+    d.next_engine_pid(Duration::from_secs(10));
+    let (code, out, err) = ctl(&["--connect", d.addr.as_str(), "preflight"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let result: Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    let p = &result["preflight"];
+    assert_eq!((p["status"].clone(), p["measured"].clone()), (json!("done"), json!(true)), "{out}");
+    // Loopback is fast: everyone at full quality.
+    assert_eq!(p["summary"], "YouTube 1080p + Facebook 1080p", "{p}");
+    assert!(d.data_dir.join("upload-speed.json").exists(), "the speed is kept for next time");
+
+    // Never while streaming.
+    d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+    let (code, out, _) = ctl(&["--connect", d.addr.as_str(), "preflight"]);
+    assert_eq!(code, 1);
+    assert!(out.contains("unavailable"), "{out}");
+}
+
 /// True if every field in `expected` is in `actual` with the same value (objects compared
 /// the same way, recursively): how the shared scenarios match an ack.
 fn contains(actual: &Value, expected: &Value) -> bool {

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, streamAlerts, type Command, type DaemonLike, type StreamDestination } from "../src/index";
+import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type StreamDestination } from "../src/index";
 import fixtures from "../fixtures/parse-cases.json";
 import alertFixtures from "../fixtures/stream-alerts.json";
+import preflightFixtures from "../fixtures/preflight-summary.json";
 
 type Case = { name: string; input: string; expect: { ok: boolean; command?: unknown; code?: string; id?: string } };
 const cases = fixtures.cases as Case[];
@@ -22,6 +23,13 @@ describe("stream alerts (the same cases run in the Rust daemon)", () => {
   type AlertCase = { name: string; before: StreamDestination[]; after: StreamDestination[]; expect: unknown[] };
   it.each((alertFixtures.cases as AlertCase[]).map((c) => [c.name, c] as const))("%s", (_name, c) => {
     expect(streamAlerts(c.before, c.after)).toEqual(c.expect);
+  });
+});
+
+describe("pre-flight summary (the same cases run in the Rust daemon)", () => {
+  type Case = { name: string; destinations: PreflightDestination[]; expect: string };
+  it.each((preflightFixtures.cases as Case[]).map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    expect(preflightSummary(c.destinations)).toBe(c.expect);
   });
 });
 

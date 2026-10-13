@@ -60,7 +60,7 @@ Used when the hostname can't be reached: internet down, DNS blocked, or rebindin
 
 ## 4. What we test
 
-- TLS (PR #32): `wss` only, renewal without restart, open connections stay, bad pairs keep the last good one, keys never in logs).
+- TLS (PR #32): `wss` only, renewal without restart, open connections stay, bad pairs keep the last good one, keys never in logs.
 - Pairing: an unpaired device gets nothing but the pairing request; a removed device is cut off at once; a stolen challenge response can't be replayed on another connection (channel binding); approval only from the church computer.
 - Fallback: off by default; codes expire, are single-use and lock after 3 tries; nothing in plain text on the wire (a test captures the bytes and checks that neither the code nor any command appears); fallback devices can't reach settings or keys.
 - Chaos: the engine is killed mid-pairing and mid-session; paired devices reconnect and re-prove within the 3-second target; the shared scenarios pass over `wss` with authentication.

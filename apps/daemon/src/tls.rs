@@ -22,9 +22,10 @@ pub struct TlsFiles {
 
 #[derive(Default)]
 struct Loaded {
-    /// The file contents last tried, good or not, so unchanged files aren't parsed again.
-    cert: Vec<u8>,
-    key: Vec<u8>,
+    /// The file contents (cert, key) last tried, good or not, so unchanged files aren't
+    /// parsed again. `None` until the files have been read once, so even empty files get
+    /// checked (and their problem logged) the first time.
+    tried: Option<(Vec<u8>, Vec<u8>)>,
     /// The last good pair.
     config: Option<Arc<ServerConfig>>,
     /// The last problem logged, so a bad pair is logged once, not on every connection.
@@ -42,10 +43,10 @@ impl TlsFiles {
         let mut loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
         let files = std::fs::read(&self.cert).and_then(|c| Ok((c, std::fs::read(&self.key)?)));
         let problem = match files {
-            Ok((cert, key)) if cert == loaded.cert && key == loaded.key => return loaded.config.clone(),
+            Ok(files) if loaded.tried.as_ref() == Some(&files) => return loaded.config.clone(),
             Ok((cert, key)) => {
                 let result = server_config(&cert, &key);
-                (loaded.cert, loaded.key) = (cert, key);
+                loaded.tried = Some((cert, key));
                 match result {
                     Ok(config) => {
                         crate::log("engine", format!("WebSocket certificate loaded from {}", self.cert.display()));
@@ -136,6 +137,18 @@ pub(crate) mod tests {
         std::fs::write(&cert, &c2).unwrap();
         std::fs::write(&key, &k2).unwrap();
         assert!(!Arc::ptr_eq(&first, &tls.config().unwrap()), "a renewed pair is picked up");
+    }
+
+    #[test]
+    fn empty_files_are_checked_not_mistaken_for_files_already_tried() {
+        let dir = temp("empty");
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, "").unwrap();
+        std::fs::write(&key, "").unwrap();
+        let tls = TlsFiles::new(&cert, &key);
+        assert!(tls.config().is_none());
+        let problem = tls.loaded.lock().unwrap().problem.clone();
+        assert!(problem.is_some_and(|p| p.contains("no certificate")), "the empty pair is diagnosed");
     }
 
     #[test]

@@ -710,7 +710,7 @@ impl Write for Conn {
 
 /// Sends one command over the WebSocket channel, reconnecting until the engine answers or
 /// time runs out (as `Daemon::send` does over TCP).
-fn send_ws(addr: &str, ca_pem: Option<&str>, command: Value, within: Duration) -> Value {
+fn send_ws(addr: &str, ca_pem: Option<&str>, device: Option<&DeviceKey>, command: Value, within: Duration) -> Value {
     use tungstenite::client::IntoClientRequest;
     let deadline = Instant::now() + within;
     let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
@@ -723,6 +723,13 @@ fn send_ws(addr: &str, ca_pem: Option<&str>, command: Value, within: Duration) -
             let url = if ca_pem.is_some() { format!("wss://{CHURCH}/") } else { format!("ws://{addr}/") };
             let req = url.into_client_request().map_err(|e| not_taken(&e))?;
             let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| not_taken(&e))?;
+            if let Some(device) = device {
+                // A paired device proves its key on every connection, a restarted engine's too.
+                let proof = device.prove(&mut ws).map_err(|e| not_taken(&e))?;
+                if proof["ok"] != true {
+                    return Err((true, format!("a paired device was refused: {proof}")));
+                }
+            }
             ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| not_taken(&e))?;
             let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
             ws.get_ref().tcp().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
@@ -748,6 +755,86 @@ fn send_ws(addr: &str, ca_pem: Option<&str>, command: Value, within: Duration) -
     }
 }
 
+/// A device key like the web app's (P-256), for pairing over the network channel.
+struct DeviceKey(ring::signature::EcdsaKeyPair);
+
+impl DeviceKey {
+    fn new() -> DeviceKey {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        DeviceKey(EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap())
+    }
+
+    fn public(&self) -> String {
+        use base64::Engine as _;
+        use ring::signature::KeyPair;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0.public_key().as_ref())
+    }
+
+    fn sign(&self, message: &str) -> String {
+        use base64::Engine as _;
+        let sig = self.0.sign(&ring::rand::SystemRandom::new(), message.as_bytes()).unwrap();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.as_ref())
+    }
+
+    /// auth.hello, then auth.prove with the signed challenge; returns the prove ack.
+    fn prove(&self, ws: &mut tungstenite::WebSocket<Conn>) -> Result<Value, String> {
+        let hello = ws_command(ws, json!({ "type": "auth.hello", "publicKey": self.public() }))?;
+        let (Some(daemon), Some(challenge)) = (hello["daemonId"].as_str(), hello["challenge"].as_str()) else {
+            return Err(format!("no challenge: {hello}"));
+        };
+        let message = format!("jivvy-live auth v1\n{daemon}\n{challenge}");
+        ws_command(ws, json!({ "type": "auth.prove", "signature": self.sign(&message) }))
+    }
+}
+
+/// Sends one command and returns the next message that isn't an event.
+fn ws_command(ws: &mut tungstenite::WebSocket<Conn>, command: Value) -> Result<Value, String> {
+    let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
+    ws.send(tungstenite::Message::text(msg)).map_err(|e| e.to_string())?;
+    loop {
+        match ws.read().map_err(|e| e.to_string())? {
+            tungstenite::Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+                if v.get("event").is_none() {
+                    return Ok(v);
+                }
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Pairs a new device over the network channel, approved over the local one as the church
+/// computer would.
+fn pair_device(d: &Daemon, addr: &str, ca_pem: Option<&str>) -> DeviceKey {
+    use tungstenite::client::IntoClientRequest;
+    let key = DeviceKey::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ws = loop {
+        let attempt = (|| -> Result<_, String> {
+            let stream = Conn::open(addr, ca_pem).map_err(|e| e.to_string())?;
+            stream.tcp().set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+            let url = if ca_pem.is_some() { format!("wss://{CHURCH}/") } else { format!("ws://{addr}/") };
+            let req = url.into_client_request().map_err(|e| e.to_string())?;
+            tungstenite::client(req, stream).map(|(ws, _)| ws).map_err(|e| e.to_string())
+        })();
+        match attempt {
+            Ok(ws) => break ws,
+            Err(e) if Instant::now() >= deadline => panic!("WebSocket channel never came up: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    assert_eq!(d.send(json!({ "type": "pair.open" }), Duration::from_secs(10))["ok"], true);
+    let req = ws_command(&mut ws, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Chaos phone" }))
+        .unwrap();
+    let request_id = req["request"]["requestId"].clone();
+    let approved = d.send(json!({ "type": "pair.approve", "requestId": request_id }), Duration::from_secs(10));
+    assert_eq!(approved["ok"], true, "{approved}");
+    key
+}
+
 fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
@@ -766,6 +853,17 @@ fn run_shared_scenarios(channel: Channel) {
             scope.spawn(move || {
                 let name = scenario["name"].as_str().unwrap();
                 let slides = scenario["slides"].as_u64().unwrap();
+                // churchComputer runs on the local channel only; unpaired on the network channel only.
+                let connection = scenario["connection"].as_str();
+                let runs_here = match connection {
+                    None => true,
+                    Some("churchComputer") => channel == Channel::Tcp,
+                    Some("unpaired") => channel != Channel::Tcp,
+                    Some(other) => panic!("{name}: unknown connection {other}"),
+                };
+                if !runs_here {
+                    return;
+                }
                 let ws = format!("127.0.0.1:{}", free_port());
                 let (d, ca) = match channel {
                     Channel::Tcp => (start(&format!("scenario-{n}"), slides), None),
@@ -790,6 +888,9 @@ fn run_shared_scenarios(channel: Channel) {
                     }
                 };
                 let mut engine = d.next_engine_pid(Duration::from_secs(10));
+                // Over WebSocket, a trusted connection is a device paired for real.
+                let device =
+                    (channel != Channel::Tcp && connection.is_none()).then(|| pair_device(&d, &ws, ca.as_deref()));
                 for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
                     if step["crash"] == true {
                         kill_hard(engine);
@@ -798,7 +899,7 @@ fn run_shared_scenarios(channel: Channel) {
                     }
                     // Waits for a restarted engine to answer, like any client reconnecting.
                     let ack = if channel != Channel::Tcp {
-                        send_ws(&ws, ca.as_deref(), step["send"].clone(), RESTORE_TARGET)
+                        send_ws(&ws, ca.as_deref(), device.as_ref(), step["send"].clone(), RESTORE_TARGET)
                     } else {
                         d.send(step["send"].clone(), RESTORE_TARGET)
                     };

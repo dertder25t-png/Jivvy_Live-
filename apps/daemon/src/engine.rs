@@ -11,7 +11,11 @@ use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{self, Ack, Command, ErrorCode, RecordingStatus, StateSnapshot, StreamStatus};
+use crate::devices::{self, Devices};
+use crate::protocol::{
+    self, Ack, AckExtras, Command, DeviceInfo, ErrorCode, PairRequestInfo, PairingStatus, RecordingStatus, RequestAck,
+    StateSnapshot, StreamStatus,
+};
 use crate::snapshot::{Snapshot, Store};
 use crate::tls::TlsFiles;
 
@@ -40,11 +44,76 @@ impl Outbox {
     }
 }
 
+/// Who is on the other end of a connection.
+///
+/// The local channel (TCP on loopback) is the church computer itself: our own processes and
+/// its screen, all trusted. Every WebSocket connection is a device on the network, which
+/// must be paired and prove it holds its key before anything else.
+pub struct Session {
+    id: u64,
+    local: bool,
+    /// Set once the device has proven its key.
+    device_id: Option<String>,
+    /// The key and challenge from the last `auth.hello`; one proof per challenge.
+    hello: Option<(String, String)>,
+}
+
+impl Session {
+    pub fn local() -> Session {
+        Session::new(true)
+    }
+
+    pub fn device() -> Session {
+        Session::new(false)
+    }
+
+    fn new(local: bool) -> Session {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Session { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), local, device_id: None, hello: None }
+    }
+}
+
+/// What a paired device may do: run the service. Pairing, devices and the video process's
+/// reports are the church computer's alone.
+fn device_may(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SlideNext
+            | Command::SlidePrev
+            | Command::SlideGoto { .. }
+            | Command::OutputBlack { .. }
+            | Command::StreamStart
+            | Command::StreamStop
+            | Command::RecordingStart
+            | Command::RecordingStop
+            | Command::StateGet
+            | Command::StateSubscribe
+    )
+}
+
+struct PendingPairing {
+    request_id: String,
+    name: String,
+    public_key: String,
+    code: String,
+    session: u64,
+    outbox: Option<Outbox>,
+}
+
 pub struct Engine {
     state: Snapshot,
     store: Store,
     slide_count: u64,
     subscribers: Vec<Outbox>,
+    /// The church computer's subscribers, which also hear about pairing.
+    local_subscribers: Vec<Outbox>,
+    devices: Devices,
+    daemon_id: String,
+    /// Open for pairing requests until then.
+    pairing_until: Option<Instant>,
+    pending: Vec<PendingPairing>,
+    /// Connections whose device has proven its key: (device, session), and how to cut them off.
+    proven: Vec<(String, u64, Option<Outbox>)>,
     /// The video process's latest report on the stream, and when it came.
     stream_report: Option<(StreamStatus, Instant)>,
     /// The video process's latest report on the recording: its status, whether the disk is
@@ -60,11 +129,23 @@ impl Engine {
         let mut state = state;
         // A snapshot from a longer run sheet must not point past the end of this one.
         state.slide_index = state.slide_index.min(slide_count - 1);
+        let devices = Devices::load(store.dir());
+        let daemon_id = devices::daemon_id(store.dir()).unwrap_or_else(|e| {
+            // Devices check this id; one that changes makes them re-pair, never lets anyone in.
+            crate::log("engine", format!("can't save the daemon id ({e}); using a temporary one"));
+            devices::random_id(16)
+        });
         Engine {
             state,
             store,
             slide_count,
             subscribers: Vec::new(),
+            local_subscribers: Vec::new(),
+            devices,
+            daemon_id,
+            pairing_until: None,
+            pending: Vec::new(),
+            proven: Vec::new(),
             stream_report: None,
             recording_report: None,
             last_sent: None,
@@ -120,6 +201,10 @@ impl Engine {
         if self.last_sent.as_ref() != Some(&self.view_at(now)) {
             self.broadcast_at(now);
         }
+        if self.pairing_until.is_some_and(|t| now >= t) {
+            self.pairing_until = None;
+            self.pairing_changed(now);
+        }
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -131,15 +216,85 @@ impl Engine {
         self.handle_line_from(line, None)
     }
 
-    /// Like `handle_line`, for a connection that can receive events through `outbox`.
+    /// Like `handle_line`, for a connection on the local channel that can receive events
+    /// through `outbox`.
     pub fn handle_line_from(&mut self, line: &str, outbox: Option<&Outbox>) -> Ack {
+        self.handle(line, &mut Session::local(), outbox)
+    }
+
+    /// Handles one raw message from `session`.
+    pub fn handle(&mut self, line: &str, session: &mut Session, outbox: Option<&Outbox>) -> Ack {
         let env = match protocol::parse_envelope(line) {
             Ok(e) => e,
             Err(e) => return protocol::nack(e.id.as_deref().unwrap_or(""), e.code, e.message),
         };
         let id = env.id.as_str();
+        if !session.local {
+            match env.command {
+                Command::PairRequest { public_key, name } => {
+                    return self.pair_request(id, session, outbox, public_key, name);
+                }
+                Command::AuthHello { public_key } => {
+                    let challenge = devices::random_id(32);
+                    session.hello = Some((public_key, challenge.clone()));
+                    let extras = AckExtras {
+                        challenge: Some(challenge),
+                        daemon_id: Some(self.daemon_id.clone()),
+                        ..Default::default()
+                    };
+                    return protocol::ack_with(id, None, extras);
+                }
+                Command::AuthProve { signature } => return self.auth_prove(id, session, outbox, &signature),
+                _ => {}
+            }
+            // Checked on every command, so a device removed a moment ago gets nothing more.
+            let Some(device) = session.device_id.as_deref().filter(|d| self.devices.contains_id(d)) else {
+                return protocol::nack(id, ErrorCode::Unauthorized, "pair this device first");
+            };
+            if !device_may(&env.command) {
+                crate::log("engine", format!("refused {} from device {device}", command_name(&env.command)));
+                return protocol::nack(id, ErrorCode::Unauthorized, "only the church computer can do that");
+            }
+        }
         let mut next = self.state.clone();
         match env.command {
+            Command::PairOpen => {
+                self.pairing_until = Some(Instant::now() + protocol::PAIRING_WINDOW);
+                crate::log("engine", "pairing open for 2 minutes");
+                self.pairing_changed(Instant::now());
+                return self.pairing_ack(id);
+            }
+            Command::PairClose => {
+                self.pairing_until = None;
+                self.pairing_changed(Instant::now());
+                return self.pairing_ack(id);
+            }
+            Command::PairApprove { request_id } => return self.pair_answer(id, &request_id, true),
+            Command::PairDeny { request_id } => return self.pair_answer(id, &request_id, false),
+            Command::DeviceList => return self.devices_ack(id),
+            Command::DeviceRemove { device_id } => {
+                match self.devices.remove(&device_id) {
+                    Ok(true) => {}
+                    Ok(false) => return protocol::nack(id, ErrorCode::BadArguments, "no such device"),
+                    Err(e) => {
+                        crate::log("engine", format!("devices.json save failed: {e}"));
+                        return protocol::nack(id, ErrorCode::Unavailable, "could not save; try again");
+                    }
+                }
+                crate::log("engine", format!("device {device_id} removed"));
+                // Its open connections end now, not at their next command.
+                self.proven.retain(|(device, _, outbox)| {
+                    let removed = *device == device_id;
+                    if let Some(stream) = outbox.as_ref().and_then(|o| o.stream.as_ref()).filter(|_| removed) {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                    !removed
+                });
+                return self.devices_ack(id);
+            }
+            Command::PairRequest { .. } | Command::AuthHello { .. } | Command::AuthProve { .. } => {
+                return protocol::nack(id, ErrorCode::BadArguments, "the church computer doesn't need to pair");
+            }
             Command::SlideNext => next.slide_index = (next.slide_index + 1).min(self.slide_count - 1),
             Command::SlidePrev => next.slide_index = next.slide_index.saturating_sub(1),
             Command::SlideGoto { index } => {
@@ -175,7 +330,12 @@ impl Engine {
                 return protocol::ack(id, None);
             }
             Command::StateSubscribe => match outbox {
-                Some(o) => self.subscribers.push(o.clone()),
+                Some(o) => {
+                    self.subscribers.push(o.clone());
+                    if session.local {
+                        self.local_subscribers.push(o.clone());
+                    }
+                }
                 None => return protocol::nack(id, ErrorCode::Unavailable, "this connection can't receive events"),
             },
         }
@@ -190,6 +350,138 @@ impl Engine {
             self.broadcast();
         }
         protocol::ack(id, Some(self.view()))
+    }
+
+    /// A connection ended: its pairing request and proof go with it.
+    pub fn forget(&mut self, session: &Session) {
+        self.proven.retain(|(_, s, _)| *s != session.id);
+        let before = self.pending.len();
+        self.pending.retain(|p| p.session != session.id);
+        if self.pending.len() != before {
+            self.pairing_changed(Instant::now());
+        }
+    }
+
+    pub fn daemon_id(&self) -> &str {
+        &self.daemon_id
+    }
+
+    fn pairing_open(&self, now: Instant) -> bool {
+        self.pairing_until.is_some_and(|t| now < t)
+    }
+
+    fn pairing_status(&self, now: Instant) -> PairingStatus {
+        match self.pairing_until.filter(|t| now < *t) {
+            None => PairingStatus { open: false, closes_in_ms: None, requests: Vec::new() },
+            Some(until) => PairingStatus {
+                open: true,
+                closes_in_ms: Some(until.saturating_duration_since(now).as_millis() as u64),
+                requests: self
+                    .pending
+                    .iter()
+                    .map(|p| PairRequestInfo {
+                        request_id: p.request_id.clone(),
+                        name: p.name.clone(),
+                        code: p.code.clone(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn pairing_ack(&self, id: &str) -> Ack {
+        let extras = AckExtras { pairing: Some(self.pairing_status(Instant::now())), ..Default::default() };
+        protocol::ack_with(id, None, extras)
+    }
+
+    fn devices_ack(&self, id: &str) -> Ack {
+        let devices = self
+            .devices
+            .list()
+            .iter()
+            .map(|d| DeviceInfo { device_id: d.device_id.clone(), name: d.name.clone(), paired_at: d.paired_at })
+            .collect();
+        protocol::ack_with(id, None, AckExtras { devices: Some(devices), ..Default::default() })
+    }
+
+    /// Tells the church computer's subscribers. Once pairing has closed, waiting devices hear
+    /// they weren't approved.
+    fn pairing_changed(&mut self, now: Instant) {
+        if !self.pairing_open(now) {
+            for p in std::mem::take(&mut self.pending) {
+                send_event(p.outbox.as_ref(), &protocol::pair_result_event(None));
+            }
+        }
+        if let Ok(mut line) = serde_json::to_vec(&protocol::pairing_event(self.pairing_status(now))) {
+            line.push(b'\n');
+            self.local_subscribers.retain(|s| s.tx.try_send(line.clone()).is_ok());
+        }
+    }
+
+    fn pair_request(&mut self, id: &str, session: &Session, outbox: Option<&Outbox>, key: String, name: String) -> Ack {
+        let now = Instant::now();
+        if !self.pairing_open(now) {
+            return protocol::nack(id, ErrorCode::Unauthorized, "pairing isn't open; open it on the church computer");
+        }
+        // Asking again from the same connection replaces the earlier request.
+        self.pending.retain(|p| p.session != session.id);
+        if self.pending.len() >= protocol::MAX_PENDING_PAIRINGS {
+            return protocol::nack(id, ErrorCode::Unauthorized, "too many pairing requests waiting");
+        }
+        let (request_id, code) = (devices::random_id(12), devices::random_code());
+        crate::log("engine", format!("pairing request {request_id} from {name:?}"));
+        self.pending.push(PendingPairing {
+            request_id: request_id.clone(),
+            name,
+            public_key: key,
+            code: code.clone(),
+            session: session.id,
+            outbox: outbox.cloned(),
+        });
+        self.pairing_changed(now);
+        protocol::ack_with(id, None, AckExtras { request: Some(RequestAck { request_id, code }), ..Default::default() })
+    }
+
+    fn pair_answer(&mut self, id: &str, request_id: &str, approve: bool) -> Ack {
+        let now = Instant::now();
+        let found = self.pending.iter().position(|p| p.request_id == request_id).filter(|_| self.pairing_open(now));
+        let Some(i) = found else {
+            return protocol::nack(id, ErrorCode::BadArguments, "no such pairing request");
+        };
+        if approve {
+            let p = &self.pending[i];
+            match self.devices.add(&p.name, &p.public_key, crate::now_ms()) {
+                Ok(device_id) => {
+                    crate::log("engine", format!("paired {:?} as device {device_id}", p.name));
+                    send_event(p.outbox.as_ref(), &protocol::pair_result_event(Some((&device_id, &self.daemon_id))));
+                }
+                Err(e) => {
+                    // Not saved means not paired; the request stays so it can be approved again.
+                    crate::log("engine", format!("devices.json save failed: {e}"));
+                    return protocol::nack(id, ErrorCode::Unavailable, "could not save; try again");
+                }
+            }
+        } else {
+            send_event(self.pending[i].outbox.as_ref(), &protocol::pair_result_event(None));
+        }
+        self.pending.remove(i);
+        self.pairing_changed(now);
+        self.pairing_ack(id)
+    }
+
+    fn auth_prove(&mut self, id: &str, session: &mut Session, outbox: Option<&Outbox>, signature: &str) -> Ack {
+        // One proof per challenge, right or wrong.
+        let Some((key, challenge)) = session.hello.take() else {
+            return protocol::nack(id, ErrorCode::Unauthorized, "send auth.hello first");
+        };
+        let message = protocol::auth_message(&self.daemon_id, &challenge);
+        let device = self.devices.by_key(&key).filter(|_| devices::verify(&key, &message, signature));
+        let Some(device_id) = device.map(|d| d.device_id.clone()) else {
+            return protocol::nack(id, ErrorCode::Unauthorized, "not a paired device");
+        };
+        session.device_id = Some(device_id.clone());
+        self.proven.push((device_id.clone(), session.id, outbox.cloned()));
+        protocol::ack_with(id, Some(self.view()), AckExtras { device_id: Some(device_id), ..Default::default() })
     }
 
     /// Sends the current state to every subscriber without ever blocking: a subscriber
@@ -221,6 +513,19 @@ impl Engine {
             Err(TrySendError::Disconnected(_)) => false,
         });
     }
+}
+
+/// One event to one connection, if it can receive events; never blocks.
+fn send_event(outbox: Option<&Outbox>, event: &impl serde::Serialize) {
+    if let (Some(o), Ok(mut line)) = (outbox, serde_json::to_vec(event)) {
+        line.push(b'\n');
+        let _ = o.tx.try_send(line);
+    }
+}
+
+/// For the log: the command's type, never its arguments.
+fn command_name(command: &Command) -> String {
+    serde_json::to_value(command).ok().and_then(|v| v["type"].as_str().map(String::from)).unwrap_or_default()
 }
 
 /// Binds the command channel, retrying briefly in case the previous engine's socket is
@@ -273,6 +578,13 @@ fn discard_line(reader: &mut impl BufRead) -> std::io::Result<u64> {
 }
 
 fn serve_connection(stream: TcpStream, engine: &Mutex<Engine>) -> std::io::Result<()> {
+    // The local channel is trusted, so it only ever takes connections from this computer,
+    // whatever address it was told to listen on. Devices use the WebSocket channel.
+    let peer = stream.peer_addr()?;
+    if !peer.ip().is_loopback() {
+        crate::log("engine", format!("refused a local-channel connection from {}", peer.ip()));
+        return Ok(());
+    }
     stream.set_nodelay(true)?;
     let shared = Arc::new(stream.try_clone()?);
     let (tx, rx) = sync_channel::<Vec<u8>>(OUTBOX_CAPACITY);
@@ -366,17 +678,19 @@ fn serve_ws_connection(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(WS_HANDSHAKE_TIMEOUT))?;
     let shared = Arc::new(stream.try_clone()?);
+    let mut session = Session::device();
     let result = match tls {
-        None => ws_session(stream, &shared, engine, access),
+        None => ws_session(stream, &shared, engine, access, &mut session),
         // No good certificate yet: refuse rather than serve in plain text.
         Some(tls) => match tls.config() {
             Some(config) => {
                 let conn = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
-                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access)
+                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access, &mut session)
             }
             None => Ok(()),
         },
     };
+    engine.lock().unwrap_or_else(|p| p.into_inner()).forget(&session);
     let _ = shared.shutdown(Shutdown::Both);
     result
 }
@@ -405,6 +719,7 @@ fn ws_session<S: OverTcp>(
     socket: &Arc<TcpStream>,
     engine: &Mutex<Engine>,
     access: &WsAccess,
+    session: &mut Session,
 ) -> std::io::Result<()> {
     use tungstenite::{Error, Message, handshake::server::ErrorResponse, http::StatusCode};
 
@@ -443,7 +758,7 @@ fn ws_session<S: OverTcp>(
             Ok(Message::Text(text)) => {
                 // A panic in one handler must not poison the engine for every other device.
                 let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
-                Some(e.handle_line_from(text.trim(), Some(&outbox)))
+                Some(e.handle(text.trim(), session, Some(&outbox)))
             }
             Ok(Message::Binary(_)) => Some(protocol::nack("", ErrorCode::BadMessage, "send JSON as text messages")),
             // tungstenite has queued the close reply; the flush below sends it, and the next
@@ -835,17 +1150,39 @@ mod tests {
         }
     }
 
-    fn ws_send(ws: &mut Ws, text: &str) {
+    fn ws_send<S: Read + Write>(ws: &mut tungstenite::WebSocket<S>, text: &str) {
         ws.send(tungstenite::Message::text(text.to_string())).unwrap();
     }
 
-    fn ws_next(ws: &mut Ws) -> Value {
+    fn ws_next<S: Read + Write>(ws: &mut tungstenite::WebSocket<S>) -> Value {
         loop {
             match ws.read().unwrap() {
                 tungstenite::Message::Text(t) => return serde_json::from_str(&t).unwrap(),
                 _ => continue,
             }
         }
+    }
+
+    fn envelope(command: Value) -> String {
+        json!({ "v": 1, "id": "t", "ts": 1, "command": command }).to_string()
+    }
+
+    /// Sends one command and returns the next message that isn't an event.
+    fn ws_cmd<S: Read + Write>(ws: &mut tungstenite::WebSocket<S>, command: Value) -> Value {
+        ws_send(ws, &envelope(command));
+        loop {
+            let m = ws_next(ws);
+            if m.get("event").is_none() {
+                return m;
+            }
+        }
+    }
+
+    /// Proves `key` on this connection, as a paired device does on every connection.
+    fn prove<S: Read + Write>(ws: &mut tungstenite::WebSocket<S>, key: &TestKey) -> Value {
+        let hello = ws_cmd(ws, json!({ "type": "auth.hello", "publicKey": key.public() }));
+        let message = protocol::auth_message(hello["daemonId"].as_str().unwrap(), hello["challenge"].as_str().unwrap());
+        ws_cmd(ws, json!({ "type": "auth.prove", "signature": key.sign(&message) }))
     }
 
     fn tcp_ask(addr: std::net::SocketAddr, line: &str) -> Value {
@@ -860,6 +1197,7 @@ mod tests {
     fn websocket_carries_the_same_envelopes_acks_and_events_as_tcp() {
         let (tcp, ws_addr) = serve_both("ws-same", &[]);
         let mut ws = ws_connect(ws_addr, None).unwrap();
+        pair_over_the_wire(tcp, &mut ws, &TestKey::new());
         let goto = r#"{"v":1,"id":"g","ts":1,"command":{"type":"slide.goto","index":3}}"#;
         ws_send(&mut ws, goto);
         let ws_ack = ws_next(&mut ws);
@@ -918,17 +1256,36 @@ mod tests {
         assert_eq!(ws_next(&mut ws)["message"], "message too long");
     }
 
+    /// Pairs `key` the way a phone does: the church computer opens pairing and approves the
+    /// request (over the local channel), then the device proves its key.
+    fn pair_over_the_wire<S: Read + Write>(
+        tcp: std::net::SocketAddr,
+        ws: &mut tungstenite::WebSocket<S>,
+        key: &TestKey,
+    ) {
+        assert_eq!(tcp_ask(tcp, &envelope(json!({ "type": "pair.open" })))["pairing"]["open"], true);
+        let req = ws_cmd(ws, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Test phone" }));
+        let request_id = req["request"]["requestId"].as_str().unwrap().to_string();
+        tcp_ask(tcp, &envelope(json!({ "type": "pair.approve", "requestId": request_id })));
+        let result = ws_next(ws);
+        assert_eq!((result["event"].clone(), result["approved"].clone()), (json!("pair.result"), json!(true)));
+        assert_eq!(prove(ws, key)["ok"], true);
+    }
+
     type Wss = tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
     const CHURCH: &str = "church.d.jivvy.org";
 
-    /// An engine serving `wss://` with whatever is in `cert` and `key`.
-    fn serve_tls(name: &str, cert: &std::path::Path, key: &std::path::Path) -> std::net::SocketAddr {
-        let (e, _) = engine(name, 10);
+    /// An engine serving `wss://` with whatever is in `cert` and `key`, with one device
+    /// already paired: its key.
+    fn serve_tls(name: &str, cert: &std::path::Path, key: &std::path::Path) -> (std::net::SocketAddr, TestKey) {
+        let (mut e, _) = engine(name, 10);
+        let device = TestKey::new();
+        e.devices.add("Test phone", &device.public(), 1).unwrap();
         let ws = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
         let addr = ws.local_addr().unwrap();
         let tls = Some(Arc::new(TlsFiles::new(cert, key)));
         std::thread::spawn(move || serve_ws(ws, Arc::new(Mutex::new(e)), Arc::new(WsAccess::default()), tls));
-        addr
+        (addr, device)
     }
 
     /// Connects trusting only `ca_pem`, as a browser trusts only real certificate authorities.
@@ -969,13 +1326,15 @@ mod tests {
         let dir = crate::tls::tests::temp("wss");
         let (ca, cert, key) = crate::tls::tests::test_pair(CHURCH);
         write_pair(&dir, &cert, &key);
-        let addr = serve_tls("wss", &dir.join("cert.pem"), &dir.join("key.pem"));
+        let (addr, device) = serve_tls("wss", &dir.join("cert.pem"), &dir.join("key.pem"));
 
         let mut ws = wss_connect(addr, &ca).unwrap();
+        assert_eq!(prove(&mut ws, &device)["ok"], true);
         assert_eq!(wss_ask(&mut ws, "slide.next")["state"]["slideIndex"], 1);
         // Events reach a quiet subscriber over TLS too.
         assert_eq!(wss_ask(&mut ws, "state.subscribe")["ok"], true);
         let mut other = wss_connect(addr, &ca).unwrap();
+        prove(&mut other, &device);
         let sent = Instant::now();
         for _ in 0..20 {
             wss_ask(&mut other, "slide.next");
@@ -1006,13 +1365,15 @@ mod tests {
         let dir = crate::tls::tests::temp("wss-renew");
         let (ca, cert, key) = crate::tls::tests::test_pair(CHURCH);
         write_pair(&dir, &cert, &key);
-        let addr = serve_tls("wss-renew", &dir.join("cert.pem"), &dir.join("key.pem"));
+        let (addr, device) = serve_tls("wss-renew", &dir.join("cert.pem"), &dir.join("key.pem"));
         let mut open = wss_connect(addr, &ca).unwrap();
+        prove(&mut open, &device);
 
         let (new_ca, new_cert, new_key) = crate::tls::tests::test_pair(CHURCH);
         write_pair(&dir, &new_cert, &new_key);
         let mut renewed = wss_connect(addr, &new_ca).expect("new connections get the renewed certificate");
         assert!(wss_connect(addr, &ca).is_err(), "the old certificate is no longer served");
+        prove(&mut renewed, &device);
         assert_eq!(wss_ask(&mut renewed, "slide.next")["state"]["slideIndex"], 1);
         assert_eq!(wss_ask(&mut open, "state.get")["state"]["slideIndex"], 1, "the open connection carries on");
     }
@@ -1020,12 +1381,277 @@ mod tests {
     #[test]
     fn with_no_certificate_yet_connections_are_refused_until_it_arrives() {
         let dir = crate::tls::tests::temp("wss-later");
-        let addr = serve_tls("wss-later", &dir.join("cert.pem"), &dir.join("key.pem"));
+        let (addr, device) = serve_tls("wss-later", &dir.join("cert.pem"), &dir.join("key.pem"));
         let (ca, cert, key) = crate::tls::tests::test_pair(CHURCH);
         assert!(wss_connect(addr, &ca).is_err());
         assert!(ws_connect(addr, None).is_err(), "no certificate never means plain text");
         write_pair(&dir, &cert, &key);
         let mut ws = wss_connect(addr, &ca).expect("the certificate is picked up when it arrives");
+        prove(&mut ws, &device);
         assert_eq!(wss_ask(&mut ws, "state.get")["ok"], true);
+    }
+
+    // ---- Pairing and device authentication ----
+
+    use crate::devices::tests::TestKey;
+
+    /// A device connection in-process: its session, and the events it receives.
+    struct Phone {
+        session: Session,
+        outbox: Outbox,
+        events: std::sync::mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl Phone {
+        fn new() -> Phone {
+            let (tx, events) = sync_channel(64);
+            Phone { session: Session::device(), outbox: Outbox::new(tx, None), events }
+        }
+        fn send(&mut self, e: &mut Engine, command: Value) -> Value {
+            serde_json::to_value(e.handle(&envelope(command), &mut self.session, Some(&self.outbox))).unwrap()
+        }
+        fn prove(&mut self, e: &mut Engine, key: &TestKey) -> Value {
+            let hello = self.send(e, json!({ "type": "auth.hello", "publicKey": key.public() }));
+            let msg = protocol::auth_message(hello["daemonId"].as_str().unwrap(), hello["challenge"].as_str().unwrap());
+            self.send(e, json!({ "type": "auth.prove", "signature": key.sign(&msg) }))
+        }
+        fn events(&self) -> Vec<Value> {
+            self.events.try_iter().map(|b| serde_json::from_slice(&b).unwrap()).collect()
+        }
+    }
+
+    /// Pairs `key` in-process; returns its device id.
+    fn pair(e: &mut Engine, key: &TestKey) -> String {
+        send(e, json!({ "type": "pair.open" }));
+        let mut phone = Phone::new();
+        let req = phone.send(e, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Phone" }));
+        send(e, json!({ "type": "pair.approve", "requestId": req["request"]["requestId"] }));
+        e.forget(&phone.session);
+        phone.events().last().unwrap()["deviceId"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_device_pairs_with_a_code_the_church_computer_checks_and_then_runs_the_service() {
+        let (mut e, _) = engine("pair-flow", 10);
+        let key = TestKey::new();
+        let (tx, church_events) = sync_channel(64);
+        let church = Outbox::new(tx, None);
+        e.handle_line_from(&envelope(json!({ "type": "state.subscribe" })), Some(&church));
+
+        let opened = send(&mut e, json!({ "type": "pair.open" }));
+        assert_eq!(opened["pairing"]["open"], true);
+        let closes = opened["pairing"]["closesInMs"].as_u64().unwrap();
+        assert!((119_000..=120_000).contains(&closes), "{closes}");
+
+        let mut phone = Phone::new();
+        let req =
+            phone.send(&mut e, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Sam's iPhone" }));
+        let code = req["request"]["code"].as_str().unwrap().to_string();
+        assert!(code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()));
+        // The church computer sees the request with the same code the phone shows.
+        let seen: Vec<Value> = church_events.try_iter().map(|b| serde_json::from_slice(&b).unwrap()).collect();
+        let pairing = seen.iter().rev().find(|ev| ev["event"] == "pairing").unwrap();
+        assert_eq!(pairing["pairing"]["requests"][0]["code"], json!(code));
+        assert_eq!(pairing["pairing"]["requests"][0]["name"], "Sam's iPhone");
+        // Asking isn't being paired.
+        assert_eq!(phone.send(&mut e, json!({ "type": "slide.next" }))["code"], "unauthorized");
+
+        send(&mut e, json!({ "type": "pair.approve", "requestId": req["request"]["requestId"] }));
+        let result = phone.events().pop().unwrap();
+        assert_eq!((result["event"].clone(), result["approved"].clone()), (json!("pair.result"), json!(true)));
+        assert_eq!(result["daemonId"], json!(e.daemon_id()));
+
+        let mut phone = Phone::new();
+        let proved = phone.prove(&mut e, &key);
+        assert_eq!((proved["ok"].clone(), proved["deviceId"].clone()), (json!(true), result["deviceId"].clone()));
+        assert_eq!(phone.send(&mut e, json!({ "type": "slide.next" }))["state"]["slideIndex"], 1);
+        let devices = send(&mut e, json!({ "type": "device.list" }));
+        assert_eq!(devices["devices"][0]["name"], "Sam's iPhone");
+    }
+
+    #[test]
+    fn a_paired_device_can_never_do_the_church_computers_or_the_video_processs_jobs() {
+        let (mut e, _) = engine("pair-limits", 10);
+        let key = TestKey::new();
+        pair(&mut e, &key);
+        let mut phone = Phone::new();
+        phone.prove(&mut e, &key);
+        for command in [
+            json!({ "type": "pair.open" }),
+            json!({ "type": "pair.close" }),
+            json!({ "type": "pair.approve", "requestId": "x" }),
+            json!({ "type": "pair.deny", "requestId": "x" }),
+            json!({ "type": "device.list" }),
+            json!({ "type": "device.remove", "deviceId": "x" }),
+            json!({ "type": "stream.report", "status": "live" }),
+            json!({ "type": "recording.report", "status": "recording" }),
+            json!({ "type": "media.levels", "peakDb": [0], "rmsDb": [0] }),
+        ] {
+            assert_eq!(phone.send(&mut e, command.clone())["code"], "unauthorized", "{command}");
+        }
+    }
+
+    #[test]
+    fn only_the_right_key_for_this_daemon_on_a_fresh_challenge_gets_in() {
+        let (mut e, _) = engine("pair-proof", 10);
+        let (key, stranger) = (TestKey::new(), TestKey::new());
+        pair(&mut e, &key);
+        assert_eq!(Phone::new().prove(&mut e, &stranger)["code"], "unauthorized");
+
+        // Signed for another church computer.
+        let mut phone = Phone::new();
+        let hello = phone.send(&mut e, json!({ "type": "auth.hello", "publicKey": key.public() }));
+        let elsewhere = protocol::auth_message("another-church", hello["challenge"].as_str().unwrap());
+        assert_eq!(
+            phone.send(&mut e, json!({ "type": "auth.prove", "signature": key.sign(&elsewhere) }))["code"],
+            "unauthorized"
+        );
+
+        // A signature works once, on its own connection.
+        let mut a = Phone::new();
+        let hello = a.send(&mut e, json!({ "type": "auth.hello", "publicKey": key.public() }));
+        let sig = key.sign(&protocol::auth_message(e.daemon_id(), hello["challenge"].as_str().unwrap()));
+        let mut b = Phone::new();
+        b.send(&mut e, json!({ "type": "auth.hello", "publicKey": key.public() }));
+        assert_eq!(b.send(&mut e, json!({ "type": "auth.prove", "signature": sig.clone() }))["code"], "unauthorized");
+        assert_eq!(a.send(&mut e, json!({ "type": "auth.prove", "signature": sig.clone() }))["ok"], true);
+        assert_eq!(
+            Phone::new().send(&mut e, json!({ "type": "auth.prove", "signature": sig }))["code"],
+            "unauthorized"
+        );
+
+        // A wrong proof uses up the challenge.
+        let mut c = Phone::new();
+        let hello = c.send(&mut e, json!({ "type": "auth.hello", "publicKey": key.public() }));
+        let msg = protocol::auth_message(e.daemon_id(), hello["challenge"].as_str().unwrap());
+        c.send(&mut e, json!({ "type": "auth.prove", "signature": stranger.sign(&msg) }));
+        assert_eq!(
+            c.send(&mut e, json!({ "type": "auth.prove", "signature": key.sign(&msg) }))["code"],
+            "unauthorized"
+        );
+    }
+
+    #[test]
+    fn pairing_closes_by_itself_after_two_minutes_and_waiting_devices_hear_no() {
+        let (mut e, _) = engine("pair-window", 10);
+        let key = TestKey::new();
+        send(&mut e, json!({ "type": "pair.open" }));
+        let mut phone = Phone::new();
+        let req = phone.send(&mut e, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Phone" }));
+        e.tick_at(Instant::now() + protocol::PAIRING_WINDOW);
+        let result = phone.events().pop().unwrap();
+        assert_eq!((result["event"].clone(), result["approved"].clone()), (json!("pair.result"), json!(false)));
+        let late = send(&mut e, json!({ "type": "pair.approve", "requestId": req["request"]["requestId"] }));
+        assert_eq!(late["code"], "bad_arguments");
+        let again = phone.send(&mut e, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Phone" }));
+        assert_eq!(again["code"], "unauthorized");
+        assert_eq!(send(&mut e, json!({ "type": "device.list" }))["devices"], json!([]));
+    }
+
+    #[test]
+    fn a_denied_device_isnt_paired_and_five_requests_at_most_wait() {
+        let (mut e, _) = engine("pair-deny", 10);
+        send(&mut e, json!({ "type": "pair.open" }));
+        let key = TestKey::new();
+        let mut phone = Phone::new();
+        let req = phone.send(&mut e, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Phone" }));
+        send(&mut e, json!({ "type": "pair.deny", "requestId": req["request"]["requestId"] }));
+        assert_eq!(phone.events().pop().unwrap()["approved"], false);
+        assert_eq!(Phone::new().prove(&mut e, &key)["code"], "unauthorized");
+
+        let mut waiting = Vec::new();
+        for i in 0..5 {
+            let mut p = Phone::new();
+            let r = p.send(
+                &mut e,
+                json!({ "type": "pair.request", "publicKey": TestKey::new().public(), "name": format!("P{i}") }),
+            );
+            assert_eq!(r["ok"], true);
+            waiting.push(p);
+        }
+        let r = Phone::new()
+            .send(&mut e, json!({ "type": "pair.request", "publicKey": TestKey::new().public(), "name": "P6" }));
+        assert_eq!(r["code"], "unauthorized");
+        // A device that leaves takes its request with it, making room.
+        e.forget(&waiting.pop().unwrap().session);
+        let r = Phone::new()
+            .send(&mut e, json!({ "type": "pair.request", "publicKey": TestKey::new().public(), "name": "P6" }));
+        assert_eq!(r["ok"], true);
+    }
+
+    #[test]
+    fn paired_devices_survive_a_restart_and_a_removed_one_gets_nothing_more() {
+        let (mut e, dir) = engine("pair-restart", 10);
+        let key = TestKey::new();
+        let device_id = pair(&mut e, &key);
+        let daemon_id = e.daemon_id().to_string();
+        let mut phone = Phone::new();
+        phone.prove(&mut e, &key);
+        drop(e);
+
+        // A new engine on the same data folder: same daemon id, same devices.
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut e = Engine::new(store, snap, 10);
+        assert_eq!(e.daemon_id(), daemon_id);
+        let mut phone = Phone::new();
+        assert_eq!(phone.prove(&mut e, &key)["ok"], true);
+
+        assert_eq!(send(&mut e, json!({ "type": "device.remove", "deviceId": device_id }))["devices"], json!([]));
+        assert_eq!(
+            phone.send(&mut e, json!({ "type": "state.get" }))["code"],
+            "unauthorized",
+            "an open connection is cut off"
+        );
+        assert_eq!(Phone::new().prove(&mut e, &key)["code"], "unauthorized");
+    }
+
+    #[test]
+    fn removing_a_device_closes_its_websocket_at_once() {
+        let (tcp, ws_addr) = serve_both("pair-remove", &[]);
+        let key = TestKey::new();
+        let mut ws = ws_connect(ws_addr, None).unwrap();
+        pair_over_the_wire(tcp, &mut ws, &key);
+        let devices = tcp_ask(tcp, &envelope(json!({ "type": "device.list" })));
+        let device_id = devices["devices"][0]["deviceId"].as_str().unwrap().to_string();
+        tcp_ask(tcp, &envelope(json!({ "type": "device.remove", "deviceId": device_id })));
+        let start = Instant::now();
+        let end = loop {
+            match ws.read() {
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            !matches!(end, tungstenite::Error::Io(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "closed, not timed out: {end}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_local_channel_only_takes_connections_from_this_computer() {
+        // Needs an address on this machine that isn't loopback; skipped without one.
+        let Ok(probe) = std::net::UdpSocket::bind("0.0.0.0:0") else { return };
+        if probe.connect("192.0.2.1:9").is_err() {
+            eprintln!("skipped: no route off this machine");
+            return;
+        }
+        let Ok(local) = probe.local_addr() else { return };
+        if local.ip().is_unspecified() || local.ip().is_loopback() {
+            eprintln!("skipped: this machine has no address but loopback");
+            return;
+        }
+        eprintln!("connecting from {}", local.ip());
+        let (e, _) = engine("local-only", 10);
+        let listener = bind("0.0.0.0:0", Duration::from_secs(1)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || serve(listener, Arc::new(Mutex::new(e))));
+        let mut s = TcpStream::connect((local.ip(), port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(format!("{}\n", envelope(json!({ "type": "state.get" }))).as_bytes()).unwrap();
+        let mut reply = String::new();
+        let n = BufReader::new(s).read_line(&mut reply).unwrap_or(0);
+        assert_eq!(n, 0, "no answer to a connection from {}: {reply}", local.ip());
     }
 }

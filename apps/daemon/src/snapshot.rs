@@ -54,6 +54,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// The data folder the snapshot lives in.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     pub fn new(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;

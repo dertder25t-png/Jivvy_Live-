@@ -1356,11 +1356,13 @@ name = "jivvy-daemon"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "base64 0.22.1",
  "fs4",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",

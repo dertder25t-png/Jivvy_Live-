@@ -43,6 +43,79 @@ pub enum Command {
         #[serde(rename = "lowDisk")]
         low_disk: bool,
     },
+    // Pairing and device authentication: the church computer's local channel is trusted;
+    // every device on the network channel pairs once and proves its key on every connection.
+    #[serde(rename = "pair.open")]
+    PairOpen,
+    #[serde(rename = "pair.close")]
+    PairClose,
+    #[serde(rename = "pair.request")]
+    PairRequest {
+        #[serde(rename = "publicKey")]
+        public_key: String,
+        name: String,
+    },
+    #[serde(rename = "pair.approve")]
+    PairApprove {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    #[serde(rename = "pair.deny")]
+    PairDeny {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    #[serde(rename = "auth.hello")]
+    AuthHello {
+        #[serde(rename = "publicKey")]
+        public_key: String,
+    },
+    #[serde(rename = "auth.prove")]
+    AuthProve { signature: String },
+    #[serde(rename = "device.list")]
+    DeviceList,
+    #[serde(rename = "device.remove")]
+    DeviceRemove {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+    },
+}
+
+/// Longest device name, in characters (code points, as JavaScript's `[...name]` counts).
+pub const MAX_DEVICE_NAME: usize = 64;
+/// How long pairing stays open after `pair.open`.
+pub const PAIRING_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+/// Most pairing requests waiting at once.
+pub const MAX_PENDING_PAIRINGS: usize = 5;
+
+fn is_b64url(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A P-256 public key, raw uncompressed (65 bytes), base64url without padding.
+fn public_key(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    (s.len() == 87 && s.starts_with('B') && is_b64url(s)).then(|| s.to_string())
+}
+
+/// A 64-byte signature, base64url without padding.
+fn signature(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    (s.len() == 86 && is_b64url(s)).then(|| s.to_string())
+}
+
+/// Request and device ids.
+fn id_field(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    (!s.is_empty() && s.len() <= 64 && is_b64url(s)).then(|| s.to_string())
+}
+
+/// A device name, trimmed like JavaScript's `trim()`: 1-64 characters, no control characters.
+fn device_name(v: Option<&Value>) -> Option<String> {
+    let name = v?.as_str()?.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let count = name.chars().count();
+    let control = name.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f);
+    ((1..=MAX_DEVICE_NAME).contains(&count) && !control).then(|| name.to_string())
 }
 
 /// Audio input levels in dBFS, one entry per channel.
@@ -72,6 +145,9 @@ pub enum ErrorCode {
     UnknownCommand,
     BadArguments,
     Unavailable,
+    /// This connection may not do that: an unpaired or unproven device, a command only the
+    /// church computer may send, or pairing that isn't open.
+    Unauthorized,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +198,58 @@ pub struct StateSnapshot {
     pub recording_low_disk: bool,
 }
 
+/// A device waiting for approval, as the church computer sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairRequestInfo {
+    pub request_id: String,
+    pub name: String,
+    /// 6 random digits, also shown on the device.
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingStatus {
+    pub open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closes_in_ms: Option<u64>,
+    pub requests: Vec<PairRequestInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestAck {
+    pub request_id: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceInfo {
+    pub device_id: String,
+    pub name: String,
+    pub paired_at: u64,
+}
+
+/// Fields an ok ack may carry besides `state`; only some commands send them.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AckExtras {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairing: Option<PairingStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<RequestAck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<DeviceInfo>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Ack {
@@ -131,6 +259,8 @@ pub enum Ack {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         state: Option<StateSnapshot>,
+        #[serde(flatten)]
+        extras: AckExtras,
     },
     Err {
         v: u32,
@@ -166,7 +296,51 @@ pub fn levels_event(levels: &Levels) -> LevelsEvent<'_> {
 }
 
 pub fn ack(id: &str, state: Option<StateSnapshot>) -> Ack {
-    Ack::Ok { v: PROTOCOL_VERSION, id: id.into(), ok: true, state }
+    ack_with(id, state, AckExtras::default())
+}
+
+pub fn ack_with(id: &str, state: Option<StateSnapshot>, extras: AckExtras) -> Ack {
+    Ack::Ok { v: PROTOCOL_VERSION, id: id.into(), ok: true, state, extras }
+}
+
+/// To the church computer's subscribers whenever pairing opens, closes or gets a request.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairingEvent {
+    pub v: u32,
+    pub event: &'static str,
+    pub pairing: PairingStatus,
+}
+
+pub fn pairing_event(pairing: PairingStatus) -> PairingEvent {
+    PairingEvent { v: PROTOCOL_VERSION, event: "pairing", pairing }
+}
+
+/// To the device that asked to pair, once the church computer answers.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairResultEvent {
+    pub v: u32,
+    pub event: &'static str,
+    pub approved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
+}
+
+pub fn pair_result_event(approved: Option<(&str, &str)>) -> PairResultEvent {
+    PairResultEvent {
+        v: PROTOCOL_VERSION,
+        event: "pair.result",
+        approved: approved.is_some(),
+        device_id: approved.map(|(device, _)| device.to_string()),
+        daemon_id: approved.map(|(_, daemon)| daemon.to_string()),
+    }
+}
+
+/// What a device signs to prove it holds its key (same as the TypeScript `authMessage`).
+pub fn auth_message(daemon_id: &str, challenge: &str) -> String {
+    format!("jivvy-live auth v1\n{daemon_id}\n{challenge}")
 }
 
 pub fn nack(id: &str, code: ErrorCode, message: impl Into<String>) -> Ack {
@@ -202,6 +376,35 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "stream.stop" => Command::StreamStop,
         "state.get" => Command::StateGet,
         "state.subscribe" => Command::StateSubscribe,
+        "pair.open" => Command::PairOpen,
+        "pair.close" => Command::PairClose,
+        "device.list" => Command::DeviceList,
+        "pair.request" => match (public_key(obj.get("publicKey")), device_name(obj.get("name"))) {
+            (Some(public_key), Some(name)) => Command::PairRequest { public_key, name },
+            _ => {
+                return Err((
+                    ErrorCode::BadArguments,
+                    "pair.request needs a P-256 publicKey and a name of 1-64 characters",
+                ));
+            }
+        },
+        "pair.approve" | "pair.deny" => match id_field(obj.get("requestId")) {
+            Some(request_id) if ty == "pair.approve" => Command::PairApprove { request_id },
+            Some(request_id) => Command::PairDeny { request_id },
+            None => return Err((ErrorCode::BadArguments, "needs a requestId")),
+        },
+        "auth.hello" => match public_key(obj.get("publicKey")) {
+            Some(public_key) => Command::AuthHello { public_key },
+            None => return Err((ErrorCode::BadArguments, "auth.hello needs a P-256 publicKey")),
+        },
+        "auth.prove" => match signature(obj.get("signature")) {
+            Some(signature) => Command::AuthProve { signature },
+            None => return Err((ErrorCode::BadArguments, "auth.prove needs a 64-byte signature")),
+        },
+        "device.remove" => match id_field(obj.get("deviceId")) {
+            Some(device_id) => Command::DeviceRemove { device_id },
+            None => return Err((ErrorCode::BadArguments, "device.remove needs a deviceId")),
+        },
         "recording.start" => Command::RecordingStart,
         "recording.stop" => Command::RecordingStop,
         "recording.report" => {

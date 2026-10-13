@@ -123,8 +123,8 @@ function dbList(x: unknown): number[] | null {
 /** Most destinations a stream report may list. */
 export const MAX_DESTINATIONS = 16;
 const DESTINATION_STATES: readonly DestinationState[] = ["off", "connecting", "live", "reconnecting", "paused"];
-/** "1080p", "720p", ... or "" when not sending. */
-const QUALITY = /^(\d{3,4}p)?$/;
+/** "1080p", "720p", ..., "audio" (audio only), or "" when not sending. */
+const QUALITY = /^(\d{3,4}p|audio)?$/;
 
 /** A stream report's destination list, or null if it isn't one. */
 function destinationList(x: unknown): StreamDestination[] | null {
@@ -270,7 +270,7 @@ export interface StreamDestination {
   name: string;
   /** `paused`: the bandwidth manager stopped it because the upload can't carry it too. */
   state: DestinationState;
-  /** What it sends ("1080p", "720p", ...), or "" when not sending. */
+  /** What it sends ("1080p", "720p", ...; "audio" for audio only), or "" when not sending. */
   quality: string;
 }
 
@@ -374,8 +374,11 @@ export interface Alert {
   message: string;
 }
 
-/** Height of a quality label ("720p" -> 720), 0 for none. */
-const height = (q: string): number => Number.parseInt(q, 10) || 0;
+/** Height of a quality label ("720p" -> 720); audio only ranks below every picture; 0 for none. */
+const height = (q: string): number => (q === "audio" ? 1 : Number.parseInt(q, 10) || 0);
+
+/** A quality as people say it. */
+const spoken = (q: string): string => (q === "audio" ? "audio only" : q);
 
 const label = (d: StreamDestination) => d.name || d.id;
 
@@ -394,10 +397,11 @@ export function streamAlerts(before: StreamDestination[], after: StreamDestinati
       out.push({ ...base, kind: "stream.paused",
         message: `${label(now)} is paused: the internet upload can't carry it right now. It comes back by itself when the upload recovers.` });
     } else if (was.state === "paused" && now.state !== "paused" && now.quality) {
-      out.push({ ...base, kind: "stream.resumed", message: `${label(now)} is streaming again, at ${now.quality}.` });
+      const how = now.quality === "audio" ? "audio only" : `at ${now.quality}`;
+      out.push({ ...base, kind: "stream.resumed", message: `${label(now)} is streaming again, ${how}.` });
     } else if (was.state !== "paused" && now.state !== "paused" && height(now.quality) > 0 && height(now.quality) < height(was.quality)) {
       out.push({ ...base, kind: "stream.lowered",
-        message: `${label(now)} lowered to ${now.quality}: the internet upload is slow. It goes back up by itself.` });
+        message: `${label(now)} lowered to ${spoken(now.quality)}: the internet upload is slow. It goes back up by itself.` });
     }
   }
   return out;

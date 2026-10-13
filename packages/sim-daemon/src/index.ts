@@ -38,8 +38,11 @@ export interface SimOptions {
   setTimer?: (fn: () => void, ms: number) => unknown;
   /** Clock for the pairing window, ms. */
   now?: () => number;
-  /** Streaming platforms, main platform first (stream.json's order). */
-  destinations?: Array<{ id: string; name: string }>;
+  /**
+   * Streaming platforms, main platform first (stream.json's order). `whenShort` is Advanced
+   * mode's choice for a slow upload: lower (the default), audio only, or pause.
+   */
+  destinations?: Array<{ id: string; name: string; whenShort?: "lower" | "audioOnly" | "pause" }>;
 }
 
 /** The simulated program's quality, and what the main platform drops to on a slow upload. */
@@ -123,11 +126,15 @@ export class SimDaemon implements DaemonLike {
    */
   streamDestinations(): StreamDestination[] {
     if (!this.wantStream || this.state.restarting) return [];
-    return (this.opts.destinations ?? []).map((d, i): StreamDestination => {
+    return (this.opts.destinations ?? []).map(({ id, name, whenShort }, i): StreamDestination => {
+      const d = { id, name };
       switch (this.state.uplink) {
         case "down": return { ...d, state: "reconnecting", quality: FULL };
-        case "slow": return i === 0 ? { ...d, state: "live", quality: SLOW } : { ...d, state: "paused", quality: "" };
         case "ok": return { ...d, state: "live", quality: FULL };
+        case "slow":
+          if (whenShort === "audioOnly") return { ...d, state: "live", quality: "audio" };
+          if (whenShort === "pause") return { ...d, state: "paused", quality: "" };
+          return i === 0 ? { ...d, state: "live", quality: SLOW } : { ...d, state: "paused", quality: "" };
       }
     });
   }

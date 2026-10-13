@@ -60,4 +60,16 @@ describe("stream alerts", () => {
     expect(heard).toHaveLength(alerts.length);
     expect(heard[0]).toMatchObject({ event: "alert", alert: { kind: "stream.lowered" } });
   });
+  it("advanced mode: a platform set to audio only goes to audio only instead of pausing", async () => {
+    const d = new SimDaemon({
+      slideCount: 5,
+      destinations: [{ id: "fb", name: "Facebook" }, { id: "yt", name: "YouTube", whenShort: "audioOnly" }],
+    });
+    const alerts: Alert[] = [];
+    d.onAlert((a) => alerts.push(a));
+    await dispatch(d, makeEnvelope({ type: "stream.start" }));
+    d.setUplink("slow");
+    expect(d.streamDestinations()).toMatchObject([{ id: "fb", quality: "480p" }, { id: "yt", state: "live", quality: "audio" }]);
+    expect(alerts.at(-1)?.message).toBe("YouTube lowered to audio only: the internet upload is slow. It goes back up by itself.");
+  });
 });

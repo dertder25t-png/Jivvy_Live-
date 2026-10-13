@@ -2,10 +2,13 @@
 
 Oct 12, 2026. Covers the "Local secure command channel" item in `docs/BUILD_PLAN.md`: what's built, and what's left.
 
-## What exists today
+## What's built
+
+TLS and pairing are in open PRs (#32, then #34 on top of it) and aren't on `main` until those merge.
 
 - The protocol over WebSocket (`--listen-ws`), browsers only from allowed origins.
 - TLS on it (`--ws-cert`/`--ws-key`, PR #32): `wss://` only, no plain fallback, renewed certificates picked up without a restart.
+- Plain `ws://` is only for development on this computer: without a certificate the engine refuses to listen on anything but loopback (#34), so pairing and proofs never cross the network unencrypted.
 - Pairing and device keys (PR #34), described in section 2.
 - The TCP channel is the church computer itself (our own processes, `jivvy-ctl`, the booth screen). It is trusted, so it only takes connections from this computer (loopback), whatever address it listens on.
 
@@ -45,7 +48,7 @@ Used when the hostname can't be reached: internet down, DNS blocked, or rebindin
 **Decided (Oct 12): the fallback never serves the web app over plain HTTP, and we don't accept that risk.** A plain-HTTP page from a local address could be swapped by someone spoofing the church Wi-Fi during an outage, and no in-page crypto can protect a page that is itself fake. So:
 
 - The app's code only ever comes from `app.jivvy.org` over https, installed on the device (an installable web app) while it's online.
-- Offline, the installed app reaches the church computer's local address directly over an encrypted channel a secure page is allowed to open (a WebRTC data channel, DTLS-encrypted). The QR code (or short code) carries the local address and the daemon's key fingerprint; the app refuses any other fingerprint, so a spoofed device on the network gets nowhere.
+- Offline, the installed app reaches the church computer's local address directly over an encrypted channel a secure page is allowed to open (a WebRTC data channel, DTLS-encrypted). The QR code (or short code) carries only the local address and the daemon's key fingerprint, neither of them secret: they go in the URL fragment (after `#`), which the browser never sends anywhere, and the installed app reads them from there. The app refuses any other fingerprint, so a spoofed device on the network gets nowhere. The pairing code is never in the QR code or any URL; it's shown on the church computer and the phone and compared by a person (section 2).
 - Then the device proves its paired key exactly as it does online (section 2). An unpaired device can pair offline only with the code shown on the church computer and approval there, through the same genuine app.
 - A device that has never opened the app while online can't join offline. It's told plainly: "Open Jivvy once with internet on this phone."
 - **Off by default**, a setting on the church computer, hidden in volunteer mode, Tech Lead or above once roles exist.
@@ -55,7 +58,7 @@ Used when the hostname can't be reached: internet down, DNS blocked, or rebindin
 
 - Certificate issuance: the key never leaves the computer; renewal never during a service window; pre-flight warns before expiry.
 - Fallback: off by default; codes expire and are single-use; the app refuses a wrong fingerprint; nothing in plain text on the wire (a test captures the bytes and checks that neither the code nor any command appears).
-- Never: a code or key in a log, a URL or the stream.
+- Never: a pairing code, challenge, signature or key in a log, a URL or the stream. (The local address and fingerprint in the QR code's fragment aren't secrets.)
 
 ## Order of work (one PR each)
 

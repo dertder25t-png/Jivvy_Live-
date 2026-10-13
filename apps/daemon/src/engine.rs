@@ -528,6 +528,15 @@ fn command_name(command: &Command) -> String {
     serde_json::to_value(command).ok().and_then(|v| v["type"].as_str().map(String::from)).unwrap_or_default()
 }
 
+/// True if every address `addr` names is on this computer (loopback), so a plain channel on
+/// it never crosses the network. Unresolvable or wildcard addresses (`0.0.0.0`) are not.
+pub fn is_loopback_only(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(addrs) = addr.to_socket_addrs() else { return false };
+    let addrs: Vec<_> = addrs.collect();
+    !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+}
+
 /// Binds the command channel, retrying briefly in case the previous engine's socket is
 /// still being released by the OS after a crash.
 pub fn bind(addr: &str, wait: Duration) -> std::io::Result<TcpListener> {
@@ -1627,6 +1636,16 @@ mod tests {
             "closed, not timed out: {end}"
         );
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn plain_websocket_is_only_for_this_computer() {
+        for addr in ["127.0.0.1:47801", "[::1]:47801", "localhost:47801"] {
+            assert!(is_loopback_only(addr), "{addr}");
+        }
+        for addr in ["0.0.0.0:47801", "[::]:47801", "192.168.1.20:47801", "10.0.0.1:1", "nonsense", ""] {
+            assert!(!is_loopback_only(addr), "{addr}");
+        }
     }
 
     #[test]

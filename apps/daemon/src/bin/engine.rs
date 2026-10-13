@@ -67,6 +67,18 @@ fn main() {
         std::thread::spawn(move || heartbeat(&engine, &hang_file));
     }
 
+    // Without a certificate, pairing codes and proofs would cross the network in plain text:
+    // plain ws:// only on this computer. Refused, not fatal: a bad setting never stops a service.
+    let listen_ws = listen_ws.filter(|addr| {
+        let ok = ws_tls.is_some() || engine::is_loopback_only(addr);
+        if !ok {
+            log(
+                "engine",
+                format!("WebSocket channel {addr}: needs --ws-cert and --ws-key off this computer; not started"),
+            );
+        }
+        ok
+    });
     if let Some(addr) = listen_ws {
         let (engine, access) = (engine.clone(), Arc::new(ws_access));
         if let Some(tls) = &ws_tls {

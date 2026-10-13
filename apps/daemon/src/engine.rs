@@ -333,6 +333,10 @@ impl Engine {
                         }
                     }
                     self.stream_destinations = destinations;
+                } else {
+                    // A video process that doesn't list them (an older one): nothing to show,
+                    // rather than another process's last list.
+                    self.stream_destinations.clear();
                 }
                 // Live status, not saved: it only means anything while it keeps coming.
                 self.stream_report = Some((status, now));
@@ -1567,6 +1571,10 @@ mod tests {
     fn an_older_video_process_without_destinations_still_works() {
         let (mut e, _) = engine("alerts-old", 10);
         send(&mut e, json!({ "type": "stream.start" }));
+        let yt = json!([{ "id": "yt", "name": "YouTube", "state": "live", "quality": "1080p" }]);
+        report(&mut e, yt);
+        assert!(send(&mut e, json!({ "type": "state.get" }))["state"].get("streamDestinations").is_some());
+        // Replaced by an older one that doesn't list them: the old list goes.
         let r = send(&mut e, json!({ "type": "stream.report", "status": "live" }));
         assert_eq!(r["ok"], true);
         let state = send(&mut e, json!({ "type": "state.get" }))["state"].clone();

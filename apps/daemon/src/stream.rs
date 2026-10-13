@@ -375,20 +375,30 @@ pub struct DestinationStatus {
 
 /// Each destination as the engine's screens see it (`stream.report`). Always a list the
 /// protocol accepts, whatever `stream.json` holds: an id with other characters is made safe
-/// (the same way every time, so alerts follow it), names are cut to 64 characters, and at
-/// most 16 are listed. A report the engine refused would leave screens showing "reconnecting".
+/// (the same way every time, so alerts follow it, with a hash of the original so two ids
+/// never become one), names are cut to 64 characters, and at most 16 are listed. A report the engine refused would leave screens showing "reconnecting".
 pub fn destinations_for_screens(destinations: &[DestinationStatus]) -> Vec<crate::protocol::StreamDestination> {
     destinations
         .iter()
         .take(crate::protocol::MAX_DESTINATIONS)
         .map(|d| {
-            let id: String =
-                d.id.chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-                    .take(64)
-                    .collect();
+            let fits = !d.id.is_empty()
+                && d.id.len() <= 64
+                && d.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            let id = if fits {
+                d.id.clone()
+            } else {
+                // Readable part, then a stable hash of the whole id (FNV-1a), within 64.
+                let hash = d.id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+                let readable: String =
+                    d.id.chars()
+                        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                        .take(47)
+                        .collect();
+                format!("{readable}-{hash:016x}")
+            };
             crate::protocol::StreamDestination {
-                id: if id.is_empty() { "destination".into() } else { id },
+                id,
                 name: d.name.chars().filter(|c| !c.is_control()).take(crate::protocol::MAX_DEVICE_NAME).collect(),
                 state: d.state.into(),
                 quality: d.quality.clone(),
@@ -713,9 +723,15 @@ book",
         list.extend((0..20).map(|i| d(&format!("d{i}"), "x")));
         let shown = destinations_for_screens(&list);
         assert_eq!(shown.len(), crate::protocol::MAX_DESTINATIONS);
-        assert_eq!(shown[0].id, "my-youtube-");
+        assert!(shown[0].id.starts_with("my-youtube--"), "{}", shown[0].id);
+        assert!(shown[0].id.len() <= 64);
         assert_eq!(shown[0].name.chars().count(), 64);
-        assert_eq!(shown[1].id, "destination");
+        assert!(shown[1].id.starts_with('-'), "an empty id still gets one: {}", shown[1].id);
+        assert_eq!(destinations_for_screens(&list)[0].id, shown[0].id, "the same every time");
+        // Two ids that differ only in characters replaced stay two.
+        let two = destinations_for_screens(&[d("youtube!", "a"), d("youtube?", "b"), d("youtube", "c")]);
+        assert_ne!(two[0].id, two[1].id);
+        assert_eq!(two[2].id, "youtube", "an id that fits is kept as it is");
         assert_eq!(shown[2].name, "Facebook");
         // The engine takes the report as it is.
         let msg = serde_json::json!({ "v": 1, "id": "r", "ts": 1,

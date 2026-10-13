@@ -172,6 +172,19 @@ describe("pairing", () => {
     expect((await login(t.d, key)).ack).toMatchObject({ ok: false, code: "unauthorized" });
   });
 
+  it("a device that disconnects takes its request with it", async () => {
+    const t = setup();
+    const seen: Array<{ requests: unknown[] }> = [];
+    t.d.onPairing((p) => seen.push(p));
+    await t.church({ type: "pair.open" });
+    const phone = t.d.connect();
+    const req = await t.send(phone, { type: "pair.request", publicKey: (await deviceKey()).publicKey, name: "Phone" });
+    if (!req.ok || !req.request) throw new Error();
+    phone.close();
+    expect(seen.at(-1)?.requests).toEqual([]);
+    expect(await t.church({ type: "pair.approve", requestId: req.request.requestId })).toMatchObject({ ok: false, code: "bad_arguments" });
+  });
+
   it("no more than five requests wait at once", async () => {
     const t = setup();
     await t.church({ type: "pair.open" });

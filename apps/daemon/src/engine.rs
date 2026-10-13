@@ -334,6 +334,11 @@ impl Engine {
                     self.subscribers.push(o.clone());
                     if session.local {
                         self.local_subscribers.push(o.clone());
+                        // Started (or reconnected) while pairing is open: it still sees the
+                        // requests already waiting.
+                        if self.pairing_open(Instant::now()) {
+                            send_event(Some(o), &protocol::pairing_event(self.pairing_status(Instant::now())));
+                        }
                     }
                 }
                 None => return protocol::nack(id, ErrorCode::Unavailable, "this connection can't receive events"),
@@ -1476,6 +1481,34 @@ mod tests {
         assert_eq!(phone.send(&mut e, json!({ "type": "slide.next" }))["state"]["slideIndex"], 1);
         let devices = send(&mut e, json!({ "type": "device.list" }));
         assert_eq!(devices["devices"][0]["name"], "Sam's iPhone");
+    }
+
+    #[test]
+    fn a_church_computer_screen_that_subscribes_late_still_sees_waiting_requests() {
+        let (mut e, _) = engine("pair-late", 10);
+        send(&mut e, json!({ "type": "pair.open" }));
+        let mut phone = Phone::new();
+        let req = phone
+            .send(&mut e, json!({ "type": "pair.request", "publicKey": TestKey::new().public(), "name": "Phone" }));
+        let (tx, rx) = sync_channel(64);
+        e.handle_line_from(&envelope(json!({ "type": "state.subscribe" })), Some(&Outbox::new(tx, None)));
+        let first: Value = serde_json::from_slice(&rx.try_recv().expect("the pairing status at once")).unwrap();
+        assert_eq!(first["event"], "pairing");
+        assert_eq!(first["pairing"]["requests"][0]["code"], req["request"]["code"]);
+
+        // A device that subscribes hears nothing about pairing.
+        let (tx, rx) = sync_channel(64);
+        let mut session = Session::device();
+        let key = TestKey::new();
+        e.devices.add("D", &key.public(), 1).unwrap();
+        let o = Outbox::new(tx, None);
+        let hello =
+            e.handle(&envelope(json!({ "type": "auth.hello", "publicKey": key.public() })), &mut session, Some(&o));
+        let hello = serde_json::to_value(hello).unwrap();
+        let msg = protocol::auth_message(e.daemon_id(), hello["challenge"].as_str().unwrap());
+        e.handle(&envelope(json!({ "type": "auth.prove", "signature": key.sign(&msg) })), &mut session, Some(&o));
+        e.handle(&envelope(json!({ "type": "state.subscribe" })), &mut session, Some(&o));
+        assert!(rx.try_iter().all(|b| serde_json::from_slice::<Value>(&b).unwrap()["event"] != "pairing"));
     }
 
     #[test]

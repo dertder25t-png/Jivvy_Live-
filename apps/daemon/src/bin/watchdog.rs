@@ -111,7 +111,15 @@ fn main() {
                     Duration::from_millis(value(&mut args, "--hang-timeout-ms").parse().expect("a number of ms"))
             }
             "--data-dir" => shared.extend([a, value(&mut args, "--data-dir")]),
-            "--listen" => listen = value(&mut args, "--listen"),
+            "--listen" => {
+                listen = value(&mut args, "--listen");
+                // The local channel is trusted, so it's for this computer only (devices use
+                // --listen-ws); the engine, outputs and video all reach it at this address.
+                assert!(
+                    jivvy_daemon::engine::is_loopback_only(&listen),
+                    "--listen must be a loopback address such as 127.0.0.1:47800, not {listen}"
+                );
+            }
             "--" => engine_args.extend(args.by_ref()),
             _ => engine_args.push(a),
         }

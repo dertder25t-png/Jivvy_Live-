@@ -92,7 +92,13 @@ export class SimDaemon implements DaemonLike {
   connect(): DeviceConnection {
     const c = new DeviceConnection(this);
     this.connections.add(c);
-    c.onClose(() => this.connections.delete(c));
+    c.onClose(() => {
+      this.connections.delete(c);
+      // Its pairing request goes with it, like the real daemon's.
+      const before = this.pending.length;
+      this.pending = this.pending.filter((r) => r.conn !== c);
+      if (this.pending.length !== before) this.pairingChanged();
+    });
     return c;
   }
 

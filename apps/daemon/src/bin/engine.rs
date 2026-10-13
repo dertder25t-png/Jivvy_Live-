@@ -32,7 +32,13 @@ fn main() {
         let mut val = || args.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
         match flag.as_str() {
             "--data-dir" => data_dir = PathBuf::from(val()),
-            "--listen" => listen = val(),
+            "--listen" => {
+                listen = val();
+                // Trusted, so for this computer only; devices use --listen-ws.
+                if !engine::is_loopback_only(&listen) {
+                    fail(&format!("--listen must be a loopback address such as 127.0.0.1:47800, not {listen}"));
+                }
+            }
             "--slides" => slides = val().parse().unwrap_or_else(|_| fail("--slides must be a number")),
             "--supervised" => supervised = true,
             "--listen-ws" => listen_ws = Some(val()),

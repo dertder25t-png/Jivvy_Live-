@@ -35,7 +35,7 @@ export type Command =
    * it was asked for is actually reaching the platforms, about once a second. UIs read the
    * result as `stream` in the state; they never send this.
    */
-  | { type: "stream.report"; status: StreamStatus }
+  | { type: "stream.report"; status: StreamStatus; destinations?: StreamDestination[] }
   /**
    * Added in v1 without a version bump. Start or stop the local recording. Like the stream,
    * the wish is saved: after a crash the recording resumes into the same set of files.
@@ -120,6 +120,25 @@ function dbList(x: unknown): number[] | null {
   return x.every((n) => typeof n === "number" && Number.isFinite(n)) ? (x as number[]) : null;
 }
 
+/** Most destinations a stream report may list. */
+export const MAX_DESTINATIONS = 16;
+const DESTINATION_STATES: readonly DestinationState[] = ["off", "connecting", "live", "reconnecting", "paused"];
+/** "1080p", "720p", ... or "" when not sending. */
+const QUALITY = /^(\d{3,4}p)?$/;
+
+/** A stream report's destination list, or null if it isn't one. */
+function destinationList(x: unknown): StreamDestination[] | null {
+  if (!Array.isArray(x) || x.length > MAX_DESTINATIONS) return null;
+  const out: StreamDestination[] = [];
+  for (const d of x) {
+    if (!isObj(d) || !isId(d.id) || typeof d.name !== "string" || [...d.name].length > MAX_DEVICE_NAME) return null;
+    if (!DESTINATION_STATES.includes(d.state as DestinationState)) return null;
+    if (typeof d.quality !== "string" || !QUALITY.test(d.quality)) return null;
+    out.push({ id: d.id, name: d.name, state: d.state as DestinationState, quality: d.quality });
+  }
+  return out;
+}
+
 /** A P-256 public key, raw uncompressed (0x04 || x || y, 65 bytes), base64url without padding. */
 const PUBLIC_KEY = /^B[A-Za-z0-9_-]{86}$/;
 /** A 64-byte ECDSA signature (r || s), base64url without padding. */
@@ -194,10 +213,15 @@ function parseCommand(raw: unknown): CommandResult {
         return { ok: false, code: "bad_arguments", message: `media.levels needs peakDb and rmsDb: 1-${MAX_CHANNELS} numbers each, same length` };
       return { ok: true, command: { type: "media.levels", peakDb, rmsDb } };
     }
-    case "stream.report":
+    case "stream.report": {
       if (raw.status !== "off" && raw.status !== "live" && raw.status !== "reconnecting")
         return { ok: false, code: "bad_arguments", message: "stream.report needs status off, live or reconnecting" };
-      return { ok: true, command: { type: "stream.report", status: raw.status } };
+      if (raw.destinations === undefined) return { ok: true, command: { type: "stream.report", status: raw.status } };
+      const destinations = destinationList(raw.destinations);
+      if (!destinations)
+        return { ok: false, code: "bad_arguments", message: `stream.report destinations: up to ${MAX_DESTINATIONS} of { id, name, state, quality }` };
+      return { ok: true, command: { type: "stream.report", status: raw.status, destinations } };
+    }
     case "recording.report":
       if (raw.status !== "off" && raw.status !== "recording" && raw.status !== "waiting")
         return { ok: false, code: "bad_arguments", message: "recording.report needs status off, recording or waiting" };
@@ -238,6 +262,18 @@ export function makeEnvelope(command: Command, opts: { id?: string; now?: number
 
 export type StreamStatus = "off" | "live" | "reconnecting";
 
+export type DestinationState = "off" | "connecting" | "live" | "reconnecting" | "paused";
+
+/** One streaming platform, as the video process reports it. */
+export interface StreamDestination {
+  id: string;
+  name: string;
+  /** `paused`: the bandwidth manager stopped it because the upload can't carry it too. */
+  state: DestinationState;
+  /** What it sends ("1080p", "720p", ...), or "" when not sending. */
+  quality: string;
+}
+
 /** `waiting`: a recording was asked for but nothing is being written yet (starting, or resuming after a crash). */
 export type RecordingStatus = "off" | "recording" | "waiting";
 
@@ -254,6 +290,8 @@ export interface StateSnapshot {
   recordingWanted?: boolean;
   /** Added in v1: the disk the recording goes to has under 10 GB free. */
   recordingLowDisk?: boolean;
+  /** Added in v1: each platform's state and quality while streaming; left out when there's nothing to show. */
+  streamDestinations?: StreamDestination[];
 }
 
 /** A device waiting for approval, as the church computer sees it. */
@@ -313,8 +351,57 @@ export type DaemonEvent =
   | { v: number; event: "levels"; levels: Levels }
   /** To the church computer's subscribers whenever pairing opens, closes or gets a request. */
   | { v: number; event: "pairing"; pairing: PairingStatus }
+  /** Something the tech lead should know about, in plain words (e.g. a platform lowered or paused). */
+  | { v: number; event: "alert"; alert: Alert }
   /** To the device that asked to pair, once the church computer answers. */
   | { v: number; event: "pair.result"; approved: boolean; deviceId?: string; daemonId?: string };
+
+/**
+ * `stream.lowered`: a platform gets a lower quality because the upload is slow.
+ * `stream.paused`: a platform stopped because the upload can't carry it too.
+ * `stream.resumed`: a paused platform is streaming again.
+ */
+export type AlertKind = "stream.lowered" | "stream.paused" | "stream.resumed";
+
+export interface Alert {
+  kind: AlertKind;
+  destinationId: string;
+  /** The platform's name as the church set it up. */
+  name: string;
+  /** What it sends now; "" when paused. */
+  quality: string;
+  /** One plain-English sentence for the screen and the tech lead. */
+  message: string;
+}
+
+/** Height of a quality label ("720p" -> 720), 0 for none. */
+const height = (q: string): number => Number.parseInt(q, 10) || 0;
+
+const label = (d: StreamDestination) => d.name || d.id;
+
+/**
+ * The alerts between two reports of the same stream. Shared by both daemons, so they say
+ * exactly the same thing. Only platforms in both reports count: one starting, connecting or
+ * reconnecting isn't the bandwidth manager's doing.
+ */
+export function streamAlerts(before: StreamDestination[], after: StreamDestination[]): Alert[] {
+  const out: Alert[] = [];
+  for (const now of after) {
+    const was = before.find((d) => d.id === now.id);
+    if (!was) continue;
+    const base = { destinationId: now.id, name: label(now), quality: now.state === "paused" ? "" : now.quality };
+    if (now.state === "paused" && was.state !== "paused") {
+      out.push({ ...base, kind: "stream.paused",
+        message: `${label(now)} is paused: the internet upload can't carry it right now. It comes back by itself when the upload recovers.` });
+    } else if (was.state === "paused" && now.state !== "paused" && now.quality) {
+      out.push({ ...base, kind: "stream.resumed", message: `${label(now)} is streaming again, at ${now.quality}.` });
+    } else if (was.state !== "paused" && now.state !== "paused" && height(now.quality) > 0 && height(now.quality) < height(was.quality)) {
+      out.push({ ...base, kind: "stream.lowered",
+        message: `${label(now)} lowered to ${now.quality}: the internet upload is slow. It goes back up by itself.` });
+    }
+  }
+  return out;
+}
 
 /**
  * What a device signs to prove it holds its key (UTF-8). The daemon id stops a signature
@@ -324,6 +411,7 @@ export const authMessage = (daemonId: string, challenge: string): string =>
   `jivvy-live auth v1\n${daemonId}\n${challenge}`;
 
 export const stateEvent = (state: StateSnapshot): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "state", state });
+export const alertEvent = (alert: Alert): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "alert", alert });
 export const levelsEvent = (levels: Levels): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "levels", levels });
 
 export const ack = (id: string, state?: StateSnapshot, extras: AckExtras = {}): Ack =>

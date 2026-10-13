@@ -1,7 +1,7 @@
 import {
-  ack, authMessage, MAX_PENDING_PAIRINGS, nack, PAIRING_WINDOW_MS, PROTOCOL_VERSION,
-  type Ack, type CommandType, type DaemonEvent, type DaemonLike, type DeviceInfo, type Envelope,
-  type PairingStatus, type RecordingStatus, type StateSnapshot, type StreamStatus,
+  ack, alertEvent, authMessage, MAX_PENDING_PAIRINGS, nack, PAIRING_WINDOW_MS, PROTOCOL_VERSION, streamAlerts,
+  type Ack, type Alert, type CommandType, type DaemonEvent, type DaemonLike, type DeviceInfo, type Envelope,
+  type PairingStatus, type RecordingStatus, type StateSnapshot, type StreamDestination, type StreamStatus,
 } from "@jivvy/protocol";
 
 /**
@@ -38,7 +38,13 @@ export interface SimOptions {
   setTimer?: (fn: () => void, ms: number) => unknown;
   /** Clock for the pairing window, ms. */
   now?: () => number;
+  /** Streaming platforms, main platform first (stream.json's order). */
+  destinations?: Array<{ id: string; name: string }>;
 }
+
+/** The simulated program's quality, and what the main platform drops to on a slow upload. */
+const FULL = "1080p";
+const SLOW = "480p";
 
 /** What a paired device may do: run the service. Settings, pairing and reports are not theirs. */
 const DEVICE_COMMANDS: ReadonlySet<CommandType> = new Set<CommandType>([
@@ -81,6 +87,9 @@ export class SimDaemon implements DaemonLike {
   private pending: PendingPairing[] = [];
   private connections = new Set<DeviceConnection>();
   private pairingListeners = new Set<(p: PairingStatus) => void>();
+  private alertListeners = new Set<(a: Alert) => void>();
+  /** The platforms as last shown, to tell what changed. */
+  private shownDestinations: StreamDestination[] = [];
 
   constructor(private readonly opts: SimOptions) {
     this.restartMs = opts.restartMs ?? 1500;
@@ -100,6 +109,27 @@ export class SimDaemon implements DaemonLike {
       if (this.pending.length !== before) this.pairingChanged();
     });
     return c;
+  }
+
+  /** Alerts (a platform lowered, paused or resumed), as every subscriber gets them. */
+  onAlert(fn: (a: Alert) => void): () => void {
+    this.alertListeners.add(fn);
+    return () => this.alertListeners.delete(fn);
+  }
+
+  /**
+   * Each platform while streaming. A slow upload works like the real bandwidth manager:
+   * the main platform gets a lower quality and the others are paused.
+   */
+  streamDestinations(): StreamDestination[] {
+    if (!this.wantStream || this.state.restarting) return [];
+    return (this.opts.destinations ?? []).map((d, i): StreamDestination => {
+      switch (this.state.uplink) {
+        case "down": return { ...d, state: "reconnecting", quality: FULL };
+        case "slow": return i === 0 ? { ...d, state: "live", quality: SLOW } : { ...d, state: "paused", quality: "" };
+        case "ok": return { ...d, state: "live", quality: FULL };
+      }
+    });
   }
 
   /** The church computer's view of pairing, whenever it changes. */
@@ -264,9 +294,11 @@ export class SimDaemon implements DaemonLike {
   /** The protocol's view of the state, as the real daemon reports it. */
   snapshotForUi(): StateSnapshot {
     const { slideIndex, black, stream, recording, diskFreeGb } = this.state;
+    const streamDestinations = this.streamDestinations();
     return {
       slideIndex, black, stream, streamWanted: this.wantStream,
       recording, recordingWanted: this.wantRecording, recordingLowDisk: this.wantRecording && diskFreeGb < LOW_DISK_GB,
+      ...(streamDestinations.length ? { streamDestinations } : {}),
     };
   }
 
@@ -325,6 +357,12 @@ export class SimDaemon implements DaemonLike {
 
   private emit(): void {
     for (const l of this.listeners) l(this.state);
+    const now = this.streamDestinations();
+    for (const alert of streamAlerts(this.shownDestinations, now)) {
+      for (const l of this.alertListeners) l(alert);
+      for (const conn of this.connections) if (conn.deviceId) conn.emit(alertEvent(alert));
+    }
+    this.shownDestinations = now;
   }
 }
 

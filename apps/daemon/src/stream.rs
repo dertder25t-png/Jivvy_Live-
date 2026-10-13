@@ -307,6 +307,30 @@ pub struct DestinationStatus {
     pub quality: String,
 }
 
+/// Each destination as the engine's screens see it (`stream.report`). Always a list the
+/// protocol accepts, whatever `stream.json` holds: an id with other characters is made safe
+/// (the same way every time, so alerts follow it), names are cut to 64 characters, and at
+/// most 16 are listed. A report the engine refused would leave screens showing "reconnecting".
+pub fn destinations_for_screens(destinations: &[DestinationStatus]) -> Vec<crate::protocol::StreamDestination> {
+    destinations
+        .iter()
+        .take(crate::protocol::MAX_DESTINATIONS)
+        .map(|d| {
+            let id: String =
+                d.id.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                    .take(64)
+                    .collect();
+            crate::protocol::StreamDestination {
+                id: if id.is_empty() { "destination".into() } else { id },
+                name: d.name.chars().filter(|c| !c.is_control()).take(crate::protocol::MAX_DEVICE_NAME).collect(),
+                state: d.state.into(),
+                quality: d.quality.clone(),
+            }
+        })
+        .collect()
+}
+
 /// What screens see: live only when every destination is live, apart from ones the
 /// bandwidth manager paused (as long as one is still live).
 pub fn overall(wanted: bool, destinations: &[DestinationStatus]) -> &'static str {
@@ -553,5 +577,39 @@ mod tests {
         assert_eq!(overall(true, &[d("live"), d("live")]), "live");
         assert_eq!(overall(true, &[d("live"), d("reconnecting")]), "reconnecting");
         assert_eq!(overall(true, &[]), "reconnecting", "wanted but nowhere to send it");
+    }
+
+    #[test]
+    fn screens_always_get_a_destination_list_the_engine_accepts() {
+        let d = |id: &str, name: &str| DestinationStatus {
+            id: id.into(),
+            name: name.into(),
+            server: "rtmp://example".into(),
+            state: "live",
+            detail: String::new(),
+            kbps: 0.0,
+            reconnects: 0,
+            quality: "720p".into(),
+        };
+        let mut list = vec![
+            d("my youtube!", &"N".repeat(100)),
+            d("", "Empty id"),
+            d(
+                "fb",
+                "Face
+book",
+            ),
+        ];
+        list.extend((0..20).map(|i| d(&format!("d{i}"), "x")));
+        let shown = destinations_for_screens(&list);
+        assert_eq!(shown.len(), crate::protocol::MAX_DESTINATIONS);
+        assert_eq!(shown[0].id, "my-youtube-");
+        assert_eq!(shown[0].name.chars().count(), 64);
+        assert_eq!(shown[1].id, "destination");
+        assert_eq!(shown[2].name, "Facebook");
+        // The engine takes the report as it is.
+        let msg = serde_json::json!({ "v": 1, "id": "r", "ts": 1,
+            "command": { "type": "stream.report", "status": "live", "destinations": shown } });
+        assert!(crate::protocol::parse_envelope(&msg.to_string()).is_ok());
     }
 }

@@ -99,9 +99,10 @@ impl LevelsSender {
         self.command(serde_json::json!({ "type": "media.levels", "peakDb": peak_db, "rmsDb": rms_db }));
     }
 
-    /// Queues a stream status report ("off", "live" or "reconnecting").
-    pub fn report_stream(&self, status: &str) {
-        self.command(serde_json::json!({ "type": "stream.report", "status": status }));
+    /// Queues a stream status report ("off", "live" or "reconnecting") with each platform's
+    /// state and quality, which the engine turns into alerts when one is lowered or paused.
+    pub fn report_stream(&self, status: &str, destinations: &[crate::protocol::StreamDestination]) {
+        self.command(serde_json::json!({ "type": "stream.report", "status": status, "destinations": destinations }));
     }
 
     /// Queues a recording report: its status ("off", "recording" or "waiting") and whether

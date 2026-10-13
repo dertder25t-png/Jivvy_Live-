@@ -98,6 +98,10 @@ pub struct StreamDestination {
     pub state: String,
     /// "1080p", "720p", ..., "audio" (audio only), or "" when not sending.
     pub quality: String,
+    /// The best it may send (its own top quality in Advanced mode): sending that is never
+    /// "lowered". Older video processes leave it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
 }
 
 /// Most destinations a stream report may list.
@@ -115,17 +119,25 @@ fn destination_list(v: &Value) -> Option<Vec<StreamDestination>> {
             let name = d.get("name")?.as_str()?;
             let state = d.get("state")?.as_str()?;
             let quality = d.get("quality")?.as_str()?;
-            let quality_ok = quality.is_empty()
-                || quality == "audio"
-                || (quality.ends_with('p')
-                    && (3..=4).contains(&(quality.len() - 1))
-                    && quality[..quality.len() - 1].bytes().all(|b| b.is_ascii_digit()));
+            let valid = |q: &str| {
+                q.is_empty()
+                    || q == "audio"
+                    || (q.ends_with('p')
+                        && (3..=4).contains(&(q.len() - 1))
+                        && q[..q.len() - 1].bytes().all(|b| b.is_ascii_digit()))
+            };
+            let quality_ok = valid(quality);
+            let top = match d.get("top") {
+                None => None,
+                Some(t) => Some(t.as_str().filter(|t| valid(t))?.to_string()),
+            };
             let state_ok = ["off", "connecting", "live", "reconnecting", "paused"].contains(&state);
             (name.chars().count() <= MAX_DEVICE_NAME && state_ok && quality_ok).then(|| StreamDestination {
                 id,
                 name: name.into(),
                 state: state.into(),
                 quality: quality.into(),
+                top,
             })
         })
         .collect()
@@ -193,6 +205,8 @@ pub fn stream_alerts(before: &[StreamDestination], after: &[StreamDestination]) 
             && now.state != "paused"
             && height(&now.quality) > 0
             && height(&now.quality) < height(&was.quality)
+            // At its own top quality: the church lowered the top, the upload didn't.
+            && now.top.as_deref() != Some(now.quality.as_str())
         {
             out.push(alert(
                 "stream.lowered",

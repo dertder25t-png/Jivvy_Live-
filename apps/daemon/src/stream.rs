@@ -371,6 +371,8 @@ pub struct DestinationStatus {
     pub reconnects: u32,
     /// What it sends: "1080p", "720p", ... (the bandwidth manager's choice), or "" when off.
     pub quality: String,
+    /// The best it may send: its own top quality in Advanced mode, else the program's.
+    pub top_quality: String,
 }
 
 /// Each destination as the engine's screens see it (`stream.report`). Always a list the
@@ -402,6 +404,7 @@ pub fn destinations_for_screens(destinations: &[DestinationStatus]) -> Vec<crate
                 name: d.name.chars().filter(|c| !c.is_control()).take(crate::protocol::MAX_DEVICE_NAME).collect(),
                 state: d.state.into(),
                 quality: d.quality.clone(),
+                top: (!d.top_quality.is_empty()).then(|| d.top_quality.clone()),
             }
         })
         .collect()
@@ -690,6 +693,7 @@ mod tests {
             kbps: 0.0,
             reconnects: 0,
             quality: String::new(),
+            top_quality: String::new(),
         };
         assert_eq!(overall(false, &[d("live")]), "off");
         assert_eq!(overall(true, &[d("live"), d("paused")]), "live", "paused for bandwidth");
@@ -710,6 +714,7 @@ mod tests {
             kbps: 0.0,
             reconnects: 0,
             quality: "720p".into(),
+            top_quality: "1080p".into(),
         };
         let mut list = vec![
             d("my youtube!", &"N".repeat(100)),

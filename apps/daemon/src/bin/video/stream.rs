@@ -276,6 +276,7 @@ impl Streamer {
                 kbps: 0.0,
                 reconnects: 0,
                 quality: String::new(),
+                top_quality: String::new(),
             }));
             let link = Arc::new(Link::new(&id, self.ladder[0]));
             let (dest, f, s, st, l) = (d.clone(), feed.clone(), stop.clone(), status.clone(), link.clone());
@@ -297,6 +298,7 @@ impl Streamer {
                 let quality = a.and_then(|t| self.qualities.iter().find(|q| q.tier == t).copied());
                 let top = bandwidth::top_quality(&self.ladder, prefs.get(&id).copied().unwrap_or_default());
                 *w.link.top.lock().unwrap() = top.map_or(Tier::Full, |q| q.tier);
+                w.status.lock().unwrap().top_quality = top.map(|q| q.label()).unwrap_or_default();
                 *w.link.assigned.lock().unwrap() = quality;
             }
         }

@@ -134,7 +134,9 @@ function destinationList(x: unknown): StreamDestination[] | null {
     if (!isObj(d) || !isId(d.id) || typeof d.name !== "string" || [...d.name].length > MAX_DEVICE_NAME) return null;
     if (!DESTINATION_STATES.includes(d.state as DestinationState)) return null;
     if (typeof d.quality !== "string" || !QUALITY.test(d.quality)) return null;
-    out.push({ id: d.id, name: d.name, state: d.state as DestinationState, quality: d.quality });
+    if (d.top !== undefined && (typeof d.top !== "string" || !QUALITY.test(d.top))) return null;
+    const top = typeof d.top === "string" ? { top: d.top } : {};
+    out.push({ id: d.id, name: d.name, state: d.state as DestinationState, quality: d.quality, ...top });
   }
   return out;
 }
@@ -272,6 +274,12 @@ export interface StreamDestination {
   state: DestinationState;
   /** What it sends ("1080p", "720p", ...; "audio" for audio only), or "" when not sending. */
   quality: string;
+  /**
+   * The best it may send: its own top quality in Advanced mode, else the program's. Sending
+   * that is never "lowered", even right after the church lowered the top. Older video
+   * processes leave it out.
+   */
+  top?: string;
 }
 
 /** `waiting`: a recording was asked for but nothing is being written yet (starting, or resuming after a crash). */
@@ -399,7 +407,11 @@ export function streamAlerts(before: StreamDestination[], after: StreamDestinati
     } else if (was.state === "paused" && now.state !== "paused" && now.quality) {
       const how = now.quality === "audio" ? "audio only" : `at ${now.quality}`;
       out.push({ ...base, kind: "stream.resumed", message: `${label(now)} is streaming again, ${how}.` });
-    } else if (was.state !== "paused" && now.state !== "paused" && height(now.quality) > 0 && height(now.quality) < height(was.quality)) {
+    } else if (
+      was.state !== "paused" && now.state !== "paused" && height(now.quality) > 0 && height(now.quality) < height(was.quality)
+      // At its own top quality: the church lowered the top, the upload didn't.
+      && now.quality !== now.top
+    ) {
       out.push({ ...base, kind: "stream.lowered",
         message: `${label(now)} lowered to ${spoken(now.quality)}: the internet upload is slow. It goes back up by itself.` });
     }

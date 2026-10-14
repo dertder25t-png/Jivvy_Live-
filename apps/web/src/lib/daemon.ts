@@ -147,9 +147,12 @@ export class DaemonConnection {
     if (!localStorage.getItem(pairedKey(this.url))) return this.h.status({ kind: "unpaired" });
     const key = await deviceKey();
     const hello = await this.send({ type: "auth.hello", publicKey: await publicKey(key) });
+    // Disconnected mid-way: the reconnect tries again, still paired.
+    if (!hello.ok && hello.code === "unavailable") return;
     if (!hello.ok || !hello.challenge || !hello.daemonId) return this.h.status({ kind: "unpaired" });
     const signature = await sign(key, authMessage(hello.daemonId, hello.challenge));
     const proof = await this.send({ type: "auth.prove", signature });
+    if (!proof.ok && proof.code !== "unauthorized") return; // disconnected: the reconnect tries again
     if (!proof.ok) {
       // Removed on the church computer, or another daemon at this address: pair again.
       localStorage.removeItem(pairedKey(this.url));

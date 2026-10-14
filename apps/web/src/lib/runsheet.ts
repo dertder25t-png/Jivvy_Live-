@@ -102,14 +102,6 @@ export function nextTime(at: string, now: Date): number | null {
 /** The slides one item shows. */
 export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
   switch (item.kind) {
-    case "song":
-    case "text":
-    case "loop": {
-      const size = item.kind === "song" ? SONG_LINES : MAX_SLIDE_LINES;
-      return paragraphs(item.text)
-        .flatMap((p) => chunks(p, size))
-        .map((lines) => ({ lines: lines.map((l) => clean(l)) }));
-    }
     case "scripture": {
       // Verses run on; the reference goes under every slide so latecomers know where we are.
       const words = paragraphs(item.text).map((p) => p.join(" ")).join(" ");
@@ -122,6 +114,13 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
       const to = nextTime(item.at ?? "", now);
       const lines = [clean(item.text)].filter(Boolean);
       return [to === null ? { lines } : { lines, countdownTo: to }];
+    }
+    // Songs, text and pre-service loops; also any kind this version doesn't know (a draft saved by a newer one).
+    default: {
+      const size = item.kind === "song" ? SONG_LINES : MAX_SLIDE_LINES;
+      return paragraphs(item.text ?? "")
+        .flatMap((p) => chunks(p, size))
+        .map((lines) => ({ lines: lines.map((l) => clean(l)) }));
     }
   }
 }

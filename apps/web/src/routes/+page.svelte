@@ -71,7 +71,9 @@
   async function send() {
     if (!conn) return;
     sendError = "";
-    const ack = await conn.send({ type: "runsheet.set", runSheet: built });
+    // Built now, not the copy kept for the editor: a countdown whose time has passed while
+    // the page was open counts down to the next one, not to a moment already gone.
+    const ack = await conn.send({ type: "runsheet.set", runSheet: build(draft) });
     if (!ack.ok) sendError = ack.message;
   }
 

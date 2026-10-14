@@ -48,7 +48,16 @@ pub fn render(font: &FontRef, lines: &[&str], frame_w: u32, frame_h: u32, style:
     if lines.is_empty() || frame_w == 0 || frame_h == 0 {
         return None;
     }
-    let px = (frame_h as f32 * style.size).max(8.0);
+    // The style's size, made smaller if that's what it takes to fit every line (run sheets
+    // allow 16 lines of 200 characters): text is shrunk, never cut off.
+    let styled = (frame_h as f32 * style.size).max(8.0);
+    let at_style = font.as_scaled(PxScale::from(styled));
+    let widest = lines.iter().map(|l| line_width(&at_style, l)).fold(0.0, f32::max);
+    let tall = (at_style.ascent() - at_style.descent() + at_style.line_gap()) * lines.len() as f32;
+    let room_w = frame_w as f32 * 0.92;
+    let room_h = frame_h as f32 * (0.96 - style.bottom_margin);
+    let fit = (room_w / widest.max(1.0)).min(room_h / tall.max(1.0)).min(1.0);
+    let px = (styled * fit).max(8.0);
     let sf = font.as_scaled(PxScale::from(px));
     let line_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil();
     let shadow = (px / 16.0).ceil().max(1.0);
@@ -166,6 +175,15 @@ mod tests {
         assert!(opaque > 1000, "expected visible glyph pixels, got {opaque}");
         // Premultiplied alpha: no channel may exceed alpha.
         assert!(l.bgra.chunks(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
+    }
+
+    #[test]
+    fn a_full_slide_is_shrunk_to_fit_not_cut_off() {
+        let f = font();
+        let line = "And can it be that I should gain an interest in the Saviour's blood";
+        let l = render(&f, &[line; 16], 1920, 1080, &Style::default()).unwrap();
+        assert!(l.height < 1080 && l.y > 0, "all 16 lines fit: height {} at y {}", l.height, l.y);
+        assert!(l.width < 1920 && l.x > 0, "the long line fits: width {}", l.width);
     }
 
     #[test]

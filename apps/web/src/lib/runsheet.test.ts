@@ -1,6 +1,6 @@
 import { parseRunSheet } from "@jivvy/protocol";
 import { describe, expect, it } from "vitest";
-import { build, type Draft } from "./runsheet";
+import { build, slidesFor, type Draft, type DraftItem } from "./runsheet";
 
 describe("run sheet", () => {
   it("turns songs, scripture and a countdown into slides the daemon accepts", () => {
@@ -25,5 +25,8 @@ describe("run sheet", () => {
     expect(sheet.items[1]?.slides[1]?.lines.at(-2)).toBe("might be saved.");
     expect(sheet.items[2]?.slides[0]?.countdownTo).toBe(new Date(2026, 9, 18, 10, 30).getTime());
     expect(parseRunSheet(sheet)).toEqual(sheet);
+    // A draft saved by a newer version, with a kind this one doesn't know, still shows its words.
+    const future = { id: "f", kind: "something-new", title: "", text: "Hello\n\nWorld" } as unknown as DraftItem;
+    expect(slidesFor(future, now)).toEqual([{ lines: ["Hello"] }, { lines: ["World"] }]);
   });
 });

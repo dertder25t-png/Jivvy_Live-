@@ -75,6 +75,8 @@ export class DaemonConnection {
   private closed = false;
   private retry: ReturnType<typeof setTimeout> | null = null;
   private rev: number | undefined;
+  /** A state event arrived since subscribing: newer than the snapshot on the subscribe ack. */
+  private sawEvent = false;
 
   constructor(
     readonly url: string,
@@ -163,7 +165,10 @@ export class DaemonConnection {
   }
 
   private event(e: DaemonEvent): void {
-    if (e.event === "state") this.gotState(e.state);
+    if (e.event === "state") {
+      this.sawEvent = true;
+      this.gotState(e.state);
+    }
     else if (e.event === "pair.result") {
       if (e.approved) {
         paired.set(this.url, e.deviceId ?? "paired");
@@ -202,10 +207,13 @@ export class DaemonConnection {
       return this.h.status({ kind: "unpaired", message: "This device isn't paired with this church computer." });
     }
     this.rev = undefined;
+    this.sawEvent = false;
     const sub = await this.sendOn(ws, { type: "state.subscribe" });
     if (!current()) return;
     if (!sub.ok) return this.h.status({ kind: "offline", message: sub.message });
     this.h.status({ kind: "ready" });
-    if (sub.state) this.gotState(sub.state);
+    // The daemon sends events queued during the subscribe ahead of its ack, so an event already
+    // seen is newer than the ack's snapshot: keep it.
+    if (sub.state && !this.sawEvent) this.gotState(sub.state);
   }
 }

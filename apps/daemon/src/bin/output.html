@@ -10,7 +10,7 @@
   #stage { position: absolute; left: 50%; top: 50%; background: #000; overflow: hidden; transform-origin: center; }
   #slide { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; align-items: center; justify-content: center;
            padding: 0 6%; color: #fff; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 700; text-align: center;
-           line-height: 1.2; }
+           line-height: 1.2; overflow-wrap: anywhere; }
   #clock { font-variant-numeric: tabular-nums; margin-top: .3em; font-size: 1.6em; }
   #ident { position: absolute; left: 4%; bottom: 4%; color: rgba(244, 241, 234, .55);
            font-family: Consolas, ui-monospace, monospace; letter-spacing: .08em; }
@@ -32,7 +32,8 @@
   function fitText() {
     let size = Math.round(canvas.h * 0.09);
     slide.style.fontSize = size + "px";
-    while (slide.scrollHeight > canvas.h * 0.92 && size > 12) {
+    // Too tall, or too wide (a word that can't break): smaller until it fits.
+    while ((slide.scrollHeight > canvas.h * 0.92 || slide.scrollWidth > slide.clientWidth) && size > 12) {
       size = Math.floor(size * 0.92);
       slide.style.fontSize = size + "px";
     }

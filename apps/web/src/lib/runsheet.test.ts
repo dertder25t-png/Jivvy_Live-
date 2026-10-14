@@ -28,5 +28,9 @@ describe("run sheet", () => {
     // A draft saved by a newer version, with a kind this one doesn't know, still shows its words.
     const future = { id: "f", kind: "something-new", title: "", text: "Hello\n\nWorld" } as unknown as DraftItem;
     expect(slidesFor(future, now)).toEqual([{ lines: ["Hello"] }, { lines: ["World"] }]);
+    // A pasted paragraph longer than a slide line is wrapped, not cut off.
+    const paragraph = "Welcome to everyone joining us this morning. ".repeat(6).trim();
+    const words = slidesFor({ id: "p", kind: "text", title: "", text: paragraph }, now).flatMap((s) => s.lines);
+    expect(words.join(" ")).toBe(paragraph);
   });
 });

@@ -8,8 +8,12 @@ const KEY = "device";
 
 function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    // No version: whatever version is there opens, so a database a newer version of this page
+    // has upgraded still gives back the same key (going back a version never unpairs).
+    const req = indexedDB.open(DB);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE);
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });

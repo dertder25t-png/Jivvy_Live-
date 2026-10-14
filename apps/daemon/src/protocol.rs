@@ -32,7 +32,12 @@ pub enum Command {
     #[serde(rename = "media.levels")]
     MediaLevels(Levels),
     #[serde(rename = "stream.report")]
-    StreamReport { status: StreamStatus },
+    StreamReport {
+        status: StreamStatus,
+        /// Each platform; left out by older video processes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destinations: Option<Vec<StreamDestination>>,
+    },
     #[serde(rename = "recording.start")]
     RecordingStart,
     #[serde(rename = "recording.stop")]
@@ -79,6 +84,113 @@ pub enum Command {
         #[serde(rename = "deviceId")]
         device_id: String,
     },
+}
+
+/// One streaming platform, as the video process reports it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StreamDestination {
+    pub id: String,
+    pub name: String,
+    /// "off", "connecting", "live", "reconnecting" or "paused" (by the bandwidth manager).
+    pub state: String,
+    /// "1080p", "720p", ... or "" when not sending.
+    pub quality: String,
+}
+
+/// Most destinations a stream report may list.
+pub const MAX_DESTINATIONS: usize = 16;
+
+fn destination_list(v: &Value) -> Option<Vec<StreamDestination>> {
+    let list = v.as_array()?;
+    if list.len() > MAX_DESTINATIONS {
+        return None;
+    }
+    list.iter()
+        .map(|d| {
+            let d = d.as_object()?;
+            let id = id_field(d.get("id"))?;
+            let name = d.get("name")?.as_str()?;
+            let state = d.get("state")?.as_str()?;
+            let quality = d.get("quality")?.as_str()?;
+            let quality_ok = quality.is_empty()
+                || (quality.ends_with('p')
+                    && (3..=4).contains(&(quality.len() - 1))
+                    && quality[..quality.len() - 1].bytes().all(|b| b.is_ascii_digit()));
+            let state_ok = ["off", "connecting", "live", "reconnecting", "paused"].contains(&state);
+            (name.chars().count() <= MAX_DEVICE_NAME && state_ok && quality_ok).then(|| StreamDestination {
+                id,
+                name: name.into(),
+                state: state.into(),
+                quality: quality.into(),
+            })
+        })
+        .collect()
+}
+
+/// Something the tech lead should know about, in plain words.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    /// "stream.lowered", "stream.paused" or "stream.resumed".
+    pub kind: &'static str,
+    pub destination_id: String,
+    pub name: String,
+    /// What it sends now; "" when paused.
+    pub quality: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AlertEvent<'a> {
+    pub v: u32,
+    pub event: &'static str,
+    pub alert: &'a Alert,
+}
+
+pub fn alert_event(alert: &Alert) -> AlertEvent<'_> {
+    AlertEvent { v: PROTOCOL_VERSION, event: "alert", alert }
+}
+
+/// Height of a quality label ("720p" -> 720), 0 for none (like JavaScript's parseInt).
+fn height(q: &str) -> u32 {
+    q.trim_end_matches('p').parse().unwrap_or(0)
+}
+
+/// The alerts between two reports of the same stream, word for word as the TypeScript
+/// `streamAlerts` (packages/protocol/fixtures/stream-alerts.json). Only platforms in both
+/// reports count: one starting or reconnecting isn't the bandwidth manager's doing.
+pub fn stream_alerts(before: &[StreamDestination], after: &[StreamDestination]) -> Vec<Alert> {
+    let mut out = Vec::new();
+    for now in after {
+        let Some(was) = before.iter().find(|d| d.id == now.id) else { continue };
+        let name = if now.name.is_empty() { now.id.clone() } else { now.name.clone() };
+        let quality = if now.state == "paused" { String::new() } else { now.quality.clone() };
+        let alert = |kind, message| Alert {
+            kind,
+            destination_id: now.id.clone(),
+            name: name.clone(),
+            quality: quality.clone(),
+            message,
+        };
+        if now.state == "paused" && was.state != "paused" {
+            out.push(alert(
+                "stream.paused",
+                format!("{name} is paused: the internet upload can't carry it right now. It comes back by itself when the upload recovers."),
+            ));
+        } else if was.state == "paused" && now.state != "paused" && !now.quality.is_empty() {
+            out.push(alert("stream.resumed", format!("{name} is streaming again, at {}.", now.quality)));
+        } else if was.state != "paused"
+            && now.state != "paused"
+            && height(&now.quality) > 0
+            && height(&now.quality) < height(&was.quality)
+        {
+            out.push(alert(
+                "stream.lowered",
+                format!("{name} lowered to {}: the internet upload is slow. It goes back up by itself.", now.quality),
+            ));
+        }
+    }
+    out
 }
 
 /// Longest device name, in characters (code points, as JavaScript's `[...name]` counts).
@@ -196,6 +308,9 @@ pub struct StateSnapshot {
     pub recording_wanted: bool,
     /// The disk the recording goes to has under 10 GB free.
     pub recording_low_disk: bool,
+    /// Each platform's state and quality while streaming; left out when there's nothing to show.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stream_destinations: Vec<StreamDestination>,
 }
 
 /// A device waiting for approval, as the church computer sees it.
@@ -250,6 +365,8 @@ pub struct AckExtras {
     pub devices: Option<Vec<DeviceInfo>>,
 }
 
+// Built once per command and sent straight away; boxing the ok case would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Ack {
@@ -416,12 +533,27 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
             };
             Command::RecordingReport { status, low_disk: obj.get("lowDisk").and_then(Value::as_bool) == Some(true) }
         }
-        "stream.report" => match obj.get("status").and_then(Value::as_str) {
-            Some("off") => Command::StreamReport { status: StreamStatus::Off },
-            Some("live") => Command::StreamReport { status: StreamStatus::Live },
-            Some("reconnecting") => Command::StreamReport { status: StreamStatus::Reconnecting },
-            _ => return Err((ErrorCode::BadArguments, "stream.report needs status off, live or reconnecting")),
-        },
+        "stream.report" => {
+            let status = match obj.get("status").and_then(Value::as_str) {
+                Some("off") => StreamStatus::Off,
+                Some("live") => StreamStatus::Live,
+                Some("reconnecting") => StreamStatus::Reconnecting,
+                _ => return Err((ErrorCode::BadArguments, "stream.report needs status off, live or reconnecting")),
+            };
+            let destinations = match obj.get("destinations") {
+                None => None,
+                Some(v) => match destination_list(v) {
+                    Some(list) => Some(list),
+                    None => {
+                        return Err((
+                            ErrorCode::BadArguments,
+                            "stream.report destinations: up to 16 of { id, name, state, quality }",
+                        ));
+                    }
+                },
+            };
+            Command::StreamReport { status, destinations }
+        }
         "media.levels" => match (db_list(obj.get("peakDb")), db_list(obj.get("rmsDb"))) {
             (Some(peak_db), Some(rms_db)) if peak_db.len() == rms_db.len() => {
                 Command::MediaLevels(Levels { peak_db, rms_db })
@@ -501,6 +633,21 @@ mod tests {
     }
 
     #[test]
+    fn stream_alerts_match_the_typescript_ones_word_for_word() {
+        const ALERTS: &str = include_str!("../../../packages/protocol/fixtures/stream-alerts.json");
+        let doc: Value = serde_json::from_str(ALERTS).unwrap();
+        let list = |v: &Value| -> Vec<StreamDestination> {
+            destination_list(v).unwrap_or_else(|| panic!("a valid list: {v}"))
+        };
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(cases.len() >= 5);
+        for c in cases {
+            let got = serde_json::to_value(stream_alerts(&list(&c["before"]), &list(&c["after"]))).unwrap();
+            assert_eq!(got, c["expect"], "{}", c["name"]);
+        }
+    }
+
+    #[test]
     fn acks_serialize_like_the_typescript_ones() {
         let state = StateSnapshot {
             slide_index: 2,
@@ -510,6 +657,7 @@ mod tests {
             recording: RecordingStatus::Off,
             recording_wanted: false,
             recording_low_disk: false,
+            stream_destinations: Vec::new(),
         };
         assert_eq!(
             serde_json::to_string(&ack("x", Some(state))).unwrap(),
@@ -524,6 +672,7 @@ mod tests {
             recording: RecordingStatus::Recording,
             recording_wanted: true,
             recording_low_disk: true,
+            stream_destinations: Vec::new(),
         };
         assert_eq!(
             serde_json::to_string(&state_event(state)).unwrap(),

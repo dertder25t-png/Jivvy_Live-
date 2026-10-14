@@ -1039,6 +1039,40 @@ mod video {
             panic!("no matching levels event in {within:?}");
         }
 
+        /// Listens to the engine like a screen does, from now on, keeping every alert.
+        fn watch_alerts(&self) -> AlertWatch {
+            let alerts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (addr, keep) = (self.addr.clone(), alerts.clone());
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let up = ready.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let Ok(mut s) = TcpStream::connect(&addr) else {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    };
+                    let _ =
+                        s.write_all(b"{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"state.subscribe\"}}\n");
+                    for line in BufReader::new(s).lines() {
+                        let Ok(line) = line else { break };
+                        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                        if v["id"] == "a" {
+                            up.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if v["event"] == "alert" {
+                            keep.lock().unwrap().push(v["alert"].clone());
+                        }
+                    }
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "couldn't subscribe to the engine");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            AlertWatch(alerts)
+        }
+
         fn media_status(&self, within: Duration, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
             let deadline = Instant::now() + within;
             let mut last = Value::Null;
@@ -2011,6 +2045,37 @@ mod video {
         }
     }
 
+    /// Every alert the engine sent a subscribed screen since `watch_alerts`.
+    struct AlertWatch(std::sync::Arc<std::sync::Mutex<Vec<Value>>>);
+
+    impl AlertWatch {
+        fn all(&self) -> Vec<Value> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// Waits for an alert of `kind` about `destination`.
+        fn wait(&self, kind: &str, destination: &str, within: Duration) -> Value {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(a) = self.all().into_iter().find(|a| a["kind"] == kind && a["destinationId"] == destination)
+                {
+                    return a;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no {kind} alert for {destination} in {within:?}; got {:?}",
+                    self.all()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// The engine's view of each platform, as every screen gets it.
+    fn engine_destinations(d: &Daemon) -> Value {
+        d.send(json!({ "type": "state.get" }), Duration::from_secs(5))["state"]["streamDestinations"].clone()
+    }
+
     /// A shared upload limit for throttling proxies: kbps, 0 for unlimited.
     #[derive(Default)]
     struct Uplink {
@@ -2112,11 +2177,25 @@ mod video {
     }
 
     /// What the program really sends (kbps).
+    /// What the program really sends once settled (kbps): the median of five readings a
+    /// second apart. One reading at start-up can catch the encoder's first burst (a CI
+    /// runner once read 15 Mbps from a 3 Mbps program).
     fn program_kbps(d: &Daemon) -> f64 {
-        let s = d.media_status(Duration::from_secs(20), "program running", |s| {
-            program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0 && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
-        });
-        program(&s)["kbps"].as_f64().unwrap()
+        let mut readings: Vec<f64> = (0..5)
+            .map(|i| {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let s = d.media_status(Duration::from_secs(20), "program running", |s| {
+                    program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+                        && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
+                });
+                program(&s)["kbps"].as_f64().unwrap()
+            })
+            .collect();
+        readings.sort_by(f64::total_cmp);
+        println!("program kbps readings {readings:?}");
+        readings[2]
     }
 
     #[test]
@@ -2125,6 +2204,7 @@ mod video {
         let server = MediaMtx::start(&dir);
         let uplink = std::sync::Arc::new(Uplink::default());
         let d = start_bandwidth("bw-slow", &rtmp_destination("local", throttled(uplink.clone(), server.rtmp)));
+        let alerts = d.watch_alerts();
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         wait_stream_state(&d, "live", Duration::from_secs(20));
         d.media_status(Duration::from_secs(5), "live at full quality", |s| {
@@ -2141,6 +2221,11 @@ mod video {
             dest["quality"] == "360p" && dest["state"] == "live"
         });
         println!("live at 360p {:?} after the upload dropped to {limit:.0} kbps", slowed.elapsed());
+        // The tech lead hears about it, and every screen shows the platform's quality.
+        let lowered = alerts.wait("stream.lowered", "local", Duration::from_secs(5));
+        assert!(lowered["message"].as_str().unwrap().contains("the internet upload is slow"), "{lowered}");
+        let shown = engine_destinations(&d);
+        assert_eq!(shown[0]["quality"], "360p", "{shown}");
         let dest = destination(&s, "local");
         assert!(dest["detail"].as_str().unwrap().contains("Lowered to 360p"), "{dest}");
         let upload = s["stream"]["uploadKbps"].as_f64().expect("an upload estimate");
@@ -2187,6 +2272,7 @@ mod video {
             rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp))
         );
         let d = start_bandwidth("bw-share", &destinations);
+        let alerts = d.watch_alerts();
         // 1.2 Mbps shared: 840 kbps to spend can't carry both even at 360p (~630 each).
         uplink.set(1200);
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
@@ -2197,6 +2283,19 @@ mod video {
         assert_eq!(yt_status["quality"], "360p", "{yt_status}");
         assert!(fb_status["detail"].as_str().unwrap().contains("Paused"), "{fb_status}");
         assert_eq!(stream_state(&d), "live", "screens: live, the paused platform aside");
+        // The tech lead hears which platform was paused, in plain words.
+        let paused = alerts.wait("stream.paused", "facebook", Duration::from_secs(5));
+        assert!(
+            paused["message"].as_str().unwrap().contains("is paused: the internet upload can't carry it"),
+            "{paused}"
+        );
+        assert!(
+            alerts.all().iter().all(|a| a["destinationId"] != "youtube" || a["kind"] != "stream.paused"),
+            "the main platform is never paused"
+        );
+        let shown = engine_destinations(&d);
+        let fb = shown.as_array().unwrap().iter().find(|x| x["id"] == "facebook").unwrap().clone();
+        assert_eq!((fb["state"].clone(), fb["quality"].clone()), (json!("paused"), json!("")), "{shown}");
         // YouTube keeps getting video, within the ingestion rules.
         yt.wait_segments(3, Duration::from_secs(20));
         yt.assert_no_violations();

@@ -307,6 +307,40 @@ pub struct DestinationStatus {
     pub quality: String,
 }
 
+/// Each destination as the engine's screens see it (`stream.report`). Always a list the
+/// protocol accepts, whatever `stream.json` holds: an id with other characters is made safe
+/// (the same way every time, so alerts follow it, with a hash of the original so two ids
+/// never become one), names are cut to 64 characters, and at most 16 are listed. A report the engine refused would leave screens showing "reconnecting".
+pub fn destinations_for_screens(destinations: &[DestinationStatus]) -> Vec<crate::protocol::StreamDestination> {
+    destinations
+        .iter()
+        .take(crate::protocol::MAX_DESTINATIONS)
+        .map(|d| {
+            let fits = !d.id.is_empty()
+                && d.id.len() <= 64
+                && d.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            let id = if fits {
+                d.id.clone()
+            } else {
+                // Readable part, then a stable hash of the whole id (FNV-1a), within 64.
+                let hash = d.id.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+                let readable: String =
+                    d.id.chars()
+                        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                        .take(47)
+                        .collect();
+                format!("{readable}-{hash:016x}")
+            };
+            crate::protocol::StreamDestination {
+                id,
+                name: d.name.chars().filter(|c| !c.is_control()).take(crate::protocol::MAX_DEVICE_NAME).collect(),
+                state: d.state.into(),
+                quality: d.quality.clone(),
+            }
+        })
+        .collect()
+}
+
 /// What screens see: live only when every destination is live, apart from ones the
 /// bandwidth manager paused (as long as one is still live).
 pub fn overall(wanted: bool, destinations: &[DestinationStatus]) -> &'static str {
@@ -553,5 +587,45 @@ mod tests {
         assert_eq!(overall(true, &[d("live"), d("live")]), "live");
         assert_eq!(overall(true, &[d("live"), d("reconnecting")]), "reconnecting");
         assert_eq!(overall(true, &[]), "reconnecting", "wanted but nowhere to send it");
+    }
+
+    #[test]
+    fn screens_always_get_a_destination_list_the_engine_accepts() {
+        let d = |id: &str, name: &str| DestinationStatus {
+            id: id.into(),
+            name: name.into(),
+            server: "rtmp://example".into(),
+            state: "live",
+            detail: String::new(),
+            kbps: 0.0,
+            reconnects: 0,
+            quality: "720p".into(),
+        };
+        let mut list = vec![
+            d("my youtube!", &"N".repeat(100)),
+            d("", "Empty id"),
+            d(
+                "fb",
+                "Face
+book",
+            ),
+        ];
+        list.extend((0..20).map(|i| d(&format!("d{i}"), "x")));
+        let shown = destinations_for_screens(&list);
+        assert_eq!(shown.len(), crate::protocol::MAX_DESTINATIONS);
+        assert!(shown[0].id.starts_with("my-youtube--"), "{}", shown[0].id);
+        assert!(shown[0].id.len() <= 64);
+        assert_eq!(shown[0].name.chars().count(), 64);
+        assert!(shown[1].id.starts_with('-'), "an empty id still gets one: {}", shown[1].id);
+        assert_eq!(destinations_for_screens(&list)[0].id, shown[0].id, "the same every time");
+        // Two ids that differ only in characters replaced stay two.
+        let two = destinations_for_screens(&[d("youtube!", "a"), d("youtube?", "b"), d("youtube", "c")]);
+        assert_ne!(two[0].id, two[1].id);
+        assert_eq!(two[2].id, "youtube", "an id that fits is kept as it is");
+        assert_eq!(shown[2].name, "Facebook");
+        // The engine takes the report as it is.
+        let msg = serde_json::json!({ "v": 1, "id": "r", "ts": 1,
+            "command": { "type": "stream.report", "status": "live", "destinations": shown } });
+        assert!(crate::protocol::parse_envelope(&msg.to_string()).is_ok());
     }
 }

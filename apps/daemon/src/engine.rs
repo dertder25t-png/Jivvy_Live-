@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::devices::{self, Devices};
 use crate::protocol::{
     self, Ack, AckExtras, Command, DeviceInfo, ErrorCode, PairRequestInfo, PairingStatus, RecordingStatus, RequestAck,
-    StateSnapshot, StreamStatus,
+    StateSnapshot, StreamDestination, StreamStatus,
 };
 use crate::snapshot::{Snapshot, Store};
 use crate::tls::TlsFiles;
@@ -116,6 +116,8 @@ pub struct Engine {
     proven: Vec<(String, u64, Option<Outbox>)>,
     /// The video process's latest report on the stream, and when it came.
     stream_report: Option<(StreamStatus, Instant)>,
+    /// Each platform, from the latest report that listed them.
+    stream_destinations: Vec<StreamDestination>,
     /// The video process's latest report on the recording: its status, whether the disk is
     /// running low, and when it came.
     recording_report: Option<(RecordingStatus, bool, Instant)>,
@@ -147,6 +149,7 @@ impl Engine {
             pending: Vec::new(),
             proven: Vec::new(),
             stream_report: None,
+            stream_destinations: Vec::new(),
             recording_report: None,
             last_sent: None,
         }
@@ -163,6 +166,11 @@ impl Engine {
     /// The state screens see. The stream is "off" unless asked for; when asked for, it is
     /// "live" only while the video process keeps reporting that it is.
     pub fn view_at(&self, now: Instant) -> StateSnapshot {
+        let report_fresh =
+            self.stream_report.is_some_and(|(_, at)| now.saturating_duration_since(at) < STREAM_REPORT_STALE);
+        // Platforms are only shown while streaming is wanted and the video process is reporting.
+        let stream_destinations =
+            if self.state.stream_wanted && report_fresh { self.stream_destinations.clone() } else { Vec::new() };
         let stream = match (self.state.stream_wanted, self.stream_report) {
             (false, _) => StreamStatus::Off,
             (true, Some((StreamStatus::Live, at))) if now.saturating_duration_since(at) < STREAM_REPORT_STALE => {
@@ -188,6 +196,7 @@ impl Engine {
             recording,
             recording_wanted: self.state.recording_wanted,
             recording_low_disk,
+            stream_destinations,
         }
     }
 
@@ -307,9 +316,30 @@ impl Engine {
             // Saved like the slide, so a crash mid-service resumes streaming by itself.
             Command::StreamStart => next.stream_wanted = true,
             Command::StreamStop => next.stream_wanted = false,
-            Command::StreamReport { status } => {
+            Command::StreamReport { status, destinations } => {
+                let now = Instant::now();
+                if let Some(destinations) = destinations {
+                    // Compared only with a report that is still current: after a gap (the video
+                    // process restarting) everything starts afresh, which isn't news.
+                    let fresh = self
+                        .stream_report
+                        .is_some_and(|(_, at)| now.saturating_duration_since(at) < STREAM_REPORT_STALE);
+                    if fresh && self.state.stream_wanted {
+                        for alert in protocol::stream_alerts(&self.stream_destinations, &destinations) {
+                            crate::log("engine", format!("alert: {}", alert.message));
+                            if let Ok(line) = serde_json::to_vec(&protocol::alert_event(&alert)) {
+                                self.send_to_subscribers(line);
+                            }
+                        }
+                    }
+                    self.stream_destinations = destinations;
+                } else {
+                    // A video process that doesn't list them (an older one): nothing to show,
+                    // rather than another process's last list.
+                    self.stream_destinations.clear();
+                }
                 // Live status, not saved: it only means anything while it keeps coming.
-                self.stream_report = Some((status, Instant::now()));
+                self.stream_report = Some((status, now));
                 self.tick();
                 return protocol::ack(id, None);
             }
@@ -1481,6 +1511,75 @@ mod tests {
         assert_eq!(phone.send(&mut e, json!({ "type": "slide.next" }))["state"]["slideIndex"], 1);
         let devices = send(&mut e, json!({ "type": "device.list" }));
         assert_eq!(devices["devices"][0]["name"], "Sam's iPhone");
+    }
+
+    fn report(e: &mut Engine, destinations: Value) -> Value {
+        send(e, json!({ "type": "stream.report", "status": "live", "destinations": destinations }))
+    }
+
+    fn alerts(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<Value> {
+        rx.try_iter()
+            .map(|b| serde_json::from_slice::<Value>(&b).unwrap())
+            .filter(|v| v["event"] == "alert")
+            .map(|v| v["alert"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_platform_lowered_or_paused_is_an_alert_and_every_screen_sees_each_platform() {
+        let (mut e, _) = engine("alerts", 10);
+        let (tx, rx) = sync_channel(64);
+        e.handle_line_from(&envelope(json!({ "type": "state.subscribe" })), Some(&Outbox::new(tx, None)));
+        let yt = |state: &str, q: &str| json!({ "id": "yt", "name": "YouTube", "state": state, "quality": q });
+        let fb = |state: &str, q: &str| json!({ "id": "fb", "name": "Facebook", "state": state, "quality": q });
+
+        // Not streaming: reports are kept but nothing is shown and nothing is news.
+        report(&mut e, json!([yt("off", ""), fb("off", "")]));
+        assert!(send(&mut e, json!({ "type": "state.get" }))["state"].get("streamDestinations").is_none());
+
+        send(&mut e, json!({ "type": "stream.start" }));
+        report(&mut e, json!([yt("live", "1080p"), fb("live", "1080p")]));
+        let state = send(&mut e, json!({ "type": "state.get" }))["state"].clone();
+        assert_eq!(state["streamDestinations"][1], fb("live", "1080p"));
+        assert_eq!(alerts(&rx), Vec::<Value>::new(), "starting isn't news");
+
+        report(&mut e, json!([yt("live", "720p"), fb("paused", "")]));
+        let got = alerts(&rx);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!((got[0]["kind"].clone(), got[0]["quality"].clone()), (json!("stream.lowered"), json!("720p")));
+        assert_eq!(
+            got[1]["message"],
+            "Facebook is paused: the internet upload can't carry it right now. It comes back by itself when the upload recovers."
+        );
+        report(&mut e, json!([yt("live", "720p"), fb("paused", "")]));
+        assert!(alerts(&rx).is_empty(), "said once, not every second");
+
+        // The video process restarts: its first report after the gap isn't compared.
+        e.stream_report = e.stream_report.map(|(s, at)| (s, at - STREAM_REPORT_STALE));
+        assert!(
+            send(&mut e, json!({ "type": "state.get" }))["state"].get("streamDestinations").is_none(),
+            "stale: not shown"
+        );
+        report(&mut e, json!([yt("connecting", "1080p"), fb("paused", "")]));
+        report(&mut e, json!([yt("live", "1080p"), fb("live", "360p")]));
+        let got = alerts(&rx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["kind"], "stream.resumed");
+    }
+
+    #[test]
+    fn an_older_video_process_without_destinations_still_works() {
+        let (mut e, _) = engine("alerts-old", 10);
+        send(&mut e, json!({ "type": "stream.start" }));
+        let yt = json!([{ "id": "yt", "name": "YouTube", "state": "live", "quality": "1080p" }]);
+        report(&mut e, yt);
+        assert!(send(&mut e, json!({ "type": "state.get" }))["state"].get("streamDestinations").is_some());
+        // Replaced by an older one that doesn't list them: the old list goes.
+        let r = send(&mut e, json!({ "type": "stream.report", "status": "live" }));
+        assert_eq!(r["ok"], true);
+        let state = send(&mut e, json!({ "type": "state.get" }))["state"].clone();
+        assert_eq!(state["stream"], "live");
+        assert!(state.get("streamDestinations").is_none());
     }
 
     #[test]

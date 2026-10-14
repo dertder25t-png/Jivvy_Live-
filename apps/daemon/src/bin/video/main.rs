@@ -47,6 +47,8 @@ use jivvy_daemon::client::{self, LevelsSender, Update};
 use jivvy_daemon::hardware;
 use jivvy_daemon::media::{self, Choice, DeviceInfo, InputStatus, Kind, Memory, RawDevice, Status};
 use jivvy_daemon::program::{AUDIO_CHANNELS, AUDIO_RATE, EncoderChoice, ProgramConfig};
+use jivvy_daemon::protocol::StreamDestination;
+use jivvy_daemon::stream::destinations_for_screens;
 use jivvy_daemon::{DEFAULT_LISTEN, default_data_dir, exit_when_orphaned, heartbeat, log, write_atomic};
 use program::{Feed, Program};
 use recorder::Recorder;
@@ -343,7 +345,7 @@ struct Video {
     tiers: tiers::Tiers,
     recorder: Recorder,
     /// The stream status last reported to the engine, and when.
-    stream_reported: Option<(&'static str, Instant)>,
+    stream_reported: Option<((&'static str, Vec<StreamDestination>), Instant)>,
     /// The same for the recording: its status and whether the disk is low.
     recording_reported: Option<((&'static str, bool), Instant)>,
     inputs: [Input; 2],
@@ -483,9 +485,10 @@ impl Video {
         let mut stream = self.streamer.status(wanted);
         stream.encodes = self.tiers.status();
         // Tell the engine on every change and once a second (it treats silence as trouble).
-        if self.stream_reported.is_none_or(|(s, at)| s != stream.status || at.elapsed() >= Duration::from_secs(1)) {
-            self.levels.report_stream(stream.status);
-            self.stream_reported = Some((stream.status, Instant::now()));
+        let report = (stream.status, destinations_for_screens(&stream.destinations));
+        if self.stream_reported.as_ref().is_none_or(|(r, at)| *r != report || at.elapsed() >= Duration::from_secs(1)) {
+            self.levels.report_stream(report.0, &report.1);
+            self.stream_reported = Some((report, Instant::now()));
         }
         let recording = self.recorder.info();
         if self

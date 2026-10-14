@@ -32,8 +32,37 @@ export interface Handlers {
   runSheet(r: RunSheet | null): void;
 }
 
-/** Whether this browser is paired with the daemon at this address. */
+/**
+ * Whether this browser is paired with the daemon at this address. Kept in localStorage; where
+ * the browser blocks storage, in memory for this visit (the device key is then per visit too).
+ */
 const pairedKey = (url: string) => `jivvy.paired:${url}`;
+const pairedInMemory = new Map<string, string>();
+const paired = {
+  get(url: string): string | null {
+    try {
+      return localStorage.getItem(pairedKey(url));
+    } catch {
+      return pairedInMemory.get(url) ?? null;
+    }
+  },
+  set(url: string, deviceId: string): void {
+    pairedInMemory.set(url, deviceId);
+    try {
+      localStorage.setItem(pairedKey(url), deviceId);
+    } catch {
+      // blocked storage: remembered for this visit
+    }
+  },
+  remove(url: string): void {
+    pairedInMemory.delete(url);
+    try {
+      localStorage.removeItem(pairedKey(url));
+    } catch {
+      // nothing stored
+    }
+  },
+};
 
 const failed = (message: string): Ack => ({ v: 1, id: "", ok: false, code: "unavailable", message });
 
@@ -124,7 +153,7 @@ export class DaemonConnection {
     if (e.event === "state") this.gotState(e.state);
     else if (e.event === "pair.result") {
       if (e.approved) {
-        localStorage.setItem(pairedKey(this.url), e.deviceId ?? "paired");
+        paired.set(this.url, e.deviceId ?? "paired");
         void this.start();
       } else {
         this.h.status({ kind: "unpaired", message: "The church computer didn't approve this device." });
@@ -144,7 +173,7 @@ export class DaemonConnection {
 
   /** Proves this device's key, then follows the state. */
   private async start(): Promise<void> {
-    if (!localStorage.getItem(pairedKey(this.url))) return this.h.status({ kind: "unpaired" });
+    if (!paired.get(this.url)) return this.h.status({ kind: "unpaired" });
     const key = await deviceKey();
     const hello = await this.send({ type: "auth.hello", publicKey: await publicKey(key) });
     // Disconnected mid-way: the reconnect tries again, still paired.
@@ -155,7 +184,7 @@ export class DaemonConnection {
     if (!proof.ok && proof.code !== "unauthorized") return; // disconnected: the reconnect tries again
     if (!proof.ok) {
       // Removed on the church computer, or another daemon at this address: pair again.
-      localStorage.removeItem(pairedKey(this.url));
+      paired.remove(this.url);
       return this.h.status({ kind: "unpaired", message: "This device isn't paired with this church computer." });
     }
     this.rev = undefined;

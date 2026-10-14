@@ -89,7 +89,17 @@ export type Command =
    */
   | { type: "runsheet.set"; runSheet: RunSheet }
   /** Added in v1 without a version bump. The ack carries `runSheet` (left out when none is set). */
-  | { type: "runsheet.get" };
+  | { type: "runsheet.get" }
+  /**
+   * Added in v1 without a version bump. Sends one piece of an image to the church computer,
+   * which keeps it under `id`, the SHA-256 of the whole file (64 lowercase hex). Pieces go in
+   * order: `offset` is where this one starts (0 starts again), `data` is up to MEDIA_CHUNK_BYTES
+   * in base64, and `last` finishes it: the daemon checks the hash and that it is a JPEG, PNG or
+   * WebP of at most MAX_MEDIA_BYTES. The ack carries `media`. Slides then show it by `id`.
+   */
+  | { type: "media.put"; id: string; offset: number; data: string; last: boolean }
+  /** Added in v1 without a version bump. Which of these images the church computer lacks (`missing` on the ack). */
+  | { type: "media.has"; ids: string[] };
 
 export type CommandType = Command["type"];
 
@@ -214,11 +224,30 @@ function parseSlide(x: unknown): Slide | null {
     if (line === null) return null;
     lines.push(line);
   }
-  if (x.countdownTo === undefined) return { lines };
-  const to = x.countdownTo;
-  if (typeof to !== "number" || !Number.isInteger(to) || to < 0) return null;
-  return { lines, countdownTo: to };
+  const slide: Slide = { lines };
+  if (x.countdownTo !== undefined) {
+    const to = x.countdownTo;
+    if (typeof to !== "number" || !Number.isInteger(to) || to < 0) return null;
+    slide.countdownTo = to;
+  }
+  if (x.image !== undefined) {
+    if (!isMediaId(x.image)) return null;
+    slide.image = x.image;
+  }
+  return slide;
 }
+
+// ---- Images ----
+
+/** An image's id: the SHA-256 of its bytes, 64 lowercase hex. */
+const MEDIA_ID = /^[0-9a-f]{64}$/;
+export const isMediaId = (x: unknown): x is string => typeof x === "string" && MEDIA_ID.test(x);
+/** Largest image the church computer keeps. */
+export const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+/** Largest piece of an image in one media.put (before base64). */
+export const MEDIA_CHUNK_BYTES = 256 * 1024;
+const MAX_CHUNK_BASE64 = Math.ceil(MEDIA_CHUNK_BYTES / 3) * 4;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 /** A valid run sheet with unknown fields dropped, or null. */
 export function parseRunSheet(x: unknown): RunSheet | null {
@@ -285,6 +314,17 @@ function parseCommand(raw: unknown): CommandResult {
     case "stream.preflight":
     case "runsheet.get":
       return { ok: true, command: { type: raw.type } };
+    case "media.put": {
+      const ok = isMediaId(raw.id) && typeof raw.offset === "number" && Number.isInteger(raw.offset) && raw.offset >= 0
+        && typeof raw.data === "string" && raw.data.length <= MAX_CHUNK_BASE64 && BASE64.test(raw.data);
+      if (!ok)
+        return { ok: false, code: "bad_arguments", message: `media.put needs an id (SHA-256, hex), an offset and up to ${MEDIA_CHUNK_BYTES} bytes of base64 data` };
+      return { ok: true, command: { type: "media.put", id: raw.id as string, offset: raw.offset as number, data: raw.data as string, last: raw.last === true } };
+    }
+    case "media.has":
+      if (!Array.isArray(raw.ids) || raw.ids.length > MAX_RUNSHEET_SLIDES || !raw.ids.every(isMediaId))
+        return { ok: false, code: "bad_arguments", message: `media.has needs ids: up to ${MAX_RUNSHEET_SLIDES} SHA-256 ids` };
+      return { ok: true, command: { type: "media.has", ids: raw.ids as string[] } };
     case "runsheet.set": {
       const runSheet = parseRunSheet(raw.runSheet);
       if (!runSheet)
@@ -423,6 +463,11 @@ export interface Slide {
   lines: string[];
   /** A countdown slide: counts down to this time (ms since epoch) under its lines. */
   countdownTo?: number;
+  /**
+   * Added in v1: an image slide, by id (sent first with media.put). Shown filling the screen,
+   * letterboxed, with any lines over it. runsheet.set is refused if the church computer lacks it.
+   */
+  image?: string;
 }
 
 /**
@@ -527,6 +572,10 @@ export interface AckExtras {
   preflight?: Preflight;
   /** runsheet.get: the run sheet, if one is set. */
   runSheet?: RunSheet;
+  /** media.put: how much of the image the church computer has, and whether it is complete. */
+  media?: { id: string; received: number; complete: boolean };
+  /** media.has: the ids the church computer doesn't have yet. */
+  missing?: string[];
 }
 
 export type Ack =

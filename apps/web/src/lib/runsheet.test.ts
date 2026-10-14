@@ -1,6 +1,6 @@
 import { parseRunSheet } from "@jivvy/protocol";
 import { describe, expect, it } from "vitest";
-import { build, slidesFor, type Draft, type DraftItem } from "./runsheet";
+import { build, imagesIn, slidesFor, type Draft, type DraftItem } from "./runsheet";
 
 describe("run sheet", () => {
   it("turns songs, scripture and a countdown into slides the daemon accepts", () => {
@@ -15,10 +15,12 @@ describe("run sheet", () => {
           text: "For God so loved the world, that he gave his only begotten Son, that whosoever believeth in him should not perish, but have everlasting life. For God sent not his Son into the world to condemn the world; but that the world through him might be saved." },
         { id: "c1", kind: "countdown", title: "Countdown", text: "Service starts in", at: "10:30" },
         { id: "l1", kind: "loop", title: "Before the service", text: "Welcome\n\nCoffee in the foyer", seconds: 8 },
+        { id: "i1", kind: "image", title: "Announcements", text: "", images: ["a".repeat(64), "b".repeat(64)] },
       ],
     };
     const sheet = build(draft, now);
-    expect(sheet.items.map((i) => i.slides.length)).toEqual([3, 2, 1, 2]);
+    expect(sheet.items.map((i) => i.slides.length)).toEqual([3, 2, 1, 2, 2]);
+    expect(imagesIn(sheet)).toEqual(["a".repeat(64), "b".repeat(64)]);
     expect(sheet.items[3]?.advanceSeconds).toBe(8);
     expect(sheet.items[0]?.slides[1]?.lines).toEqual(["I once was lost", "but now am found", "Was blind", "but now"]);
     expect(sheet.items[1]?.slides[0]?.lines.at(-1)).toBe("John 3:16-17");

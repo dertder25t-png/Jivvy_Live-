@@ -196,6 +196,11 @@ pub struct Model {
 }
 
 impl Model {
+    /// The data directory (images for slides live under it).
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Model {
             dir: dir.into(),

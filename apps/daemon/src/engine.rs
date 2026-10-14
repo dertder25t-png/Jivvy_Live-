@@ -98,6 +98,8 @@ fn device_may(command: &Command) -> bool {
             | Command::StreamPreflight
             | Command::RunSheetSet { .. }
             | Command::RunSheetGet
+            | Command::MediaPut { .. }
+            | Command::MediaHas { .. }
     )
 }
 
@@ -368,6 +370,13 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
+            Command::MediaPut { id: media, offset, data, last } => {
+                return self.media_put(id, &media, offset, &data, last);
+            }
+            Command::MediaHas { ids } => {
+                let missing = ids.into_iter().filter(|m| !crate::images::has(self.store.dir(), m)).collect();
+                return protocol::ack_with(id, None, AckExtras { missing: Some(missing), ..Default::default() });
+            }
             Command::SlideNext => {
                 let target = self.next_slide();
                 next.slide_index = target.min(self.slide_count() - 1);
@@ -515,7 +524,47 @@ impl Engine {
 
     /// Saves the new run sheet, then moves to its first slide (another run sheet) or stays on
     /// the current one (an edit of this one, clamped to its end), and tells every screen.
+    /// One piece of an image from a device (see `images::put`).
+    fn media_put(&mut self, id: &str, media: &str, offset: u64, data: &str, last: bool) -> Ack {
+        use base64::Engine as _;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+            return protocol::nack(id, ErrorCode::BadArguments, "media.put data isn't base64");
+        };
+        if bytes.len() > protocol::MEDIA_CHUNK_BYTES {
+            return protocol::nack(id, ErrorCode::BadArguments, "media.put piece too big");
+        }
+        match crate::images::put(self.store.dir(), media, offset, &bytes, last) {
+            Ok(progress) => {
+                if progress.complete && last {
+                    crate::log("engine", format!("image {} received ({} bytes)", &media[..12], progress.received));
+                }
+                protocol::ack_with(id, None, AckExtras { media: Some(progress), ..Default::default() })
+            }
+            Err(crate::images::PutError::Offset(have)) => {
+                protocol::nack(id, ErrorCode::BadArguments, format!("send this image from offset {have}"))
+            }
+            Err(crate::images::PutError::TooBig) => protocol::nack(
+                id,
+                ErrorCode::BadArguments,
+                format!("images can be at most {} MB", protocol::MAX_MEDIA_BYTES / (1024 * 1024)),
+            ),
+            Err(crate::images::PutError::Corrupt(why)) => protocol::nack(id, ErrorCode::BadArguments, why),
+            Err(crate::images::PutError::Io(e)) => {
+                crate::log("engine", format!("image save failed: {e}"));
+                protocol::nack(id, ErrorCode::Unavailable, "could not save the image; try again")
+            }
+        }
+    }
+
     fn set_run_sheet(&mut self, id: &str, run_sheet: protocol::RunSheet) -> Ack {
+        // Every image must already be here: a slide never shows something the screens can't load.
+        if let Some(image) =
+            run_sheet.slides().filter_map(|s| s.image.as_deref()).find(|i| !crate::images::has(self.store.dir(), i))
+        {
+            let message =
+                format!("the church computer doesn't have image {} yet; send it with media.put first", &image[..12]);
+            return protocol::nack(id, ErrorCode::BadArguments, message);
+        }
         let same = self.run_sheet.as_ref().is_some_and(|s| s.run_sheet.id == run_sheet.id);
         let rev = self.run_sheet.as_ref().map_or(1, |s| s.rev + 1);
         let saved = crate::runsheet::Saved { version: 1, rev, run_sheet };
@@ -1160,6 +1209,34 @@ mod tests {
         e.tick_at(t0 + Duration::from_secs(61));
         e.tick_at(t0 + Duration::from_secs(66));
         assert_eq!(e.view().slide_index, 2, "going back into it loops again");
+    }
+
+    #[test]
+    fn an_image_sent_in_pieces_can_be_shown_on_a_slide() {
+        use base64::Engine as _;
+        let (mut e, dir) = engine("image", 100);
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend(std::iter::repeat_n(7u8, 300_000));
+        let id: String =
+            ring::digest::digest(&ring::digest::SHA256, &png).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let sheet = json!({ "id": "img", "title": "", "items": [
+            { "id": "i", "kind": "image", "title": "", "slides": [{ "lines": [], "image": id }] },
+        ] });
+        let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        assert_eq!(r["code"], "bad_arguments", "refused until the image is here");
+        assert_eq!(send(&mut e, json!({ "type": "media.has", "ids": [id] }))["missing"], json!([id]));
+
+        let (a, b) = png.split_at(200_000);
+        let r = send(&mut e, json!({ "type": "media.put", "id": id, "offset": 0, "data": b64(a), "last": false }));
+        assert_eq!(r["media"], json!({ "id": id, "received": 200_000, "complete": false }));
+        let r = send(&mut e, json!({ "type": "media.put", "id": id, "offset": 200_000, "data": b64(b), "last": true }));
+        assert_eq!(r["media"]["complete"], true);
+        assert_eq!(std::fs::read(crate::images::path(&dir, &id)).unwrap(), png);
+        assert_eq!(send(&mut e, json!({ "type": "media.has", "ids": [id] }))["missing"], json!([]));
+
+        let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        assert_eq!(r["state"]["slide"], json!({ "lines": [], "image": id }));
     }
 
     #[test]

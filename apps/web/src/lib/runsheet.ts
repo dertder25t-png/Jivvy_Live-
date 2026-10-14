@@ -13,7 +13,7 @@ import {
   type Slide,
 } from "@jivvy/protocol";
 
-export type ItemKind = "song" | "scripture" | "countdown" | "text" | "loop";
+export type ItemKind = "song" | "scripture" | "countdown" | "text" | "loop" | "image";
 
 export interface DraftItem {
   id: string;
@@ -25,6 +25,8 @@ export interface DraftItem {
   at?: string;
   /** Pre-service loops: seconds on each slide before the next. */
   seconds?: number;
+  /** Images and PDF slides: one slide per image id (kept in this browser, see media.ts). */
+  images?: string[];
 }
 
 export interface Draft {
@@ -45,7 +47,15 @@ export const SCRIPTURE_LINES = 4;
 export const newId = (): string => crypto.randomUUID();
 
 export function newItem(kind: ItemKind): DraftItem {
-  const title = { song: "New song", scripture: "", countdown: "Countdown", text: "Announcement", loop: "Before the service" }[kind];
+  const title = {
+    song: "New song",
+    scripture: "",
+    countdown: "Countdown",
+    text: "Announcement",
+    loop: "Before the service",
+    image: "Images",
+  }[kind];
+  if (kind === "image") return { id: newId(), kind, title, text: "", images: [] };
   if (kind === "countdown") return { id: newId(), kind, title, text: "Service starts in", at: "10:30" };
   if (kind === "loop") return { id: newId(), kind, title, text: "", seconds: LOOP_SECONDS };
   return { id: newId(), kind, title, text: "" };
@@ -114,6 +124,8 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
         lines: reference ? [...lines, reference] : lines,
       }));
     }
+    case "image":
+      return (item.images ?? []).map((image) => ({ lines: [], image }));
     case "countdown": {
       const to = nextTime(item.at ?? "", now);
       const lines = [clean(item.text)].filter(Boolean);
@@ -149,3 +161,7 @@ export function build(draft: Draft, now = new Date()): RunSheet {
     }),
   };
 }
+
+/** Every image the run sheet shows, for sending them before it. */
+export const imagesIn = (sheet: RunSheet): string[] =>
+  sheet.items.flatMap((i) => i.slides.flatMap((s) => (s.image ? [s.image] : [])));

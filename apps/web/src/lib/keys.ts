@@ -2,26 +2,9 @@
  * This browser's device key (ECDSA P-256). The private key is created non-extractable and
  * kept in IndexedDB, so page scripts can sign with it but nothing can read it out.
  */
-const DB = "jivvy-live";
-const STORE = "keys";
+import { open, run } from "./db";
+
 const KEY = "device";
-
-function open(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function run<T>(db: IDBDatabase, mode: IDBTransactionMode, op: (s: IDBObjectStore) => IDBRequest): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const req = op(db.transaction(STORE, mode).objectStore(STORE));
-    req.onsuccess = () => resolve(req.result as T);
-    req.onerror = () => reject(req.error);
-  });
-}
 
 const generate = () =>
   crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]) as Promise<CryptoKeyPair>;
@@ -37,10 +20,10 @@ export function deviceKey(): Promise<CryptoKeyPair> {
     } catch {
       return generate(); // no IndexedDB (some private windows): paired for this visit only
     }
-    const saved = await run<CryptoKeyPair | undefined>(db, "readonly", (s) => s.get(KEY));
+    const saved = await run<CryptoKeyPair | undefined>(db, "keys", "readonly", (s) => s.get(KEY));
     if (saved) return saved;
     const pair = await generate();
-    await run(db, "readwrite", (s) => s.put(pair, KEY));
+    await run(db, "keys", "readwrite", (s) => s.put(pair, KEY));
     return pair;
   })();
   return cached;

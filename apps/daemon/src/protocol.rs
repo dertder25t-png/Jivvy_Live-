@@ -95,6 +95,12 @@ pub enum Command {
     },
     #[serde(rename = "runsheet.get")]
     RunSheetGet,
+    /// One piece of an image, by its SHA-256; `data` is base64.
+    #[serde(rename = "media.put")]
+    MediaPut { id: String, offset: u64, data: String, last: bool },
+    /// Which of these images the church computer lacks.
+    #[serde(rename = "media.has")]
+    MediaHas { ids: Vec<String> },
 }
 
 /// One slide as the screens show it.
@@ -105,6 +111,9 @@ pub struct Slide {
     /// A countdown slide counts down to this time (ms since epoch) under its lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub countdown_to: Option<u64>,
+    /// An image slide: the image's id (its SHA-256), sent first with `media.put`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// One item in the service (a song, a reading, a countdown...), already turned into slides
@@ -175,7 +184,32 @@ fn slide(v: &Value) -> Option<Slide> {
         None => None,
         Some(t) => Some(js_integer(t).filter(|f| *f >= 0.0)? as u64),
     };
-    Some(Slide { lines, countdown_to })
+    let image = match obj.get("image") {
+        None => None,
+        Some(i) => Some(media_id(Some(i))?),
+    };
+    Some(Slide { lines, countdown_to, image })
+}
+
+/// Largest image the church computer keeps, and largest piece of one per `media.put`.
+pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+pub const MEDIA_CHUNK_BYTES: usize = 256 * 1024;
+
+/// An image's id: the SHA-256 of its bytes, 64 lowercase hex.
+pub fn media_id(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    (s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then(|| s.to_string())
+}
+
+/// Standard base64 of at most one chunk, checked the same way as the TypeScript (decoded later).
+fn base64_chunk(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    let max = MEDIA_CHUNK_BYTES.div_ceil(3) * 4;
+    let body = s.trim_end_matches('=');
+    let ok = s.len() <= max
+        && s.len() - body.len() <= 2
+        && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/');
+    ok.then(|| s.to_string())
 }
 
 /// A valid run sheet with unknown fields dropped, as the TypeScript `parseRunSheet`.
@@ -532,6 +566,20 @@ pub struct AckExtras {
     /// runsheet.get
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_sheet: Option<RunSheet>,
+    /// media.put
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaProgress>,
+    /// media.has
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<Vec<String>>,
+}
+
+/// How much of an image the church computer has.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MediaProgress {
+    pub id: String,
+    pub received: u64,
+    pub complete: bool,
 }
 
 /// One platform in the pre-flight summary.
@@ -728,6 +776,30 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "device.list" => Command::DeviceList,
         "stream.preflight" => Command::StreamPreflight,
         "runsheet.get" => Command::RunSheetGet,
+        "media.put" => {
+            let offset = obj.get("offset").and_then(js_integer).filter(|f| *f >= 0.0);
+            match (media_id(obj.get("id")), offset, base64_chunk(obj.get("data"))) {
+                (Some(id), Some(offset), Some(data)) => Command::MediaPut {
+                    id,
+                    offset: offset as u64,
+                    data,
+                    last: obj.get("last").and_then(Value::as_bool) == Some(true),
+                },
+                _ => {
+                    return Err((
+                        ErrorCode::BadArguments,
+                        "media.put needs an id (SHA-256), an offset and base64 data",
+                    ));
+                }
+            }
+        }
+        "media.has" => {
+            let ids = obj.get("ids").and_then(Value::as_array).filter(|a| a.len() <= MAX_RUNSHEET_SLIDES);
+            match ids.and_then(|a| a.iter().map(|v| media_id(Some(v))).collect::<Option<Vec<_>>>()) {
+                Some(ids) => Command::MediaHas { ids },
+                None => return Err((ErrorCode::BadArguments, "media.has needs ids: SHA-256 ids")),
+            }
+        }
         "runsheet.set" => match run_sheet(obj.get("runSheet")) {
             Some(run_sheet) => Command::RunSheetSet { run_sheet },
             None => return Err((ErrorCode::BadArguments, "runsheet.set needs a valid runSheet")),

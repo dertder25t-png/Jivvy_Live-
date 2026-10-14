@@ -49,7 +49,31 @@ export type Command =
    * low, about once a second. UIs read the result as `recording` and `recordingLowDisk` in
    * the state; they never send this.
    */
-  | { type: "recording.report"; status: RecordingStatus; lowDisk?: boolean };
+  | { type: "recording.report"; status: RecordingStatus; lowDisk?: boolean }
+  // ---- Pairing and device authentication (added in v1 without a version bump) ----
+  // The church computer's own connection (the local channel) is trusted. Every device on the
+  // network channel must be paired, and must prove it holds its key on every connection,
+  // before any other command is accepted (`unauthorized` otherwise).
+  /** Church computer only. Lets devices ask to pair for PAIRING_WINDOW_MS. */
+  | { type: "pair.open" }
+  /** Church computer only. Stops accepting pairing requests and drops pending ones. */
+  | { type: "pair.close" }
+  /**
+   * A device asks to pair while pairing is open. `publicKey`: its P-256 public key, raw
+   * uncompressed (65 bytes), base64url. The ack carries a code shown on both screens.
+   */
+  | { type: "pair.request"; publicKey: string; name: string }
+  /** Church computer only: approve or deny a pending request after checking the codes match. */
+  | { type: "pair.approve"; requestId: string }
+  | { type: "pair.deny"; requestId: string }
+  /** A device starts proving who it is; the ack carries a one-time challenge. */
+  | { type: "auth.hello"; publicKey: string }
+  /** ECDSA P-256 / SHA-256 signature (r||s, 64 bytes, base64url) over authMessage(daemonId, challenge). */
+  | { type: "auth.prove"; signature: string }
+  /** Church computer only. */
+  | { type: "device.list" }
+  /** Church computer only. Removing a device ends its open connections at once. */
+  | { type: "device.remove"; deviceId: string };
 
 export type CommandType = Command["type"];
 
@@ -69,7 +93,12 @@ export type ErrorCode =
   | "unknown_command"
   | "bad_arguments"
   /** The daemon understood the command but can't do it yet (e.g. a feature not built on this daemon). */
-  | "unavailable";
+  | "unavailable"
+  /**
+   * Added in v1: this connection may not do that. A device that isn't paired and proven, a
+   * command only the church computer may send, or pairing that isn't open.
+   */
+  | "unauthorized";
 
 export type ParseResult =
   | { ok: true; envelope: Envelope }
@@ -91,6 +120,31 @@ function dbList(x: unknown): number[] | null {
   return x.every((n) => typeof n === "number" && Number.isFinite(n)) ? (x as number[]) : null;
 }
 
+/** A P-256 public key, raw uncompressed (0x04 || x || y, 65 bytes), base64url without padding. */
+const PUBLIC_KEY = /^B[A-Za-z0-9_-]{86}$/;
+/** A 64-byte ECDSA signature (r || s), base64url without padding. */
+const SIGNATURE = /^[A-Za-z0-9_-]{86}$/;
+/** Request and device ids. */
+const ID = /^[A-Za-z0-9_-]{1,64}$/;
+/** Longest device name, in characters. */
+export const MAX_DEVICE_NAME = 64;
+/** How long pairing stays open after pair.open. */
+export const PAIRING_WINDOW_MS = 120_000;
+/** Most pairing requests waiting at once; more are refused until one is answered. */
+export const MAX_PENDING_PAIRINGS = 5;
+
+/** A trimmed device name of 1-64 characters with no control characters, or null. */
+function deviceName(x: unknown): string | null {
+  if (typeof x !== "string") return null;
+  const name = x.trim();
+  const chars = [...name];
+  if (chars.length < 1 || chars.length > MAX_DEVICE_NAME) return null;
+  if (chars.some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)) return null;
+  return name;
+}
+
+const isId = (x: unknown): x is string => typeof x === "string" && ID.test(x);
+
 type CommandResult = { ok: true; command: Command } | { ok: false; code: ErrorCode; message: string };
 
 function parseCommand(raw: unknown): CommandResult {
@@ -105,7 +159,31 @@ function parseCommand(raw: unknown): CommandResult {
     case "recording.stop":
     case "state.get":
     case "state.subscribe":
+    case "pair.open":
+    case "pair.close":
+    case "device.list":
       return { ok: true, command: { type: raw.type } };
+    case "pair.request": {
+      const name = deviceName(raw.name);
+      if (typeof raw.publicKey !== "string" || !PUBLIC_KEY.test(raw.publicKey) || !name)
+        return { ok: false, code: "bad_arguments", message: `pair.request needs a P-256 publicKey (raw, base64url) and a name of 1-${MAX_DEVICE_NAME} characters` };
+      return { ok: true, command: { type: "pair.request", publicKey: raw.publicKey, name } };
+    }
+    case "pair.approve":
+    case "pair.deny":
+      if (!isId(raw.requestId)) return { ok: false, code: "bad_arguments", message: `${raw.type} needs a requestId` };
+      return { ok: true, command: { type: raw.type, requestId: raw.requestId } };
+    case "auth.hello":
+      if (typeof raw.publicKey !== "string" || !PUBLIC_KEY.test(raw.publicKey))
+        return { ok: false, code: "bad_arguments", message: "auth.hello needs a P-256 publicKey (raw, base64url)" };
+      return { ok: true, command: { type: "auth.hello", publicKey: raw.publicKey } };
+    case "auth.prove":
+      if (typeof raw.signature !== "string" || !SIGNATURE.test(raw.signature))
+        return { ok: false, code: "bad_arguments", message: "auth.prove needs a 64-byte signature (base64url)" };
+      return { ok: true, command: { type: "auth.prove", signature: raw.signature } };
+    case "device.remove":
+      if (!isId(raw.deviceId)) return { ok: false, code: "bad_arguments", message: "device.remove needs a deviceId" };
+      return { ok: true, command: { type: "device.remove", deviceId: raw.deviceId } };
     case "slide.goto":
       if (typeof raw.index !== "number" || !Number.isInteger(raw.index) || raw.index < 0)
         return { ok: false, code: "bad_arguments", message: "slide.goto needs a non-negative integer index" };
@@ -178,9 +256,46 @@ export interface StateSnapshot {
   recordingLowDisk?: boolean;
 }
 
+/** A device waiting for approval, as the church computer sees it. */
+export interface PairRequestInfo {
+  requestId: string;
+  name: string;
+  /** 6 random digits, also shown on the device: approve only if they match. */
+  code: string;
+}
+
+export interface PairingStatus {
+  open: boolean;
+  /** While open: how long until it closes by itself. */
+  closesInMs?: number;
+  requests: PairRequestInfo[];
+}
+
+export interface DeviceInfo {
+  deviceId: string;
+  name: string;
+  /** ms since epoch */
+  pairedAt: number;
+}
+
+/** Fields an ok ack may carry besides `state`; each was added in v1 and only some commands send them. */
+export interface AckExtras {
+  /** pair.open, pair.close, pair.approve, pair.deny */
+  pairing?: PairingStatus;
+  /** pair.request: the id the church computer approves, and the code this device shows. */
+  request?: { requestId: string; code: string };
+  /** auth.hello: sign authMessage(daemonId, challenge) and send it with auth.prove. */
+  challenge?: string;
+  daemonId?: string;
+  /** auth.prove */
+  deviceId?: string;
+  /** device.list, device.remove */
+  devices?: DeviceInfo[];
+}
+
 export type Ack =
   /** `state` was added in v1 without a version bump; older daemons leave it out. */
-  | { v: number; id: string; ok: true; state?: StateSnapshot }
+  | ({ v: number; id: string; ok: true; state?: StateSnapshot } & AckExtras)
   | { v: number; id: string; ok: false; code: ErrorCode; message: string };
 
 /**
@@ -195,13 +310,24 @@ export interface Levels {
 export type DaemonEvent =
   | { v: number; event: "state"; state: StateSnapshot }
   /** Live audio input levels, about ten a second, for meters. */
-  | { v: number; event: "levels"; levels: Levels };
+  | { v: number; event: "levels"; levels: Levels }
+  /** To the church computer's subscribers whenever pairing opens, closes or gets a request. */
+  | { v: number; event: "pairing"; pairing: PairingStatus }
+  /** To the device that asked to pair, once the church computer answers. */
+  | { v: number; event: "pair.result"; approved: boolean; deviceId?: string; daemonId?: string };
+
+/**
+ * What a device signs to prove it holds its key (UTF-8). The daemon id stops a signature
+ * made for one church computer from working on another.
+ */
+export const authMessage = (daemonId: string, challenge: string): string =>
+  `jivvy-live auth v1\n${daemonId}\n${challenge}`;
 
 export const stateEvent = (state: StateSnapshot): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "state", state });
 export const levelsEvent = (levels: Levels): DaemonEvent => ({ v: PROTOCOL_VERSION, event: "levels", levels });
 
-export const ack = (id: string, state?: StateSnapshot): Ack =>
-  state ? { v: PROTOCOL_VERSION, id, ok: true, state } : { v: PROTOCOL_VERSION, id, ok: true };
+export const ack = (id: string, state?: StateSnapshot, extras: AckExtras = {}): Ack =>
+  state ? { v: PROTOCOL_VERSION, id, ok: true, state, ...extras } : { v: PROTOCOL_VERSION, id, ok: true, ...extras };
 export const nack = (id: string, code: ErrorCode, message: string): Ack => ({
   v: PROTOCOL_VERSION, id, ok: false, code, message,
 });

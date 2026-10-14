@@ -5,7 +5,8 @@ import { SimDaemon } from "../src/index";
 
 // The same scenarios run against the real daemon (apps/daemon/tests/chaos.rs).
 type Step = { send: Command; expect: Record<string, unknown> } | { crash: true };
-const scenarios = shared.scenarios as Array<{ name: string; slides: number; steps: Step[] }>;
+type Connection = "churchComputer" | "unpaired";
+const scenarios = shared.scenarios as Array<{ name: string; slides: number; connection?: Connection; steps: Step[] }>;
 
 describe("shared scenarios (same as the real daemon)", () => {
   it("has some", () => expect(scenarios.length).toBeGreaterThanOrEqual(5));
@@ -14,13 +15,15 @@ describe("shared scenarios (same as the real daemon)", () => {
     it(s.name, async () => {
       const timers: Array<() => void> = [];
       const d = new SimDaemon({ slideCount: s.slides, setTimer: (fn) => timers.push(fn) });
+      // The church computer's channel by default; an unpaired device on the network channel if asked.
+      const target = s.connection === "unpaired" ? d.connect() : d;
       for (const [i, step] of s.steps.entries()) {
         if ("crash" in step) {
           d.crash();
           timers.splice(0).forEach((f) => f()); // restarted from its snapshot
           continue;
         }
-        const ack = await dispatch(d, makeEnvelope(step.send));
+        const ack = await dispatch(target, makeEnvelope(step.send));
         expect(ack, `step ${i}: ${JSON.stringify(step.send)}`).toMatchObject(step.expect);
       }
     });

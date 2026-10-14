@@ -32,7 +32,13 @@ fn main() {
         let mut val = || args.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
         match flag.as_str() {
             "--data-dir" => data_dir = PathBuf::from(val()),
-            "--listen" => listen = val(),
+            "--listen" => {
+                listen = val();
+                // Trusted, so for this computer only; devices use --listen-ws.
+                if !engine::is_loopback_only(&listen) {
+                    fail(&format!("--listen must be a loopback address such as 127.0.0.1:47800, not {listen}"));
+                }
+            }
             "--slides" => slides = val().parse().unwrap_or_else(|_| fail("--slides must be a number")),
             "--supervised" => supervised = true,
             "--listen-ws" => listen_ws = Some(val()),
@@ -67,6 +73,18 @@ fn main() {
         std::thread::spawn(move || heartbeat(&engine, &hang_file));
     }
 
+    // Without a certificate, pairing codes and proofs would cross the network in plain text:
+    // plain ws:// only on this computer. Refused, not fatal: a bad setting never stops a service.
+    let listen_ws = listen_ws.filter(|addr| {
+        let ok = ws_tls.is_some() || engine::is_loopback_only(addr);
+        if !ok {
+            log(
+                "engine",
+                format!("WebSocket channel {addr}: needs --ws-cert and --ws-key off this computer; not started"),
+            );
+        }
+        ok
+    });
     if let Some(addr) = listen_ws {
         let (engine, access) = (engine.clone(), Arc::new(ws_access));
         if let Some(tls) = &ws_tls {

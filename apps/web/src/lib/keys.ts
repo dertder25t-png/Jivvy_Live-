@@ -19,11 +19,14 @@ function open(): Promise<IDBDatabase> {
   });
 }
 
+/** Resolves only once the transaction has committed: a write rolled back later is an error. */
 function run<T>(db: IDBDatabase, mode: IDBTransactionMode, op: (s: IDBObjectStore) => IDBRequest): Promise<T> {
   return new Promise((resolve, reject) => {
-    const req = op(db.transaction(STORE, mode).objectStore(STORE));
-    req.onsuccess = () => resolve(req.result as T);
-    req.onerror = () => reject(req.error);
+    const tx = db.transaction(STORE, mode);
+    const req = op(tx.objectStore(STORE));
+    tx.oncomplete = () => resolve(req.result as T);
+    tx.onabort = () => reject(tx.error ?? req.error ?? new Error("This browser couldn't save it."));
+    tx.onerror = () => reject(tx.error ?? req.error);
   });
 }
 

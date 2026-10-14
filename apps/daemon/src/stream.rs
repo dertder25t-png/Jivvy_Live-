@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bandwidth::{Pref, Prefs, WhenShort};
+
 pub const CONFIG_FILE: &str = "stream.json";
 pub const CONFIG_VERSION: u32 = 1;
 /// No bytes reaching the server for this long (with the connection still open) counts as
@@ -38,6 +40,12 @@ pub struct Destination {
     pub key: String,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// Advanced mode: never above this quality ("1080p", "720p", "480p", "360p").
+    #[serde(default, rename = "maxQuality", skip_serializing_if = "Option::is_none")]
+    pub max_quality: Option<String>,
+    /// Advanced mode: when the upload runs short, "lower" (the default), "audioOnly" or "pause".
+    #[serde(default, rename = "whenShort", skip_serializing_if = "Option::is_none")]
+    pub when_short: Option<String>,
 }
 
 fn enabled_by_default() -> bool {
@@ -49,9 +57,67 @@ pub struct StreamConfig {
     pub version: u32,
     #[serde(default)]
     pub destinations: Vec<Destination>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<BandwidthConfig>,
+}
+
+/// `bandwidth` in `stream.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BandwidthConfig {
+    /// "auto" (the default) or "advanced".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// Each enabled destination's Advanced-mode settings, and any problems with them in words a
+/// tech lead can fix. In Auto mode (or with mistakes) the defaults apply, which is Auto.
+pub fn prefs(config: &StreamConfig) -> (Prefs, Vec<String>) {
+    let mut problems = Vec::new();
+    let mode = config.bandwidth.as_ref().and_then(|b| b.mode.as_deref()).unwrap_or("auto");
+    let set = config.destinations.iter().any(|d| d.max_quality.is_some() || d.when_short.is_some());
+    match mode {
+        "advanced" => {}
+        "auto" => {
+            if set {
+                problems
+                    .push("maxQuality and whenShort only apply in Advanced mode (bandwidth.mode \"advanced\")".into());
+            }
+            return (Prefs::new(), problems);
+        }
+        other => {
+            problems.push(format!("bandwidth.mode must be \"auto\" or \"advanced\", not {other:?}; using auto"));
+            return (Prefs::new(), problems);
+        }
+    }
+    let mut prefs = Prefs::new();
+    for d in config.destinations.iter().filter(|d| d.enabled) {
+        let mut pref = Pref::default();
+        if let Some(q) = &d.max_quality {
+            match q.strip_suffix('p').and_then(|h| h.parse::<u32>().ok()).filter(|h| [1080, 720, 480, 360].contains(h))
+            {
+                Some(h) => pref.max_height = Some(h),
+                None => problems.push(format!("{}: maxQuality must be 1080p, 720p, 480p or 360p", d.id)),
+            }
+        }
+        match d.when_short.as_deref() {
+            None | Some("lower") => {}
+            Some("audioOnly") => pref.when_short = WhenShort::AudioOnly,
+            Some("pause") => pref.when_short = WhenShort::Pause,
+            Some(_) => problems.push(format!("{}: whenShort must be lower, audioOnly or pause", d.id)),
+        }
+        prefs.insert(d.id.clone(), pref);
+    }
+    (prefs, problems)
 }
 
 impl Destination {
+    /// Whether `other` connects the same way: the bandwidth settings can change without a
+    /// reconnect.
+    pub fn same_connection(&self, other: &Destination) -> bool {
+        (&self.id, &self.name, &self.url, &self.key, self.enabled)
+            == (&other.id, &other.name, &other.url, &other.key, other.enabled)
+    }
+
     /// HTTP(S) addresses get YouTube's HLS segment upload; everything else RTMP.
     pub fn is_hls(&self) -> bool {
         let url = self.url.trim();
@@ -156,7 +222,7 @@ pub fn load_config(dir: &Path) -> Result<StreamConfig, String> {
     let bytes = match std::fs::read(dir.join(CONFIG_FILE)) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(StreamConfig { version: CONFIG_VERSION, destinations: vec![] });
+            return Ok(StreamConfig { version: CONFIG_VERSION, destinations: vec![], bandwidth: None });
         }
         Err(e) => return Err(format!("can't read {CONFIG_FILE}: {e}")),
     };
@@ -305,6 +371,8 @@ pub struct DestinationStatus {
     pub reconnects: u32,
     /// What it sends: "1080p", "720p", ... (the bandwidth manager's choice), or "" when off.
     pub quality: String,
+    /// The best it may send: its own top quality in Advanced mode, else the program's.
+    pub top_quality: String,
 }
 
 /// Each destination as the engine's screens see it (`stream.report`). Always a list the
@@ -336,6 +404,7 @@ pub fn destinations_for_screens(destinations: &[DestinationStatus]) -> Vec<crate
                 name: d.name.chars().filter(|c| !c.is_control()).take(crate::protocol::MAX_DEVICE_NAME).collect(),
                 state: d.state.into(),
                 quality: d.quality.clone(),
+                top: (!d.top_quality.is_empty()).then(|| d.top_quality.clone()),
             }
         })
         .collect()
@@ -389,7 +458,51 @@ mod tests {
             url: "rtmps://a.rtmps.youtube.com:443/live2/".into(),
             key: key.into(),
             enabled: true,
+            max_quality: None,
+            when_short: None,
         }
+    }
+
+    fn config(mode: Option<&str>, destinations: Vec<Destination>) -> StreamConfig {
+        StreamConfig {
+            version: CONFIG_VERSION,
+            destinations,
+            bandwidth: mode.map(|m| BandwidthConfig { mode: Some(m.into()) }),
+        }
+    }
+
+    #[test]
+    fn advanced_settings_are_read_and_mistakes_explained() {
+        let fb = |max: Option<&str>, when: Option<&str>| Destination {
+            id: "facebook".into(),
+            max_quality: max.map(String::from),
+            when_short: when.map(String::from),
+            ..yt("k")
+        };
+        let (p, problems) = prefs(&config(Some("advanced"), vec![yt("k"), fb(Some("720p"), Some("audioOnly"))]));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(p["youtube"], Pref::default());
+        assert_eq!(p["facebook"], Pref { max_height: Some(720), when_short: WhenShort::AudioOnly });
+
+        let (p, problems) = prefs(&config(Some("advanced"), vec![fb(Some("4k"), Some("skip"))]));
+        assert_eq!(p["facebook"], Pref::default(), "mistakes fall back to Auto's behavior");
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("maxQuality must be"));
+
+        // Auto mode ignores them, and says so.
+        let (p, problems) = prefs(&config(None, vec![fb(Some("720p"), None)]));
+        assert!(p.is_empty());
+        assert!(problems[0].contains("only apply in Advanced mode"), "{problems:?}");
+        let (_, problems) = prefs(&config(Some("fancy"), vec![yt("k")]));
+        assert!(problems[0].contains("must be \"auto\" or \"advanced\""), "{problems:?}");
+    }
+
+    #[test]
+    fn changing_bandwidth_settings_never_reconnects_a_platform() {
+        let a = yt("k");
+        let b = Destination { max_quality: Some("720p".into()), when_short: Some("pause".into()), ..yt("k") };
+        assert!(a.same_connection(&b));
+        assert!(!a.same_connection(&yt("other-key")));
     }
 
     #[test]
@@ -580,6 +693,7 @@ mod tests {
             kbps: 0.0,
             reconnects: 0,
             quality: String::new(),
+            top_quality: String::new(),
         };
         assert_eq!(overall(false, &[d("live")]), "off");
         assert_eq!(overall(true, &[d("live"), d("paused")]), "live", "paused for bandwidth");
@@ -600,6 +714,7 @@ mod tests {
             kbps: 0.0,
             reconnects: 0,
             quality: "720p".into(),
+            top_quality: "1080p".into(),
         };
         let mut list = vec![
             d("my youtube!", &"N".repeat(100)),

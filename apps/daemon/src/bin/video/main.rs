@@ -437,7 +437,7 @@ impl Video {
         }
         self.streamer.reconcile(&self.args.data_dir, &self.feed, &program_cfg);
         let encoders = media_encoders(&program_cfg);
-        self.tiers.reconcile(self.streamer.ladder(), &program_cfg, &encoders, &self.feed);
+        self.tiers.reconcile(self.streamer.qualities(), &program_cfg, &encoders, &self.feed);
         let raw: Vec<RawDevice> = self.device_cache.lock().unwrap().iter().map(|(r, _)| r.clone()).collect();
         self.devices = media::devices(&raw);
         let remembered = self.memory.clone();

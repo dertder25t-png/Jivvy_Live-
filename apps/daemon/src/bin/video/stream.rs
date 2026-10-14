@@ -92,6 +92,9 @@ impl Taps {
 pub(crate) struct Link {
     /// What to send: a quality, or None (paused for bandwidth).
     assigned: Mutex<Option<Quality>>,
+    /// The best this platform may send (its own top quality in Advanced mode): sending it
+    /// isn't "lowered".
+    top: Mutex<Tier>,
     /// The worker's latest measurements.
     report: Mutex<(Report, Instant)>,
 }
@@ -102,7 +105,7 @@ const REPORT_STALE: Duration = Duration::from_secs(10);
 impl Link {
     fn new(id: &str, full: Quality) -> Link {
         let report = (Report { id: id.into(), ..Report::default() }, Instant::now());
-        Link { assigned: Mutex::new(Some(full)), report: Mutex::new(report) }
+        Link { assigned: Mutex::new(Some(full)), top: Mutex::new(full.tier), report: Mutex::new(report) }
     }
 
     /// The latest report, or an empty one if it's stale.
@@ -117,6 +120,11 @@ impl Link {
 
     pub(crate) fn assigned(&self) -> Option<Quality> {
         *self.assigned.lock().unwrap()
+    }
+
+    /// What a destination shows while live at `quality`.
+    pub(crate) fn detail(&self, quality: &Quality) -> String {
+        lowered_detail(quality, *self.top.lock().unwrap())
     }
 
     /// Called about once a second by the worker. Never call while holding `status`.
@@ -157,10 +165,12 @@ impl Average {
     }
 }
 
-/// What a destination shows while live at `quality`.
-pub(crate) fn lowered_detail(quality: &Quality) -> String {
-    if quality.tier == Tier::Full {
+/// What a destination shows while live at `quality`, `top` being the best it may send.
+pub(crate) fn lowered_detail(quality: &Quality, top: Tier) -> String {
+    if quality.tier <= top {
         String::new()
+    } else if quality.tier == Tier::Audio {
+        "Audio only: the internet upload is slow. The picture comes back by itself.".into()
     } else {
         format!("Lowered to {}: the internet upload is slow. It goes back up by itself.", quality.label())
     }
@@ -197,6 +207,8 @@ pub struct Streamer {
     problems: Vec<String>,
     manager: Manager,
     ladder: Vec<Quality>,
+    /// The ladder plus audio only: every quality a destination may be given.
+    qualities: Vec<Quality>,
 }
 
 impl Streamer {
@@ -207,12 +219,13 @@ impl Streamer {
             problems: Vec::new(),
             manager: Manager::new(Instant::now()),
             ladder: Vec::new(),
+            qualities: Vec::new(),
         }
     }
 
-    /// The qualities on offer for the current program, best first.
-    pub fn ladder(&self) -> &[Quality] {
-        &self.ladder
+    /// Every quality on offer for the current program (audio only last), best first.
+    pub fn qualities(&self) -> &[Quality] {
+        &self.qualities
     }
 
     /// Once a second: re-reads `stream.json`, starts, restarts or stops destination workers
@@ -220,11 +233,14 @@ impl Streamer {
     /// workers are told to stop and finish on their own threads.
     pub fn reconcile(&mut self, dir: &std::path::Path, feed: &Arc<Feed>, program: &ProgramConfig) {
         self.ladder = bandwidth::ladder(program);
+        self.qualities = self.ladder.iter().copied().chain(bandwidth::audio_quality(&self.ladder)).collect();
         self.problems.clear();
         match stream::load_config(dir) {
             Ok(c) => self.config = c,
             Err(e) => self.problems.push(format!("{e}; keeping the last good destinations")),
         }
+        let (prefs, problems) = stream::prefs(&self.config);
+        self.problems.extend(problems);
         let mut enabled: HashMap<String, Destination> = HashMap::new();
         // Priority order: the first destination in stream.json is the main platform.
         let mut order: Vec<String> = Vec::new();
@@ -239,7 +255,8 @@ impl Streamer {
             }
         }
         self.workers.retain(|id, w| {
-            let keep = enabled.get(id) == Some(&w.destination);
+            // Only a change in how it connects restarts it; bandwidth settings apply live.
+            let keep = enabled.get(id).is_some_and(|d| d.same_connection(&w.destination));
             if !keep {
                 w.stop.store(true, Ordering::Relaxed);
             }
@@ -259,6 +276,7 @@ impl Streamer {
                 kbps: 0.0,
                 reconnects: 0,
                 quality: String::new(),
+                top_quality: String::new(),
             }));
             let link = Arc::new(Link::new(&id, self.ladder[0]));
             let (dest, f, s, st, l) = (d.clone(), feed.clone(), stop.clone(), status.clone(), link.clone());
@@ -273,10 +291,14 @@ impl Streamer {
 
         let reports: Vec<Report> =
             order.iter().filter_map(|id| self.workers.get(id)).map(|w| w.link.current()).collect();
-        let assignments = self.manager.update(&self.ladder, &order, &reports, wanted(feed), Instant::now());
+        let assignments =
+            self.manager.update_with(&self.ladder, &order, &prefs, &reports, wanted(feed), Instant::now());
         for (id, a) in assignments {
             if let Some(w) = self.workers.get(&id) {
-                let quality = a.and_then(|t| self.ladder.iter().find(|q| q.tier == t).copied());
+                let quality = a.and_then(|t| self.qualities.iter().find(|q| q.tier == t).copied());
+                let top = bandwidth::top_quality(&self.ladder, prefs.get(&id).copied().unwrap_or_default());
+                *w.link.top.lock().unwrap() = top.map_or(Tier::Full, |q| q.tier);
+                w.status.lock().unwrap().top_quality = top.map(|q| q.label()).unwrap_or_default();
                 *w.link.assigned.lock().unwrap() = quality;
             }
         }
@@ -598,7 +620,7 @@ fn session(
                 s.detail = "The internet upload is slower than the stream. Lowering the quality.".into();
             } else if delivery == Delivery::Live {
                 s.state = "live";
-                s.detail = lowered_detail(&quality);
+                s.detail = link.detail(&quality);
             } else if s.state == "live" {
                 // Was live, now catching up (e.g. confirmations falling behind).
                 s.state = "reconnecting";

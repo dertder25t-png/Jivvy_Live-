@@ -12,7 +12,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use jivvy_daemon::bandwidth::{Quality, Tier};
+use jivvy_daemon::bandwidth::{AUDIO_ONLY_FPS, Quality, Tier};
 use jivvy_daemon::log;
 use jivvy_daemon::program::{ENCODER_TRIAL, EncoderChoice, ProgramConfig};
 use jivvy_daemon::stream::EncodeStatus;
@@ -193,11 +193,17 @@ impl Tiers {
 
 /// One lower-quality encode: scaled program picture in, H.264 out to the taps.
 fn start(q: &Quality, encoder: EncoderChoice, program: &ProgramConfig, feed: &Arc<Feed>) -> Result<Encode, String> {
-    let cfg = ProgramConfig { width: q.width, height: q.height, bitrate_kbps: q.video_kbps, ..program.clone() };
+    // Audio only still needs a picture for the platform to stay live: a slow trickle of it.
+    let (fps, rate) = if q.tier == Tier::Audio {
+        (AUDIO_ONLY_FPS, format!("videorate drop-only=true ! video/x-raw,framerate={AUDIO_ONLY_FPS}/1 ! "))
+    } else {
+        (program.fps, String::new())
+    };
+    let cfg = ProgramConfig { width: q.width, height: q.height, bitrate_kbps: q.video_kbps, fps, ..program.clone() };
     // Not live: frames carry the program's running time, unrelated to this pipeline's clock.
     let description = format!(
         "appsrc name=src format=time leaky-type=downstream max-buffers=3 \
-         ! videoscale ! video/x-raw,width={w},height={h} ! {enc} \
+         ! {rate}videoscale ! video/x-raw,width={w},height={h} ! {enc} \
          ! h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au \
          ! appsink name=out sync=false async=false max-buffers=32 drop=true",
         w = q.width,

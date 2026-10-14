@@ -2154,6 +2154,11 @@ mod video {
     /// squeezes the usual test pattern to almost nothing), at 720p and 3 Mbps so x264 keeps
     /// up on a CI runner. Lower qualities: 480p and 360p.
     fn start_bandwidth(name: &str, destinations: &str) -> Daemon {
+        start_bandwidth_mode(name, destinations, "auto")
+    }
+
+    /// `start_bandwidth` with the bandwidth manager in `mode` ("auto" or "advanced").
+    fn start_bandwidth_mode(name: &str, destinations: &str, mode: &str) -> Daemon {
         let dir = test_dir(name);
         std::fs::write(
             dir.join("media.json"),
@@ -2161,7 +2166,8 @@ mod video {
                 "program":{"width":1280,"height":720,"bitrateKbps":3000}}"#,
         )
         .unwrap();
-        std::fs::write(dir.join("stream.json"), format!(r#"{{"version":1,"destinations":[{destinations}]}}"#)).unwrap();
+        let config = format!(r#"{{"version":1,"bandwidth":{{"mode":"{mode}"}},"destinations":[{destinations}]}}"#);
+        std::fs::write(dir.join("stream.json"), config).unwrap();
         let video = env!("CARGO_BIN_EXE_jivvy-video");
         let d = start_with_env(dir, 10, false, &["--video", video], &[("JIVVY_TEST_PATTERN", "snow")]);
         d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -2299,6 +2305,73 @@ mod video {
         // YouTube keeps getting video, within the ingestion rules.
         yt.wait_segments(3, Duration::from_secs(20));
         yt.assert_no_violations();
+    }
+
+    /// A destination's JSON with Advanced-mode settings added.
+    fn with_settings(destination: String, settings: &str) -> String {
+        format!("{},{settings}}}", destination.trim_end_matches('}'))
+    }
+
+    #[test]
+    fn advanced_mode_caps_a_platform_and_keeps_it_live_on_audio_only_where_auto_would_pause_it() {
+        let dir = test_dir("bw-adv-mtx");
+        let server = MediaMtx::start(&dir);
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        // Facebook ranked first; YouTube never above 480p, and audio only when short.
+        let destinations = format!(
+            "{},{}",
+            rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp)),
+            with_settings(
+                hls_destination("youtube", throttled(uplink.clone(), yt.port)),
+                r#""maxQuality":"480p","whenShort":"audioOnly""#
+            )
+        );
+        let d = start_bandwidth_mode("bw-adv", &destinations, "advanced");
+        let alerts = d.watch_alerts();
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+
+        // Plenty of upload: Facebook at the full 720p, YouTube at its own top, 480p, which
+        // isn't "lowered".
+        let s = d.media_status(Duration::from_secs(30), "both live, YouTube at 480p", |s| {
+            let (fb, yt) = (destination(s, "facebook"), destination(s, "youtube"));
+            fb["state"] == "live" && fb["quality"] == "720p" && yt["state"] == "live" && yt["quality"] == "480p"
+        });
+        assert_eq!(destination(&s, "youtube")["detail"], "", "its own top quality isn't a step down");
+        assert!(s["stream"]["problems"].as_array().unwrap().is_empty(), "{}", s["stream"]["problems"]);
+
+        // 1.7 Mbps shared (about 1.19 to spend): Auto would pause YouTube (two 360p need 1.26).
+        // Advanced keeps it live on audio only (0.23) beside Facebook's 360p (0.63). The first
+        // estimate can come in under what audio only needs too; then YouTube pauses briefly and
+        // resumes on audio only once the manager probes back up. Either way, it ends there.
+        uplink.set(1700);
+        let slowed = Instant::now();
+        d.media_status(Duration::from_secs(90), "Facebook 360p, YouTube audio only, both live", |s| {
+            let (fb, yt) = (destination(s, "facebook"), destination(s, "youtube"));
+            fb["state"] == "live" && fb["quality"] == "360p" && yt["state"] == "live" && yt["quality"] == "audio"
+        });
+        println!("YouTube on audio only {:?} after the upload dropped", slowed.elapsed());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let told = loop {
+            let all = alerts.all();
+            let last = all.iter().rev().find(|a| a["destinationId"] == "youtube").cloned();
+            if let Some(a) = last.filter(|a| a["quality"] == "audio") {
+                break a;
+            }
+            assert!(Instant::now() < deadline, "no alert put YouTube on audio only: {all:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(told["message"].as_str().unwrap().contains("audio only"), "{told}");
+        let shown = engine_destinations(&d);
+        assert_eq!(shown.as_array().unwrap().iter().find(|x| x["id"] == "youtube").unwrap()["quality"], "audio");
+
+        // YouTube keeps getting segments, now small, within the ingestion rules.
+        let before = yt.segments().len();
+        yt.wait_segments(before + 3, Duration::from_secs(30));
+        let (name, bytes) = yt.segments().last().cloned().unwrap();
+        assert!(bytes < 150_000, "an audio-only segment is small: {name} is {bytes} bytes");
+        yt.assert_no_violations();
+        assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
     }
 
     #[test]

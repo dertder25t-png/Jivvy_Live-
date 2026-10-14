@@ -494,6 +494,8 @@ mod tests {
     #[test]
     fn fingerprints_follow_the_key_without_containing_it() {
         let d = |key: &str| Destination {
+            max_quality: None,
+            when_short: None,
             id: "yt".into(),
             name: String::new(),
             url: "https://a.upload.youtube.com/http_upload_hls".into(),

@@ -119,6 +119,8 @@ pub struct Engine {
     slide_count: u64,
     /// The run sheet and its revision, saved in `runsheet.json`.
     run_sheet: Option<crate::runsheet::Saved>,
+    /// Images arriving in pieces.
+    uploads: crate::images::Uploads,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
     subscribers: Vec<Outbox>,
@@ -176,6 +178,7 @@ impl Engine {
             store,
             slide_count: slide_count.max(1),
             run_sheet,
+            uploads: Default::default(),
             shown_since: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
@@ -543,7 +546,7 @@ impl Engine {
         if bytes.len() > protocol::MEDIA_CHUNK_BYTES {
             return protocol::nack(id, ErrorCode::BadArguments, "media.put piece too big");
         }
-        match crate::images::put(self.store.dir(), media, offset, &bytes, last) {
+        match crate::images::put(&mut self.uploads, self.store.dir(), media, offset, &bytes, last) {
             Ok(progress) => {
                 if progress.complete && last {
                     crate::log("engine", format!("image {} received ({} bytes)", &media[..12], progress.received));

@@ -41,6 +41,18 @@ pub fn serve(data_dir: &Path, url_path: &str) -> Option<(&'static str, Vec<u8>)>
     Some((content_type(&bytes)?, bytes))
 }
 
+/// Images arriving now: each one's hash so far and its first bytes (for its type), so the last
+/// piece is checked without reading the whole file again under the engine's lock. Kept in
+/// memory: after a restart an upload starts again from 0.
+#[derive(Default)]
+pub struct Uploads(std::collections::HashMap<String, Upload>);
+
+struct Upload {
+    received: u64,
+    hash: ring::digest::Context,
+    head: Vec<u8>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum PutError {
     /// Pieces must come in order; this is where the next one has to start.
@@ -53,19 +65,33 @@ pub enum PutError {
 
 /// Adds one piece of image `id` at `offset` (0 starts again); with `last`, checks it and puts
 /// it in place. An image already complete is acknowledged as it is.
-pub fn put(data_dir: &Path, id: &str, offset: u64, bytes: &[u8], last: bool) -> Result<MediaProgress, PutError> {
+pub fn put(
+    uploads: &mut Uploads,
+    data_dir: &Path,
+    id: &str,
+    offset: u64,
+    bytes: &[u8],
+    last: bool,
+) -> Result<MediaProgress, PutError> {
     let io = |e: std::io::Error| PutError::Io(e.to_string());
     let done = path(data_dir, id);
     if let Ok(meta) = fs::metadata(&done) {
+        uploads.0.remove(id);
         return Ok(MediaProgress { id: id.into(), received: meta.len(), complete: true });
     }
     fs::create_dir_all(dir(data_dir)).map_err(io)?;
     let part = dir(data_dir).join(format!("{id}.part"));
-    let have = if offset == 0 { 0 } else { fs::metadata(&part).map(|m| m.len()).unwrap_or(0) };
+    if offset == 0 {
+        let fresh = Upload { received: 0, hash: ring::digest::Context::new(&ring::digest::SHA256), head: Vec::new() };
+        uploads.0.insert(id.into(), fresh);
+    }
+    // Only an upload this engine has been following can carry on; anything else starts over.
+    let have = uploads.0.get(id).map_or(0, |u| u.received);
     if offset != have {
         return Err(PutError::Offset(have));
     }
     if have + bytes.len() as u64 > MAX_MEDIA_BYTES {
+        uploads.0.remove(id);
         let _ = fs::remove_file(&part);
         return Err(PutError::TooBig);
     }
@@ -76,19 +102,26 @@ pub fn put(data_dir: &Path, id: &str, offset: u64, bytes: &[u8], last: bool) -> 
         .truncate(offset == 0)
         .open(&part)
         .map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
-    let received = have + bytes.len() as u64;
+    if let Err(e) = file.write_all(bytes) {
+        uploads.0.remove(id); // the file may hold part of this piece: start again
+        return Err(io(e));
+    }
+    let upload = uploads.0.get_mut(id).expect("inserted above or checked by offset");
+    upload.received += bytes.len() as u64;
+    upload.hash.update(bytes);
+    let room = 12usize.saturating_sub(upload.head.len());
+    upload.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
+    let received = upload.received;
     if !last {
         return Ok(MediaProgress { id: id.into(), received, complete: false });
     }
+    let upload = uploads.0.remove(id).expect("present");
     file.sync_all().map_err(io)?;
     drop(file);
-    let all = fs::read(&part).map_err(io)?;
-    let digest = ring::digest::digest(&ring::digest::SHA256, &all);
-    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = upload.hash.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect();
     let problem = if hex != id {
         Some("the image didn't arrive intact; send it again")
-    } else if content_type(&all).is_none() {
+    } else if content_type(&upload.head).is_none() {
         Some("only JPEG, PNG or WebP images")
     } else {
         None
@@ -115,10 +148,16 @@ mod tests {
         let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
         let id: String =
             ring::digest::digest(&ring::digest::SHA256, &jpeg).as_ref().iter().map(|b| format!("{b:02x}")).collect();
-        assert!(put(&dir, &id, 0, &jpeg[..3], false).is_ok());
+        let mut up = Uploads::default();
+        assert!(put(&mut up, &dir, &id, 0, &jpeg[..3], false).is_ok());
         assert_eq!(serve(&dir, &format!("/{id}")), None, "not while it is still arriving");
-        assert_eq!(put(&dir, &id, 1, &jpeg[3..], true), Err(PutError::Offset(3)));
-        assert!(put(&dir, &id, 3, &jpeg[3..], true).unwrap().complete);
+        assert_eq!(put(&mut up, &dir, &id, 1, &jpeg[3..], true), Err(PutError::Offset(3)));
+        assert_eq!(
+            put(&mut Uploads::default(), &dir, &id, 3, &jpeg[3..], true),
+            Err(PutError::Offset(0)),
+            "an upload this engine didn't follow (a restart) starts over"
+        );
+        assert!(put(&mut up, &dir, &id, 3, &jpeg[3..], true).unwrap().complete);
         assert_eq!(serve(&dir, &format!("/{id}")), Some(("image/jpeg", jpeg.to_vec())));
         assert_eq!(serve(&dir, "/../state.json"), None);
         let _ = fs::remove_dir_all(&dir);

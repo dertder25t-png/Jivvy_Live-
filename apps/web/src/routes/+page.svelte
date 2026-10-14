@@ -132,7 +132,10 @@
       });
       if (!newest()) return;
       item.images = pages;
-      if (!item.title || item.title === "PDF slides") item.title = file.name.replace(/\.pdf$/i, "");
+      const name = file.name.replace(/\.pdf$/i, "");
+      // Named after the file unless someone has typed a title of their own.
+      if (!item.title || item.title === "PDF slides" || item.title === item.titleFrom) item.title = name;
+      item.titleFrom = name;
     } catch (e) {
       if (newest()) sendError = e instanceof Error ? e.message : String(e);
     } finally {

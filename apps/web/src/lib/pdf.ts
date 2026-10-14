@@ -4,6 +4,9 @@
  */
 import { MAX_HEIGHT, MAX_WIDTH, encode, keep } from "./media";
 
+/** Where this app serves pdf.js's decoders, fonts, character maps and colour profiles. */
+const ASSETS = "/pdfjs/";
+
 /** How much a page is scaled to fill the screen (a letter page is 612×792 points). */
 export function pageScale(w: number, h: number): number {
   return Math.min(MAX_WIDTH / w, MAX_HEIGHT / h);
@@ -19,7 +22,15 @@ async function pdfjs() {
 /** Every page of `file` as a kept image, in order. `progress` hears each page as it is done. */
 export async function addPdf(file: File, progress: (page: number, pages: number) => void): Promise<string[]> {
   const lib = await pdfjs();
-  const task = lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const task = lib.getDocument({
+    data: new Uint8Array(await file.arrayBuffer()),
+    // The files pdf.js loads when a PDF needs them, served with this app (vite.config.ts).
+    wasmUrl: `${ASSETS}wasm/`,
+    standardFontDataUrl: `${ASSETS}standard_fonts/`,
+    cMapUrl: `${ASSETS}cmaps/`,
+    cMapPacked: true,
+    iccUrl: `${ASSETS}iccs/`,
+  });
   const doc = await task.promise.catch(async () => {
     await task.destroy();
     throw new Error(`${file.name} isn't a PDF this browser can read.`);

@@ -27,6 +27,8 @@ export interface DraftItem {
   seconds?: number;
   /** Images and PDF slides: one slide per image id (kept in this browser, see media.ts). */
   images?: string[];
+  /** PDF slides: the title last taken from the file's name (a title typed by hand is kept). */
+  titleFrom?: string;
 }
 
 export interface Draft {

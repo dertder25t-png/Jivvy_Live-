@@ -173,7 +173,7 @@ impl Engine {
             crate::log("engine", format!("can't save the daemon id ({e}); using a temporary one"));
             devices::random_id(16)
         });
-        Engine {
+        let mut engine = Engine {
             state,
             store,
             slide_count: slide_count.max(1),
@@ -195,7 +195,10 @@ impl Engine {
             stream_destinations: Vec::new(),
             recording_report: None,
             last_sent: None,
-        }
+        };
+        // Left from before a crash: images no run sheet shows, pieces of uploads that stopped.
+        engine.prune_images();
+        engine
     }
 
     pub fn state(&self) -> &Snapshot {
@@ -567,6 +570,11 @@ impl Engine {
                 format!("images can be at most {} MB", protocol::MAX_MEDIA_BYTES / (1024 * 1024)),
             ),
             Err(crate::images::PutError::Corrupt(why)) => protocol::nack(id, ErrorCode::BadArguments, why),
+            Err(crate::images::PutError::Full) => protocol::nack(
+                id,
+                ErrorCode::Unavailable,
+                "the church computer's picture storage is full (2 GB); send a run sheet without old pictures first",
+            ),
             Err(crate::images::PutError::Io(e)) => {
                 crate::log("engine", format!("image save failed: {e}"));
                 protocol::nack(id, ErrorCode::Unavailable, "could not save the image; try again")
@@ -610,7 +618,19 @@ impl Engine {
             self.state = next;
         }
         self.broadcast();
+        self.prune_images();
         protocol::ack(id, Some(self.view()))
+    }
+
+    /// Keeps only the images the run sheet shows (and uploads arriving now), so the folder
+    /// never grows week after week.
+    fn prune_images(&mut self) {
+        let keep: std::collections::HashSet<&str> =
+            self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.as_deref()).collect();
+        let removed = crate::images::prune(self.store.dir(), &keep, &self.uploads);
+        if removed > 0 {
+            crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
+        }
     }
 
     /// A connection ended: its pairing request and proof go with it.
@@ -1280,6 +1300,11 @@ mod tests {
 
         let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
         assert_eq!(r["state"]["slide"], json!({ "lines": [], "image": id }));
+
+        // The next run sheet doesn't show it: the church computer doesn't keep it.
+        let next = json!({ "id": "next", "title": "", "items": [] });
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": next }));
+        assert!(!crate::images::has(&dir, &id));
     }
 
     #[test]

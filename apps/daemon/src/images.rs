@@ -18,6 +18,35 @@ pub fn path(data_dir: &Path, id: &str) -> PathBuf {
     dir(data_dir).join(id)
 }
 
+/// Most space all images (complete and arriving) may take: a full service is a few hundred MB
+/// at most, and no device can fill the disk the recording needs.
+pub const MAX_STORAGE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Bytes the images folder holds now.
+pub fn usage(data_dir: &Path) -> u64 {
+    fs::read_dir(dir(data_dir))
+        .map(|d| d.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .unwrap_or(0)
+}
+
+/// Removes images the run sheet doesn't show (`keep`) and pieces of uploads this engine isn't
+/// following (left by a crash or an abandoned send). Returns how many files went.
+pub fn prune(data_dir: &Path, keep: &std::collections::HashSet<&str>, uploads: &Uploads) -> usize {
+    let Ok(entries) = fs::read_dir(dir(data_dir)) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = match name.strip_suffix(".part") {
+            Some(id) => !uploads.0.contains_key(id),
+            None => !keep.contains(name.as_str()),
+        };
+        if stale && entry.metadata().is_ok_and(|m| m.is_file()) && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub fn has(data_dir: &Path, id: &str) -> bool {
     path(data_dir, id).is_file()
 }
@@ -60,6 +89,8 @@ pub enum PutError {
     TooBig,
     /// The bytes don't hash to the id, or aren't an image: start again from 0.
     Corrupt(&'static str),
+    /// All images together would pass MAX_STORAGE.
+    Full,
     Io(String),
 }
 
@@ -89,6 +120,9 @@ pub fn put(
     let have = uploads.0.get(id).map_or(0, |u| u.received);
     if offset != have {
         return Err(PutError::Offset(have));
+    }
+    if usage(data_dir) + bytes.len() as u64 > MAX_STORAGE {
+        return Err(PutError::Full);
     }
     if have + bytes.len() as u64 > MAX_MEDIA_BYTES {
         uploads.0.remove(id);
@@ -160,6 +194,28 @@ mod tests {
         assert!(put(&mut up, &dir, &id, 3, &jpeg[3..], true).unwrap().complete);
         assert_eq!(serve(&dir, &format!("/{id}")), Some(("image/jpeg", jpeg.to_vec())));
         assert_eq!(serve(&dir, "/../state.json"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_keeps_what_the_run_sheet_shows_and_uploads_still_arriving() {
+        let dir = std::env::temp_dir().join(format!("jivvy-prune-{}-{}", std::process::id(), crate::now_ms()));
+        let hash = |b: &[u8]| -> String {
+            ring::digest::digest(&ring::digest::SHA256, b).as_ref().iter().map(|x| format!("{x:02x}")).collect()
+        };
+        let (shown, unused, arriving) = ([0xFF, 0xD8, 0xFF, 1], [0xFF, 0xD8, 0xFF, 2], [0xFF, 0xD8, 0xFF, 3]);
+        let mut up = Uploads::default();
+        for img in [&shown, &unused] {
+            put(&mut up, &dir, &hash(img), 0, img, true).unwrap();
+        }
+        put(&mut up, &dir, &hash(&arriving), 0, &arriving[..2], false).unwrap();
+        fs::write(super::dir(&dir).join(format!("{}.part", "c".repeat(64))), b"left by a crash").unwrap();
+
+        let keep = [hash(&shown)];
+        let keep: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+        assert_eq!(prune(&dir, &keep, &up), 2, "the unused image and the abandoned piece");
+        assert!(has(&dir, &hash(&shown)) && !has(&dir, &hash(&unused)));
+        assert!(put(&mut up, &dir, &hash(&arriving), 2, &arriving[2..], true).unwrap().complete, "still arriving");
         let _ = fs::remove_dir_all(&dir);
     }
 }

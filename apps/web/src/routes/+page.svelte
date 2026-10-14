@@ -75,21 +75,28 @@
   });
   onDestroy(() => conn?.close());
 
+  /** One send at a time: a second one mid-upload would restart the same images and race the first. */
+  let inFlight = $state(false);
   async function send() {
-    if (!conn) return;
+    if (!conn || inFlight) return;
+    inFlight = true;
     sendError = "";
-    // Built now, not the copy kept for the editor: a countdown whose time has passed while
-    // the page was open counts down to the next one, not to a moment already gone.
-    builtAt = new Date();
-    const sheet = build(draft, builtAt);
-    // Images first: the church computer refuses a run sheet showing one it doesn't have.
-    const failed = await upload(conn, imagesIn(sheet), (done, total) => {
-      sending = total ? `Sending images ${done} of ${total}…` : "";
-    });
-    sending = "";
-    if (failed) return void (sendError = failed);
-    const ack = await conn.send({ type: "runsheet.set", runSheet: sheet });
-    if (!ack.ok) sendError = ack.message;
+    try {
+      // Built now, not the copy kept for the editor: a countdown whose time has passed while
+      // the page was open counts down to the next one, not to a moment already gone.
+      builtAt = new Date();
+      const sheet = build(draft, builtAt);
+      // Images first: the church computer refuses a run sheet showing one it doesn't have.
+      const failed = await upload(conn, imagesIn(sheet), (done, total) => {
+        sending = total ? `Sending images ${done} of ${total}…` : "";
+      });
+      if (failed) return void (sendError = failed);
+      const ack = await conn.send({ type: "runsheet.set", runSheet: sheet });
+      if (!ack.ok) sendError = ack.message;
+    } finally {
+      sending = "";
+      inFlight = false;
+    }
   }
 
   let adding = $state("");
@@ -277,7 +284,7 @@
     </div>
 
     <div class="send">
-      <button class="primary" onclick={send} disabled={!ready}>Send to screens</button>
+      <button class="primary" onclick={send} disabled={!ready || inFlight}>Send to screens</button>
       <span class="hint">
         {#if !ready}Connect to send.
         {:else if sending}{sending}

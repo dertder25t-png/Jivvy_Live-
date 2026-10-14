@@ -33,8 +33,9 @@
     let size = Math.round(canvas.h * 0.09);
     slide.style.fontSize = size + "px";
     // Too tall, or too wide (a word that can't break): smaller until it fits.
-    while ((slide.scrollHeight > canvas.h * 0.92 || slide.scrollWidth > slide.clientWidth) && size > 12) {
-      size = Math.floor(size * 0.92);
+    // No floor: small canvases (an LED strip) get small text rather than text cut off.
+    while ((slide.scrollHeight > canvas.h * 0.92 || slide.scrollWidth > slide.clientWidth) && size > 1) {
+      size = Math.max(1, Math.floor(size * 0.92));
       slide.style.fontSize = size + "px";
     }
   }

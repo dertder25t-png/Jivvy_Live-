@@ -33,28 +33,36 @@ pub fn usage(data_dir: &Path) -> u64 {
 /// uploads arriving was taken (pruning runs on its own thread).
 const FRESH_PART: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Removes images the run sheet doesn't show (`keep`) and pieces of uploads not arriving now
-/// (`arriving`; left by a crash or an abandoned send). Returns how many files went.
+/// Removes images not in `keep` (what the run sheet shows, and what devices sent since) and
+/// pieces of uploads not arriving now (`arriving`; left by a crash or an abandoned send).
+/// `keep` is checked under its lock right before each image is removed, so the engine can add
+/// to it while this runs and nothing it adds is ever deleted. Returns how many files went.
 pub fn prune(
     data_dir: &Path,
-    keep: &std::collections::HashSet<String>,
+    keep: &std::sync::Mutex<std::collections::HashSet<String>>,
     arriving: &std::collections::HashSet<String>,
 ) -> usize {
     let Ok(entries) = fs::read_dir(dir(data_dir)) else { return 0 };
     let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let stale = match name.strip_suffix(".part") {
+        if !entry.metadata().is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let gone = match name.strip_suffix(".part") {
             Some(id) => {
                 let fresh = entry
                     .metadata()
                     .and_then(|m| m.modified())
                     .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < FRESH_PART));
-                !arriving.contains(id) && !fresh
+                !arriving.contains(id) && !fresh && fs::remove_file(entry.path()).is_ok()
             }
-            None => !keep.contains(&name),
+            None => {
+                let keep = keep.lock().unwrap_or_else(|p| p.into_inner());
+                !keep.contains(&name) && fs::remove_file(entry.path()).is_ok()
+            }
         };
-        if stale && entry.metadata().is_ok_and(|m| m.is_file()) && fs::remove_file(entry.path()).is_ok() {
+        if gone {
             removed += 1;
         }
     }
@@ -273,7 +281,7 @@ mod tests {
         fs::File::options().write(true).open(&old).unwrap().set_modified(a_while_ago).unwrap();
         fs::write(super::dir(&dir).join(format!("{}.part", "d".repeat(64))), b"just started").unwrap();
 
-        let keep = std::collections::HashSet::from([hash(&shown)]);
+        let keep = std::sync::Mutex::new(std::collections::HashSet::from([hash(&shown)]));
         assert_eq!(prune(&dir, &keep, &up.ids()), 2, "the unused image and the abandoned piece");
         assert!(has(&dir, &hash(&shown)) && !has(&dir, &hash(&unused)));
         assert!(put(&mut up, &dir, &hash(&arriving), 2, &arriving[2..], true).unwrap().complete, "still arriving");

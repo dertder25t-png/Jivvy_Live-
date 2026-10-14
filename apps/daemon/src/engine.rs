@@ -7,8 +7,9 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::devices::{self, Devices};
@@ -33,6 +34,8 @@ pub const RECORDING_REPORT_STALE: Duration = Duration::from_secs(3);
 /// acks and events never interleave mid-line.
 #[derive(Clone)]
 pub struct Outbox {
+    /// Tells connections apart (one may both subscribe and ask for a result).
+    id: u64,
     tx: SyncSender<Vec<u8>>,
     /// Closed if the client stops reading, so it reconnects and gets fresh state.
     stream: Option<Arc<TcpStream>>,
@@ -40,7 +43,8 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn new(tx: SyncSender<Vec<u8>>, stream: Option<Arc<TcpStream>>) -> Self {
-        Outbox { tx, stream }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Outbox { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), tx, stream }
     }
 }
 
@@ -88,6 +92,7 @@ fn device_may(command: &Command) -> bool {
             | Command::RecordingStop
             | Command::StateGet
             | Command::StateSubscribe
+            | Command::StreamPreflight
     )
 }
 
@@ -121,6 +126,13 @@ pub struct Engine {
     /// The video process's latest report on the recording: its status, whether the disk is
     /// running low, and when it came.
     recording_report: Option<(RecordingStatus, bool, Instant)>,
+    /// This engine, for work that finishes later on its own thread (the upload test).
+    handle: Option<Weak<Mutex<Engine>>>,
+    upload_test_url: String,
+    /// Set while the upload test runs; storing true stops it.
+    preflight_cancel: Option<Arc<AtomicBool>>,
+    /// Connections that asked for the result, which they get even if not subscribed.
+    preflight_askers: Vec<Outbox>,
     /// The view subscribers last received, so `tick` only sends real changes.
     last_sent: Option<StateSnapshot>,
 }
@@ -148,6 +160,10 @@ impl Engine {
             pairing_until: None,
             pending: Vec::new(),
             proven: Vec::new(),
+            handle: None,
+            upload_test_url: crate::preflight::DEFAULT_URL.into(),
+            preflight_cancel: None,
+            preflight_askers: Vec::new(),
             stream_report: None,
             stream_destinations: Vec::new(),
             recording_report: None,
@@ -301,6 +317,13 @@ impl Engine {
                 });
                 return self.devices_ack(id);
             }
+            Command::StreamPreflight => {
+                // The test would take the stream's bandwidth.
+                if self.state.stream_wanted {
+                    return protocol::nack(id, ErrorCode::Unavailable, "the upload test can't run while streaming");
+                }
+                return self.start_preflight(id, outbox);
+            }
             Command::PairRequest { .. } | Command::AuthHello { .. } | Command::AuthProve { .. } => {
                 return protocol::nack(id, ErrorCode::BadArguments, "the church computer doesn't need to pair");
             }
@@ -314,7 +337,13 @@ impl Engine {
             }
             Command::OutputBlack { on } => next.black = on,
             // Saved like the slide, so a crash mid-service resumes streaming by itself.
-            Command::StreamStart => next.stream_wanted = true,
+            Command::StreamStart => {
+                // A running upload test stops: the stream needs the bandwidth.
+                if let Some(cancel) = &self.preflight_cancel {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                next.stream_wanted = true
+            }
             Command::StreamStop => next.stream_wanted = false,
             Command::StreamReport { status, destinations } => {
                 let now = Instant::now();
@@ -395,6 +424,52 @@ impl Engine {
         if self.pending.len() != before {
             self.pairing_changed(Instant::now());
         }
+    }
+
+    /// Lets the engine finish work on other threads (the upload test) and tell everyone.
+    pub fn set_handle(&mut self, handle: Weak<Mutex<Engine>>) {
+        self.handle = Some(handle);
+    }
+
+    pub fn set_upload_test_url(&mut self, url: impl Into<String>) {
+        self.upload_test_url = url.into();
+    }
+
+    /// Starts the upload test on its own thread; the result goes to every subscriber.
+    fn start_preflight(&mut self, id: &str, outbox: Option<&Outbox>) -> Ack {
+        let measuring = AckExtras { preflight: Some(crate::preflight::measuring()), ..Default::default() };
+        if self.handle.is_some() {
+            self.preflight_askers.extend(outbox.cloned());
+        }
+        if self.preflight_cancel.is_some() {
+            return protocol::ack_with(id, Some(self.view()), measuring);
+        }
+        let Some(handle) = self.handle.clone() else {
+            return protocol::nack(id, ErrorCode::Unavailable, "the upload test can't run here");
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preflight_cancel = Some(cancel.clone());
+        let (dir, url) = (self.store.dir().to_path_buf(), self.upload_test_url.clone());
+        crate::log("engine", "pre-flight: testing the upload");
+        std::thread::spawn(move || {
+            let result = crate::preflight::run(&dir, &url, cancel);
+            let Some(engine) = handle.upgrade() else { return };
+            let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
+            e.preflight_cancel = None;
+            crate::log("engine", format!("pre-flight: {} {}", result.summary, result.message.as_deref().unwrap_or("")));
+            if let Ok(line) = serde_json::to_vec(&protocol::preflight_event(&result)) {
+                // Those who asked and aren't subscribed get it directly.
+                let mut direct = line.clone();
+                direct.push(b'\n');
+                for asker in std::mem::take(&mut e.preflight_askers) {
+                    if !e.subscribers.iter().any(|s| s.id == asker.id) {
+                        let _ = asker.tx.try_send(direct.clone());
+                    }
+                }
+                e.send_to_subscribers(line);
+            }
+        });
+        protocol::ack_with(id, Some(self.view()), measuring)
     }
 
     pub fn daemon_id(&self) -> &str {
@@ -1580,6 +1655,71 @@ mod tests {
         let state = send(&mut e, json!({ "type": "state.get" }))["state"].clone();
         assert_eq!(state["stream"], "live");
         assert!(state.get("streamDestinations").is_none());
+    }
+
+    /// An engine that can finish work on other threads, as the real one can.
+    fn shared_engine(name: &str, url: &str) -> Arc<Mutex<Engine>> {
+        let (e, _) = engine(name, 10);
+        let shared = Arc::new(Mutex::new(e));
+        let mut e = shared.lock().unwrap();
+        e.set_handle(Arc::downgrade(&shared));
+        e.set_upload_test_url(url);
+        drop(e);
+        shared
+    }
+
+    fn wait_event(rx: &std::sync::mpsc::Receiver<Vec<u8>>, name: &str) -> Value {
+        loop {
+            let b = rx.recv_timeout(Duration::from_secs(20)).expect("an event in time");
+            let v: Value = serde_json::from_slice(&b).unwrap();
+            if v["event"] == name {
+                return v;
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_tests_the_upload_and_everyone_hears_what_each_platform_will_get() {
+        let shared = shared_engine("preflight", &crate::preflight::tests::fake_endpoint(20_000));
+        std::fs::write(
+            shared.lock().unwrap().store.dir().join("stream.json"),
+            r#"{"version":1,"destinations":[{"id":"youtube","name":"YouTube","url":"rtmps://h/live2","key":"k"}]}"#,
+        )
+        .unwrap();
+        let (tx, screen) = sync_channel(64);
+        shared
+            .lock()
+            .unwrap()
+            .handle_line_from(&envelope(json!({ "type": "state.subscribe" })), Some(&Outbox::new(tx, None)));
+        // Asked by a connection that isn't subscribed: it gets the result too, once.
+        let (tx, asker) = sync_channel(64);
+        let ack = shared
+            .lock()
+            .unwrap()
+            .handle_line_from(&envelope(json!({ "type": "stream.preflight" })), Some(&Outbox::new(tx, None)));
+        let ack = serde_json::to_value(ack).unwrap();
+        assert_eq!(ack["preflight"]["status"], "measuring");
+        let heard = wait_event(&screen, "preflight");
+        assert_eq!(heard["preflight"]["summary"], "YouTube 1080p", "{heard}");
+        assert_eq!(heard["preflight"]["measured"], true);
+        assert_eq!(wait_event(&asker, "preflight"), heard);
+        assert!(asker.try_recv().is_err(), "once");
+    }
+
+    #[test]
+    fn preflight_never_runs_while_streaming_and_the_stream_starting_stops_it() {
+        let shared = shared_engine("preflight-stream", &crate::preflight::tests::fake_endpoint(1_000));
+        let (tx, screen) = sync_channel(64);
+        let mut e = shared.lock().unwrap();
+        e.handle_line_from(&envelope(json!({ "type": "state.subscribe" })), Some(&Outbox::new(tx, None)));
+        assert_eq!(send(&mut e, json!({ "type": "stream.preflight" }))["preflight"]["status"], "measuring");
+        send(&mut e, json!({ "type": "stream.start" }));
+        drop(e);
+        let heard = wait_event(&screen, "preflight");
+        assert_eq!(heard["preflight"]["status"], "failed");
+        assert!(heard["preflight"]["message"].as_str().unwrap().contains("the stream started"));
+        let mut e = shared.lock().unwrap();
+        assert_eq!(send(&mut e, json!({ "type": "stream.preflight" }))["code"], "unavailable");
     }
 
     #[test]

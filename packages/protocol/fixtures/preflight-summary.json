@@ -1,0 +1,11 @@
+{
+  "about": "The pre-flight streaming line for a set of platforms (preflightSummary in packages/protocol, preflight_summary in the Rust daemon). Both must give exactly these. Add cases; change wording only on purpose, in both places.",
+  "cases": [
+    {"name": "nothing set up", "destinations": [], "expect": "No streaming platforms are set up."},
+    {"name": "everyone fits", "destinations": [{"id": "yt", "name": "YouTube", "quality": "1080p"}, {"id": "fb", "name": "Facebook", "quality": "720p"}], "expect": "YouTube 1080p + Facebook 720p"},
+    {"name": "one paused", "destinations": [{"id": "yt", "name": "YouTube", "quality": "360p"}, {"id": "fb", "name": "Facebook", "quality": ""}], "expect": "YouTube 360p. Facebook won't fit and would be paused."},
+    {"name": "audio only", "destinations": [{"id": "fb", "name": "Facebook", "quality": "360p"}, {"id": "yt", "name": "YouTube", "quality": "audio"}], "expect": "Facebook 360p + YouTube audio only"},
+    {"name": "two paused, no name falls back to the id", "destinations": [{"id": "yt", "name": "YouTube", "quality": "360p"}, {"id": "fb", "name": "", "quality": ""}, {"id": "vimeo", "name": "Vimeo", "quality": ""}], "expect": "YouTube 360p. fb, Vimeo won't fit and would be paused."},
+    {"name": "nothing fits", "destinations": [{"id": "yt", "name": "YouTube", "quality": ""}], "expect": "YouTube won't fit and would be paused."}
+  ]
+}

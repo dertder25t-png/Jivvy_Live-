@@ -18,6 +18,7 @@ pub mod hls;
 pub mod lyrics;
 pub mod media;
 pub mod outputs;
+pub mod preflight;
 pub mod program;
 pub mod protocol;
 pub mod recording;

@@ -70,6 +70,12 @@ export type Command =
   | { type: "auth.hello"; publicKey: string }
   /** ECDSA P-256 / SHA-256 signature (r||s, 64 bytes, base64url) over authMessage(daemonId, challenge). */
   | { type: "auth.prove"; signature: string }
+  /**
+   * Added in v1 without a version bump. Measures the upload (a few seconds) and answers with a
+   * `preflight` event: what each platform will get, e.g. "YouTube 1080p + Facebook 720p".
+   * Never while streaming (`unavailable`): the test would take the stream's bandwidth.
+   */
+  | { type: "stream.preflight" }
   /** Church computer only. */
   | { type: "device.list" }
   /** Church computer only. Removing a device ends its open connections at once. */
@@ -183,6 +189,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "pair.open":
     case "pair.close":
     case "device.list":
+    case "stream.preflight":
       return { ok: true, command: { type: raw.type } };
     case "pair.request": {
       const name = deviceName(raw.name);
@@ -324,6 +331,44 @@ export interface DeviceInfo {
   pairedAt: number;
 }
 
+/** One platform in the pre-flight summary. */
+export interface PreflightDestination {
+  id: string;
+  name: string;
+  /** What it will get ("1080p", ..., "audio"), or "" if it won't fit and would be paused. */
+  quality: string;
+}
+
+export interface Preflight {
+  /** `measuring` while the upload test runs; `done` with a result; `failed` with none at all. */
+  status: "measuring" | "done" | "failed";
+  /** The upload speed the summary is for, kbps. */
+  uploadKbps?: number;
+  /** True if measured just now; false if the test couldn't run and this is the last speed measured. */
+  measured?: boolean;
+  /** When that speed was measured, ms since epoch. */
+  measuredAt?: number;
+  destinations: PreflightDestination[];
+  /** One plain-English line, e.g. "YouTube 1080p + Facebook 720p". */
+  summary: string;
+  /** Why it failed or fell back, in words a tech lead can act on. */
+  message?: string;
+}
+
+/**
+ * The pre-flight line for these platforms. Shared by both daemons, so they say exactly the same
+ * thing (fixtures/preflight-summary.json).
+ */
+export function preflightSummary(destinations: PreflightDestination[]): string {
+  if (destinations.length === 0) return "No streaming platforms are set up.";
+  const name = (d: PreflightDestination) => d.name || d.id;
+  const fits = destinations.filter((d) => d.quality).map((d) => `${name(d)} ${d.quality === "audio" ? "audio only" : d.quality}`);
+  const paused = destinations.filter((d) => !d.quality).map(name);
+  const pausedLine = paused.length ? `${paused.join(", ")} won't fit and would be paused.` : "";
+  if (!fits.length) return pausedLine;
+  return paused.length ? `${fits.join(" + ")}. ${pausedLine}` : fits.join(" + ");
+}
+
 /** Fields an ok ack may carry besides `state`; each was added in v1 and only some commands send them. */
 export interface AckExtras {
   /** pair.open, pair.close, pair.approve, pair.deny */
@@ -337,6 +382,8 @@ export interface AckExtras {
   deviceId?: string;
   /** device.list, device.remove */
   devices?: DeviceInfo[];
+  /** stream.preflight: `measuring`; the result follows as a `preflight` event. */
+  preflight?: Preflight;
 }
 
 export type Ack =
@@ -359,6 +406,8 @@ export type DaemonEvent =
   | { v: number; event: "levels"; levels: Levels }
   /** To the church computer's subscribers whenever pairing opens, closes or gets a request. */
   | { v: number; event: "pairing"; pairing: PairingStatus }
+  /** The pre-flight streaming summary, when the upload test finishes. */
+  | { v: number; event: "preflight"; preflight: Preflight }
   /** Something the tech lead should know about, in plain words (e.g. a platform lowered or paused). */
   | { v: number; event: "alert"; alert: Alert }
   /** To the device that asked to pair, once the church computer answers. */

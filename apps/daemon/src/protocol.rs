@@ -79,6 +79,9 @@ pub enum Command {
     AuthProve { signature: String },
     #[serde(rename = "device.list")]
     DeviceList,
+    /// Measure the upload and say what each platform will get; never while streaming.
+    #[serde(rename = "stream.preflight")]
+    StreamPreflight,
     #[serde(rename = "device.remove")]
     DeviceRemove {
         #[serde(rename = "deviceId")]
@@ -387,6 +390,69 @@ pub struct AckExtras {
     pub device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub devices: Option<Vec<DeviceInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<Preflight>,
+}
+
+/// One platform in the pre-flight summary.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct PreflightDestination {
+    pub id: String,
+    pub name: String,
+    /// What it will get ("1080p", ..., "audio"), or "" if it won't fit and would be paused.
+    pub quality: String,
+}
+
+/// The pre-flight streaming summary (same shape as the TypeScript `Preflight`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preflight {
+    /// "measuring", "done" or "failed".
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_kbps: Option<f64>,
+    /// True if measured just now; false if this is the last speed measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_at: Option<u64>,
+    pub destinations: Vec<PreflightDestination>,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PreflightEvent<'a> {
+    pub v: u32,
+    pub event: &'static str,
+    pub preflight: &'a Preflight,
+}
+
+pub fn preflight_event(preflight: &Preflight) -> PreflightEvent<'_> {
+    PreflightEvent { v: PROTOCOL_VERSION, event: "preflight", preflight }
+}
+
+/// The pre-flight line for these platforms, word for word as the TypeScript
+/// `preflightSummary` (packages/protocol/fixtures/preflight-summary.json).
+pub fn preflight_summary(destinations: &[PreflightDestination]) -> String {
+    if destinations.is_empty() {
+        return "No streaming platforms are set up.".into();
+    }
+    let name = |d: &PreflightDestination| if d.name.is_empty() { d.id.clone() } else { d.name.clone() };
+    let fits: Vec<String> = destinations
+        .iter()
+        .filter(|d| !d.quality.is_empty())
+        .map(|d| format!("{} {}", name(d), if d.quality == "audio" { "audio only" } else { &d.quality }))
+        .collect();
+    let paused: Vec<String> = destinations.iter().filter(|d| d.quality.is_empty()).map(name).collect();
+    let paused_line =
+        if paused.is_empty() { String::new() } else { format!("{} won't fit and would be paused.", paused.join(", ")) };
+    match (fits.is_empty(), paused.is_empty()) {
+        (true, _) => paused_line,
+        (false, true) => fits.join(" + "),
+        (false, false) => format!("{}. {paused_line}", fits.join(" + ")),
+    }
 }
 
 // Built once per command and sent straight away; boxing the ok case would buy nothing.
@@ -520,6 +586,7 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "pair.open" => Command::PairOpen,
         "pair.close" => Command::PairClose,
         "device.list" => Command::DeviceList,
+        "stream.preflight" => Command::StreamPreflight,
         "pair.request" => match (public_key(obj.get("publicKey")), device_name(obj.get("name"))) {
             (Some(public_key), Some(name)) => Command::PairRequest { public_key, name },
             _ => {
@@ -668,6 +735,16 @@ mod tests {
         for c in cases {
             let got = serde_json::to_value(stream_alerts(&list(&c["before"]), &list(&c["after"]))).unwrap();
             assert_eq!(got, c["expect"], "{}", c["name"]);
+        }
+    }
+
+    #[test]
+    fn preflight_summaries_match_the_typescript_ones_word_for_word() {
+        const CASES: &str = include_str!("../../../packages/protocol/fixtures/preflight-summary.json");
+        let doc: Value = serde_json::from_str(CASES).unwrap();
+        for c in doc["cases"].as_array().unwrap() {
+            let list: Vec<PreflightDestination> = serde_json::from_value(c["destinations"].clone()).unwrap();
+            assert_eq!(preflight_summary(&list), c["expect"].as_str().unwrap(), "{}", c["name"]);
         }
     }
 

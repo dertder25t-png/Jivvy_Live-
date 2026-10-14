@@ -32,8 +32,7 @@ path = "src/bin/video/main.rs"
 required-features = ["video"]
 
 [features]
-# The HTTP client is for YouTube's HLS segment upload.
-video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:ureq"]
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 ab_glyph = "0.2"
@@ -52,7 +51,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 # The command channel over WebSocket (same envelopes as the TCP one).
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
-ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
+# HTTP: YouTube's HLS segment upload, and the pre-flight upload test.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 wry = "0.57"
 
 [dev-dependencies]

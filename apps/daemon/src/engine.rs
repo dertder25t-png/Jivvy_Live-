@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{self, Ack, Command, ErrorCode, RecordingStatus, StateSnapshot, StreamStatus};
 use crate::snapshot::{Snapshot, Store};
+use crate::tls::TlsFiles;
 
 /// Longest line accepted on the command channel; protocol messages are tiny.
 const MAX_LINE: usize = 16 * 1024;
@@ -344,22 +345,69 @@ impl WsAccess {
 
 /// Serves the same protocol over WebSocket: one envelope per text message in, and the same
 /// acks and events out, one per text message (the TCP channel's lines, without the newline).
-pub fn serve_ws(listener: TcpListener, engine: Arc<Mutex<Engine>>, access: Arc<WsAccess>) {
+/// With `tls`, every connection is `wss://` with the church's certificate; there is no plain
+/// fallback.
+pub fn serve_ws(listener: TcpListener, engine: Arc<Mutex<Engine>>, access: Arc<WsAccess>, tls: Option<Arc<TlsFiles>>) {
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let (engine, access) = (engine.clone(), access.clone());
+        let (engine, access, tls) = (engine.clone(), access.clone(), tls.clone());
         std::thread::spawn(move || {
-            let _ = serve_ws_connection(stream, &engine, &access);
+            let _ = serve_ws_connection(stream, &engine, &access, tls.as_deref());
         });
     }
 }
 
-fn serve_ws_connection(stream: TcpStream, engine: &Mutex<Engine>, access: &WsAccess) -> std::io::Result<()> {
-    use tungstenite::{Error, Message, handshake::server::ErrorResponse, http::StatusCode};
-
+fn serve_ws_connection(
+    stream: TcpStream,
+    engine: &Mutex<Engine>,
+    access: &WsAccess,
+    tls: Option<&TlsFiles>,
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(WS_HANDSHAKE_TIMEOUT))?;
     let shared = Arc::new(stream.try_clone()?);
+    let result = match tls {
+        None => ws_session(stream, &shared, engine, access),
+        // No good certificate yet: refuse rather than serve in plain text.
+        Some(tls) => match tls.config() {
+            Some(config) => {
+                let conn = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
+                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access)
+            }
+            None => Ok(()),
+        },
+    };
+    let _ = shared.shutdown(Shutdown::Both);
+    result
+}
+
+/// The socket under a WebSocket's stream, plain or TLS.
+trait OverTcp: Read + Write {
+    fn tcp(&self) -> &TcpStream;
+}
+
+impl OverTcp for TcpStream {
+    fn tcp(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl OverTcp for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn tcp(&self) -> &TcpStream {
+        self.get_ref()
+    }
+}
+
+/// One WebSocket connection over `stream` (a plain socket, or TLS over it); `socket` is a
+/// clone of that socket, for the outbox to cut a stuck connection.
+fn ws_session<S: OverTcp>(
+    stream: S,
+    socket: &Arc<TcpStream>,
+    engine: &Mutex<Engine>,
+    access: &WsAccess,
+) -> std::io::Result<()> {
+    use tungstenite::{Error, Message, handshake::server::ErrorResponse, http::StatusCode};
+
     // The error type is tungstenite's handshake `Callback` contract, so it can't be boxed.
     #[allow(clippy::result_large_err)]
     let check_origin = |req: &tungstenite::handshake::server::Request, resp| {
@@ -378,17 +426,18 @@ fn serve_ws_connection(stream: TcpStream, engine: &Mutex<Engine>, access: &WsAcc
     let Ok(mut ws) = tungstenite::accept_hdr_with_config(stream, check_origin, Some(config)) else {
         return Ok(());
     };
-    ws.get_ref().set_read_timeout(Some(WS_POLL))?;
+    // On the handle being read: on Windows a clone's timeout doesn't apply to it.
+    ws.get_ref().tcp().set_read_timeout(Some(WS_POLL))?;
 
     let (tx, rx) = sync_channel::<Vec<u8>>(OUTBOX_CAPACITY);
-    let outbox = Outbox::new(tx, Some(shared.clone()));
+    let outbox = Outbox::new(tx, Some(socket.clone()));
     let as_message = |mut bytes: Vec<u8>| {
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
         }
         Message::text(String::from_utf8_lossy(&bytes).into_owned())
     };
-    let result = loop {
+    loop {
         let ack = match ws.read() {
             Ok(Message::Text(text)) if text.trim().is_empty() => None,
             Ok(Message::Text(text)) => {
@@ -431,9 +480,7 @@ fn serve_ws_connection(stream: TcpStream, engine: &Mutex<Engine>, access: &WsAcc
             Err(Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
             Err(_) => break Ok(()),
         }
-    };
-    let _ = shared.shutdown(Shutdown::Both);
-    result
+    }
 }
 
 #[cfg(test)]
@@ -769,7 +816,7 @@ mod tests {
         let access = Arc::new(WsAccess { origins: origins.iter().map(|o| o.to_string()).collect() });
         let e2 = engine.clone();
         std::thread::spawn(move || serve(tcp, e2));
-        std::thread::spawn(move || serve_ws(ws, engine, access));
+        std::thread::spawn(move || serve_ws(ws, engine, access, None));
         addrs
     }
 
@@ -869,5 +916,116 @@ mod tests {
         let mut ws = ws_connect(ws_addr, None).unwrap();
         ws_send(&mut ws, &"x".repeat(MAX_LINE + 10));
         assert_eq!(ws_next(&mut ws)["message"], "message too long");
+    }
+
+    type Wss = tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
+    const CHURCH: &str = "church.d.jivvy.org";
+
+    /// An engine serving `wss://` with whatever is in `cert` and `key`.
+    fn serve_tls(name: &str, cert: &std::path::Path, key: &std::path::Path) -> std::net::SocketAddr {
+        let (e, _) = engine(name, 10);
+        let ws = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let addr = ws.local_addr().unwrap();
+        let tls = Some(Arc::new(TlsFiles::new(cert, key)));
+        std::thread::spawn(move || serve_ws(ws, Arc::new(Mutex::new(e)), Arc::new(WsAccess::default()), tls));
+        addr
+    }
+
+    /// Connects trusting only `ca_pem`, as a browser trusts only real certificate authorities.
+    fn wss_connect(addr: std::net::SocketAddr, ca_pem: &str) -> Result<Wss, String> {
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ca_pem.as_bytes()).unwrap()).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(Arc::new(config), ServerName::try_from(CHURCH).unwrap()).unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tungstenite::client(format!("wss://{CHURCH}/"), rustls::StreamOwned::new(conn, stream))
+            .map(|(ws, _)| ws)
+            .map_err(|e| e.to_string())
+    }
+
+    fn wss_ask(ws: &mut Wss, command: &str) -> Value {
+        let msg = format!(r#"{{"v":1,"id":"q","ts":1,"command":{{"type":"{command}"}}}}"#);
+        ws.send(tungstenite::Message::text(msg)).unwrap();
+        loop {
+            if let tungstenite::Message::Text(t) = ws.read().unwrap() {
+                return serde_json::from_str(&t).unwrap();
+            }
+        }
+    }
+
+    fn write_pair(dir: &std::path::Path, cert: &str, key: &str) {
+        std::fs::write(dir.join("cert.pem"), cert).unwrap();
+        std::fs::write(dir.join("key.pem"), key).unwrap();
+    }
+
+    #[test]
+    fn wss_carries_the_protocol_and_never_falls_back_to_plain_ws() {
+        let dir = crate::tls::tests::temp("wss");
+        let (ca, cert, key) = crate::tls::tests::test_pair(CHURCH);
+        write_pair(&dir, &cert, &key);
+        let addr = serve_tls("wss", &dir.join("cert.pem"), &dir.join("key.pem"));
+
+        let mut ws = wss_connect(addr, &ca).unwrap();
+        assert_eq!(wss_ask(&mut ws, "slide.next")["state"]["slideIndex"], 1);
+        // Events reach a quiet subscriber over TLS too.
+        assert_eq!(wss_ask(&mut ws, "state.subscribe")["ok"], true);
+        let mut other = wss_connect(addr, &ca).unwrap();
+        let sent = Instant::now();
+        for _ in 0..20 {
+            wss_ask(&mut other, "slide.next");
+        }
+        for want in 2..=11 {
+            let event = loop {
+                if let tungstenite::Message::Text(t) = ws.read().unwrap() {
+                    break serde_json::from_str::<Value>(&t).unwrap();
+                }
+            };
+            assert_eq!(
+                (event["event"].clone(), event["state"]["slideIndex"].clone()),
+                (json!("state"), json!(want.min(9)))
+            );
+            if want == 9 {
+                break; // clamped at the last slide: no more changes, so no more events
+            }
+        }
+        // WS_POLL bounds the wait; seconds would mean the read timeout isn't on the TLS socket.
+        assert!(sent.elapsed() < Duration::from_secs(2), "events took {:?}", sent.elapsed());
+        assert!(ws_connect(addr, None).is_err(), "plain ws:// is refused on a wss channel");
+        let (other_ca, _, _) = crate::tls::tests::test_pair(CHURCH);
+        assert!(wss_connect(addr, &other_ca).is_err(), "a client that doesn't trust the certificate can't connect");
+    }
+
+    #[test]
+    fn a_renewed_certificate_is_used_without_a_restart_and_open_connections_stay() {
+        let dir = crate::tls::tests::temp("wss-renew");
+        let (ca, cert, key) = crate::tls::tests::test_pair(CHURCH);
+        write_pair(&dir, &cert, &key);
+        let addr = serve_tls("wss-renew", &dir.join("cert.pem"), &dir.join("key.pem"));
+        let mut open = wss_connect(addr, &ca).unwrap();
+
+        let (new_ca, new_cert, new_key) = crate::tls::tests::test_pair(CHURCH);
+        write_pair(&dir, &new_cert, &new_key);
+        let mut renewed = wss_connect(addr, &new_ca).expect("new connections get the renewed certificate");
+        assert!(wss_connect(addr, &ca).is_err(), "the old certificate is no longer served");
+        assert_eq!(wss_ask(&mut renewed, "slide.next")["state"]["slideIndex"], 1);
+        assert_eq!(wss_ask(&mut open, "state.get")["state"]["slideIndex"], 1, "the open connection carries on");
+    }
+
+    #[test]
+    fn with_no_certificate_yet_connections_are_refused_until_it_arrives() {
+        let dir = crate::tls::tests::temp("wss-later");
+        let addr = serve_tls("wss-later", &dir.join("cert.pem"), &dir.join("key.pem"));
+        let (ca, cert, key) = crate::tls::tests::test_pair(CHURCH);
+        assert!(wss_connect(addr, &ca).is_err());
+        assert!(ws_connect(addr, None).is_err(), "no certificate never means plain text");
+        write_pair(&dir, &cert, &key);
+        let mut ws = wss_connect(addr, &ca).expect("the certificate is picked up when it arrives");
+        assert_eq!(wss_ask(&mut ws, "state.get")["ok"], true);
     }
 }

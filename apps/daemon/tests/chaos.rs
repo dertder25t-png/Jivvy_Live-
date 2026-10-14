@@ -614,17 +614,103 @@ fn contains(actual: &Value, expected: &Value) -> bool {
 
 #[test]
 fn shared_scenarios_behave_the_same_on_the_real_daemon() {
-    run_shared_scenarios(false);
+    run_shared_scenarios(Channel::Tcp);
 }
 
 #[test]
 fn shared_scenarios_behave_the_same_over_the_websocket_channel() {
-    run_shared_scenarios(true);
+    run_shared_scenarios(Channel::Ws);
+}
+
+/// The same over `wss://`: the restarted engine serves the same certificate from its files.
+#[test]
+fn shared_scenarios_behave_the_same_over_the_secure_websocket_channel() {
+    run_shared_scenarios(Channel::Wss);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Channel {
+    Tcp,
+    Ws,
+    Wss,
+}
+
+const CHURCH: &str = "church.d.jivvy.org";
+
+/// A certificate for `CHURCH` written to `dir` (cert.pem, key.pem), and the CA PEM that signed it.
+fn test_certificate(dir: &Path) -> String {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![CHURCH.to_string()]).unwrap().signed_by(&key, &ca, &ca_key).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("cert.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), key.serialize_pem()).unwrap();
+    ca.pem()
+}
+
+/// A WebSocket client's stream: plain, or TLS trusting only the test CA.
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Conn {
+    fn open(addr: &str, ca_pem: Option<&str>) -> std::io::Result<Conn> {
+        let stream = TcpStream::connect(addr)?;
+        let Some(ca_pem) = ca_pem else { return Ok(Conn::Plain(stream)) };
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ca_pem.as_bytes()).map_err(std::io::Error::other)?).unwrap();
+        let config =
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), ServerName::try_from(CHURCH).unwrap())
+            .map_err(std::io::Error::other)?;
+        Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(conn, stream))))
+    }
+
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Conn::Plain(s) => s,
+            Conn::Tls(s) => s.get_ref(),
+        }
+    }
+}
+
+impl std::io::Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            Conn::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            Conn::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            Conn::Tls(s) => s.flush(),
+        }
+    }
 }
 
 /// Sends one command over the WebSocket channel, reconnecting until the engine answers or
 /// time runs out (as `Daemon::send` does over TCP).
-fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
+fn send_ws(addr: &str, ca_pem: Option<&str>, command: Value, within: Duration) -> Value {
     use tungstenite::client::IntoClientRequest;
     let deadline = Instant::now() + within;
     let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
@@ -632,13 +718,14 @@ fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
         // Err((taken, error)): once sent, the command is never sent again, as in `Daemon::send`.
         let attempt = (|| -> Result<Value, (bool, String)> {
             let not_taken = |e: &dyn std::fmt::Display| (false, e.to_string());
-            let stream = TcpStream::connect(addr).map_err(|e| not_taken(&e))?;
-            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| not_taken(&e))?;
-            let req = format!("ws://{addr}/").into_client_request().map_err(|e| not_taken(&e))?;
+            let stream = Conn::open(addr, ca_pem).map_err(|e| not_taken(&e))?;
+            stream.tcp().set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| not_taken(&e))?;
+            let url = if ca_pem.is_some() { format!("wss://{CHURCH}/") } else { format!("ws://{addr}/") };
+            let req = url.into_client_request().map_err(|e| not_taken(&e))?;
             let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| not_taken(&e))?;
             ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| not_taken(&e))?;
             let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-            ws.get_ref().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
+            ws.get_ref().tcp().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
             loop {
                 match ws.read() {
                     Ok(tungstenite::Message::Text(t)) => {
@@ -668,7 +755,7 @@ fn is_timeout(e: &std::io::Error) -> bool {
 /// Runs `packages/protocol/fixtures/scenarios.json` against the real daemon, over its TCP
 /// channel or its WebSocket channel. Also run against the simulated daemon
 /// (packages/sim-daemon/test/scenarios.test.ts).
-fn run_shared_scenarios(over_ws: bool) {
+fn run_shared_scenarios(channel: Channel) {
     const SCENARIOS: &str = include_str!("../../../packages/protocol/fixtures/scenarios.json");
     let shared: Value = serde_json::from_str(SCENARIOS).unwrap();
     let scenarios = shared["scenarios"].as_array().unwrap();
@@ -680,15 +767,27 @@ fn run_shared_scenarios(over_ws: bool) {
                 let name = scenario["name"].as_str().unwrap();
                 let slides = scenario["slides"].as_u64().unwrap();
                 let ws = format!("127.0.0.1:{}", free_port());
-                let d = if over_ws {
-                    start_with(
-                        test_dir(&format!("scenario-ws-{n}")),
-                        slides,
-                        false,
-                        &["--no-video", "--listen-ws", &ws],
-                    )
-                } else {
-                    start(&format!("scenario-{n}"), slides)
+                let (d, ca) = match channel {
+                    Channel::Tcp => (start(&format!("scenario-{n}"), slides), None),
+                    Channel::Ws => {
+                        let args = ["--no-video", "--listen-ws", &ws];
+                        (start_with(test_dir(&format!("scenario-ws-{n}")), slides, false, &args), None)
+                    }
+                    Channel::Wss => {
+                        let dir = test_dir(&format!("scenario-wss-{n}"));
+                        let ca = test_certificate(&dir.join("tls"));
+                        let (cert, key) = (dir.join("tls/cert.pem"), dir.join("tls/key.pem"));
+                        let args = [
+                            "--no-video",
+                            "--listen-ws",
+                            &ws,
+                            "--ws-cert",
+                            cert.to_str().unwrap(),
+                            "--ws-key",
+                            key.to_str().unwrap(),
+                        ];
+                        (start_with(dir, slides, false, &args), Some(ca))
+                    }
                 };
                 let mut engine = d.next_engine_pid(Duration::from_secs(10));
                 for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
@@ -698,8 +797,8 @@ fn run_shared_scenarios(over_ws: bool) {
                         continue;
                     }
                     // Waits for a restarted engine to answer, like any client reconnecting.
-                    let ack = if over_ws {
-                        send_ws(&ws, step["send"].clone(), RESTORE_TARGET)
+                    let ack = if channel != Channel::Tcp {
+                        send_ws(&ws, ca.as_deref(), step["send"].clone(), RESTORE_TARGET)
                     } else {
                         d.send(step["send"].clone(), RESTORE_TARGET)
                     };

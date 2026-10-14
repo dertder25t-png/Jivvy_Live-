@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod recording;
 pub mod snapshot;
 pub mod stream;
+pub mod tls;
 pub mod watchdog;
 
 use std::path::{Path, PathBuf};

@@ -1,10 +1,12 @@
 //! `jivvy-engine`: the live engine process. Normally started by `jivvy-watchdog`.
 //!
 //! jivvy-engine [--data-dir DIR] [--listen ADDR] [--slides N] [--supervised]
-//!              [--listen-ws ADDR] [--ws-origin ORIGIN]...
+//!              [--listen-ws ADDR] [--ws-origin ORIGIN]... [--ws-cert PEM --ws-key PEM]
 //!
 //! `--listen-ws` also serves the protocol over WebSocket (off by default). Browsers may use
-//! it only from an origin given with `--ws-origin`; programs always may.
+//! it only from an origin given with `--ws-origin`; programs always may. With `--ws-cert` and
+//! `--ws-key` it is `wss://` only, with that certificate; replacing the files renews it
+//! without a restart.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use std::time::Duration;
 
 use jivvy_daemon::engine::{self, Engine};
 use jivvy_daemon::snapshot::Store;
+use jivvy_daemon::tls::TlsFiles;
 use jivvy_daemon::{DEFAULT_LISTEN, HEARTBEAT_LINE, default_data_dir, log};
 
 fn main() {
@@ -23,6 +26,7 @@ fn main() {
     let mut supervised = false;
     let mut listen_ws: Option<String> = None;
     let mut ws_access = engine::WsAccess::default();
+    let (mut ws_cert, mut ws_key): (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
@@ -33,9 +37,17 @@ fn main() {
             "--supervised" => supervised = true,
             "--listen-ws" => listen_ws = Some(val()),
             "--ws-origin" => ws_access.origins.push(val()),
+            "--ws-cert" => ws_cert = Some(PathBuf::from(val())),
+            "--ws-key" => ws_key = Some(PathBuf::from(val())),
             other => fail(&format!("unknown flag {other}")),
         }
     }
+
+    let ws_tls = match (ws_cert, ws_key) {
+        (Some(cert), Some(key)) => Some(Arc::new(TlsFiles::new(cert, key))),
+        (None, None) => None,
+        _ => fail("--ws-cert and --ws-key go together"),
+    };
 
     let store = Store::new(&data_dir).unwrap_or_else(|e| fail(&format!("data dir {}: {e}", data_dir.display())));
     let (snap, source) = store.load();
@@ -57,14 +69,18 @@ fn main() {
 
     if let Some(addr) = listen_ws {
         let (engine, access) = (engine.clone(), Arc::new(ws_access));
+        if let Some(tls) = &ws_tls {
+            tls.config(); // logs now if the certificate can't be used, not at the first device
+        }
         // Its own thread, retrying: a WebSocket port that's busy never stops the engine or
         // its TCP channel.
         std::thread::spawn(move || {
             loop {
                 match engine::bind(&addr, Duration::from_secs(2)) {
                     Ok(l) => {
-                        log("engine", format!("WebSocket channel on {addr}"));
-                        engine::serve_ws(l, engine.clone(), access.clone());
+                        let scheme = if ws_tls.is_some() { "wss" } else { "ws" };
+                        log("engine", format!("WebSocket channel on {scheme}://{addr}"));
+                        engine::serve_ws(l, engine.clone(), access.clone(), ws_tls.clone());
                     }
                     Err(e) => log("engine", format!("WebSocket channel {addr}: {e}; retrying")),
                 }

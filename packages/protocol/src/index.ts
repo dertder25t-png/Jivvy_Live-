@@ -437,9 +437,9 @@ export interface RunSheetItem {
   slides: Slide[];
   /**
    * Added in v1: while one of this item's slides is showing, the daemon moves to its next slide
-   * every this many seconds, and from its last back to its first (the pre-service loop). Next
-   * and Back still leave it as usual. 1 to MAX_ADVANCE_SECONDS; left out for items that wait
-   * for the operator.
+   * every this many seconds, and from its last back to its first (the pre-service loop).
+   * `slide.next` from any of its slides goes to the first slide after it; Back and go-to move as
+   * usual. 1 to MAX_ADVANCE_SECONDS; left out for items that wait for the operator.
    */
   advanceSeconds?: number;
 }

@@ -367,7 +367,7 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
-            Command::SlideNext => next.slide_index = (next.slide_index + 1).min(self.slide_count() - 1),
+            Command::SlideNext => next.slide_index = self.next_slide().min(self.slide_count() - 1),
             Command::SlidePrev => next.slide_index = next.slide_index.saturating_sub(1),
             Command::SlideGoto { index } => {
                 if index >= self.slide_count() {
@@ -456,6 +456,16 @@ impl Engine {
         protocol::ack(id, Some(self.view()))
     }
 
+    /// Where Next goes: the following slide, except from a pre-service loop, which Next leaves
+    /// for the item after it (pressing Next to start the service must never keep it looping).
+    fn next_slide(&self) -> u64 {
+        let index = self.state.slide_index;
+        match self.run_sheet.as_ref().and_then(|s| s.run_sheet.item_at(index)) {
+            Some((item, start)) if item.advance_seconds.is_some() => start + item.slides.len() as u64,
+            _ => index + 1,
+        }
+    }
+
     /// The pre-service loop: on a slide of an item with `advanceSeconds`, moves to that item's
     /// next slide once it has shown that long, and from its last back to its first. Any other
     /// slide change (Next, Back, a new run sheet) restarts the wait.
@@ -476,9 +486,11 @@ impl Engine {
         let mut next = self.state.clone();
         next.slide_index = start + (index - start + 1) % item.slides.len() as u64;
         next.saved_at = crate::now_ms();
-        // Saved like any slide change, so a restart carries on in the loop where it was.
+        // Saved like any slide change, so a restart carries on in the loop where it was. Not
+        // shown unless saved: the screens stay put and the next tick tries again.
         if let Err(e) = self.store.save(&next) {
             crate::log("engine", format!("snapshot save failed: {e}"));
+            return;
         }
         self.state = next;
         self.shown_since = Some((self.state.slide_index, now));
@@ -499,6 +511,9 @@ impl Engine {
         let mut next = self.state.clone();
         next.run_sheet_id = Some(saved.run_sheet.id.clone());
         self.run_sheet = Some(saved);
+        // A loop in the new run sheet gets its full time on its first slide, even if the
+        // slide number is the same as before.
+        self.shown_since = None;
         next.slide_index = if same { next.slide_index.min(self.slide_count() - 1) } else { 0 };
         if next != self.state {
             next.saved_at = crate::now_ms();
@@ -1081,16 +1096,22 @@ mod tests {
               "slides": [{ "lines": ["Welcome"] }, { "lines": ["Coffee"] }] },
             { "id": "s1", "kind": "song", "title": "", "slides": [{ "lines": ["Amazing grace"] }] },
         ] });
+        // The daemon has sat on slide 1 for a while before the run sheet arrives.
+        let before = Instant::now();
+        e.tick_at(before);
+        e.tick_at(before + Duration::from_secs(60));
         send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
-        let t0 = Instant::now();
+        let t0 = before + Duration::from_secs(61);
         e.tick_at(t0);
+        assert_eq!(e.view().slide_index, 0, "the loop's first slide gets its full time");
         e.tick_at(t0 + Duration::from_secs(4));
         assert_eq!(e.view().slide_index, 0, "not yet");
         e.tick_at(t0 + Duration::from_secs(5));
         assert_eq!(e.view().slide_index, 1);
         e.tick_at(t0 + Duration::from_secs(10));
         assert_eq!(e.view().slide_index, 0, "back to the loop's first slide");
-        send(&mut e, json!({ "type": "slide.goto", "index": 2 }));
+        let r = send(&mut e, json!({ "type": "slide.next" }));
+        assert_eq!(r["state"]["slideIndex"], 2, "Next leaves the loop for the song");
         e.tick_at(t0 + Duration::from_secs(60));
         assert_eq!(e.view().slide_index, 2, "the song waits for the operator");
     }

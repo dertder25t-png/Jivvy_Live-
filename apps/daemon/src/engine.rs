@@ -20,11 +20,10 @@ use crate::protocol::{
 use crate::snapshot::{Snapshot, Store};
 use crate::tls::TlsFiles;
 
-/// Longest line accepted on the command channel; protocol messages are tiny.
-const MAX_LINE: usize = 16 * 1024;
-/// Longest message on the WebSocket channel: room for a whole run sheet (`runsheet.set`).
-/// The same as the TypeScript `MAX_MESSAGE_BYTES`, which UIs check before sending.
-const MAX_WS_MESSAGE: usize = 1024 * 1024;
+/// Longest message on either command channel (a TCP line or a WebSocket message): room for
+/// a whole run sheet (`runsheet.set`). The same as the TypeScript `MAX_MESSAGE_BYTES`, which
+/// UIs check before sending.
+const MAX_MESSAGE: usize = 1024 * 1024;
 /// Messages queued for one connection before it counts as stuck and is disconnected.
 const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
@@ -123,6 +122,10 @@ pub struct Engine {
     uploads: crate::images::Uploads,
     /// The latest clean-up of unused images, running on its own thread.
     pruning: Option<std::thread::JoinHandle<()>>,
+    /// Images no clean-up may delete: what the run sheet shows, plus every image a device has
+    /// sent, asked about or named since. Each clean-up checks it just before each delete, so
+    /// an older one still running can never remove an image a newer run sheet shows.
+    protected: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
     subscribers: Vec<Outbox>,
@@ -182,6 +185,7 @@ impl Engine {
             run_sheet,
             uploads: Default::default(),
             pruning: None,
+            protected: Default::default(),
             shown_since: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
@@ -385,6 +389,8 @@ impl Engine {
                 return self.media_put(id, &media, offset, &data, last);
             }
             Command::MediaHas { ids } => {
+                // A device skips sending what is here, so it has to stay until the run sheet.
+                self.protect(ids.iter().cloned());
                 let missing = ids.into_iter().filter(|m| !crate::images::has(self.store.dir(), m)).collect();
                 return protocol::ack_with(id, None, AckExtras { missing: Some(missing), ..Default::default() });
             }
@@ -557,6 +563,7 @@ impl Engine {
         if bytes.len() > protocol::MEDIA_CHUNK_BYTES {
             return protocol::nack(id, ErrorCode::BadArguments, "media.put piece too big");
         }
+        self.protect([media.to_string()]);
         match crate::images::put(&mut self.uploads, self.store.dir(), media, offset, &bytes, last) {
             Ok(progress) => {
                 if progress.complete && last {
@@ -586,6 +593,8 @@ impl Engine {
     }
 
     fn set_run_sheet(&mut self, id: &str, run_sheet: protocol::RunSheet) -> Ack {
+        // Protected before the check, so no clean-up still running removes one after it.
+        self.protect(run_sheet.slides().filter_map(|s| s.image.clone()));
         // Every image must already be here: a slide never shows something the screens can't load.
         if let Some(image) =
             run_sheet.slides().filter_map(|s| s.image.as_deref()).find(|i| !crate::images::has(self.store.dir(), i))
@@ -633,12 +642,19 @@ impl Engine {
         let keep: std::collections::HashSet<String> =
             self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.clone()).collect();
         let (dir, arriving) = (self.store.dir().to_path_buf(), self.uploads.ids());
+        // From now on only these are protected, plus whatever devices send or name next.
+        *self.protected.lock().unwrap_or_else(|p| p.into_inner()) = keep.union(&arriving).cloned().collect();
+        let protected = self.protected.clone();
         self.pruning = Some(std::thread::spawn(move || {
-            let removed = crate::images::prune(&dir, &keep, &arriving);
+            let removed = crate::images::prune(&dir, &protected, &arriving);
             if removed > 0 {
                 crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
             }
         }));
+    }
+
+    fn protect(&self, ids: impl IntoIterator<Item = String>) {
+        self.protected.lock().unwrap_or_else(|p| p.into_inner()).extend(ids);
     }
 
     /// Tests: waits for the latest clean-up to finish.
@@ -960,11 +976,11 @@ fn read_commands(stream: TcpStream, engine: &Mutex<Engine>, outbox: &Outbox) -> 
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let n = (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf)?;
+        let n = (&mut reader).take(MAX_MESSAGE as u64 + 1).read_until(b'\n', &mut buf)?;
         if n == 0 {
             return Ok(());
         }
-        let ack = if n > MAX_LINE && buf.last() != Some(&b'\n') {
+        let ack = if n > MAX_MESSAGE && buf.last() != Some(&b'\n') {
             discard_line(&mut reader)?;
             protocol::nack("", ErrorCode::BadMessage, "message too long")
         } else {
@@ -1088,8 +1104,8 @@ fn ws_session<S: OverTcp>(
         Err(no)
     };
     let config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_WS_MESSAGE))
-        .max_frame_size(Some(MAX_WS_MESSAGE));
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
     let Ok(mut ws) = tungstenite::accept_hdr_with_config(stream, check_origin, Some(config)) else {
         return Ok(());
     };
@@ -1316,6 +1332,11 @@ mod tests {
 
         let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
         assert_eq!(r["state"]["slide"], json!({ "lines": [], "image": id }));
+        // A clean-up started for an earlier run sheet (which didn't show it) and still running
+        // checks what is protected now, so it leaves the image this run sheet shows.
+        e.wait_for_pruning();
+        assert_eq!(crate::images::prune(&dir, &e.protected, &Default::default()), 0);
+        assert!(crate::images::has(&dir, &id));
 
         // The next run sheet doesn't show it: the church computer doesn't keep it.
         let next = json!({ "id": "next", "title": "", "items": [] });
@@ -1613,11 +1634,16 @@ mod tests {
         std::thread::spawn(move || serve(listener, engine));
         let mut s = TcpStream::connect(addr).unwrap();
         s.write_all(b"{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}\n\n").unwrap();
-        s.write_all(&vec![b'x'; MAX_LINE + 10]).unwrap();
+        s.write_all(&vec![b'x'; MAX_MESSAGE + 10]).unwrap();
         s.write_all(b"\n{\"v\":1,\"id\":\"b\",\"ts\":1,\"command\":{\"type\":\"state.get\"}}\n").unwrap();
+        // A line the size of a real run sheet (well past the old 16 KiB cap) is read whole.
+        let pad = "p".repeat(64 * 1024);
+        let big =
+            format!("{{\"v\":1,\"id\":\"c\",\"ts\":1,\"pad\":\"{pad}\",\"command\":{{\"type\":\"state.get\"}}}}\n");
+        s.write_all(big.as_bytes()).unwrap();
         let mut r = BufReader::new(s);
         let mut lines = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut l = String::new();
             r.read_line(&mut l).unwrap();
             lines.push(serde_json::from_str::<Value>(&l).unwrap());
@@ -1625,6 +1651,7 @@ mod tests {
         assert_eq!(lines[0]["state"]["slideIndex"], json!(1));
         assert_eq!(lines[1]["message"], json!("message too long"));
         assert_eq!((lines[2]["id"].clone(), lines[2]["state"]["slideIndex"].clone()), (json!("b"), json!(1)));
+        assert_eq!((lines[3]["id"].clone(), lines[3]["ok"].clone()), (json!("c"), json!(true)));
     }
 
     type Ws = tungstenite::WebSocket<TcpStream>;
@@ -1762,7 +1789,7 @@ mod tests {
         let mut ws = ws_connect(ws_addr, None).unwrap();
         // The engine refuses from the frame header, so it may cut the connection while the
         // client is still writing; either way nothing this big gets through.
-        let _ = ws.send(tungstenite::Message::text("x".repeat(MAX_WS_MESSAGE + 10)));
+        let _ = ws.send(tungstenite::Message::text("x".repeat(MAX_MESSAGE + 10)));
         match ws.read() {
             Ok(tungstenite::Message::Text(t)) => {
                 assert_eq!(serde_json::from_str::<Value>(&t).unwrap()["message"], "message too long")
@@ -1772,7 +1799,7 @@ mod tests {
         }
         // A message under the limit, such as a run sheet, still works on a new connection.
         let mut ws = ws_connect(ws_addr, None).unwrap();
-        ws_send(&mut ws, &"x".repeat(MAX_LINE + 10));
+        ws_send(&mut ws, &"x".repeat(64 * 1024));
         assert_eq!(ws_next(&mut ws)["message"], "invalid JSON");
     }
 

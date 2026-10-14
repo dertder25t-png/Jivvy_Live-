@@ -41,7 +41,10 @@
 
   $effect(() => store(DRAFT_KEY, draft));
 
-  const built = $derived(build(draft));
+  // Countdowns are built for the moment of sending; `builtAt` moves on each send so the
+  // comparison below uses the same build that was sent.
+  let builtAt = $state(new Date());
+  const built = $derived(build(draft, builtAt));
   const builtJson = $derived(JSON.stringify(built));
   // Compared with what the daemon has, so it stays true after a reload or another device's send.
   const unsent = $derived(builtJson !== JSON.stringify(onScreens));
@@ -72,7 +75,8 @@
     sendError = "";
     // Built now, not the copy kept for the editor: a countdown whose time has passed while
     // the page was open counts down to the next one, not to a moment already gone.
-    const ack = await conn.send({ type: "runsheet.set", runSheet: build(draft) });
+    builtAt = new Date();
+    const ack = await conn.send({ type: "runsheet.set", runSheet: build(draft, builtAt) });
     if (!ack.ok) sendError = ack.message;
   }
 

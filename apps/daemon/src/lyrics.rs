@@ -57,7 +57,8 @@ pub fn render(font: &FontRef, lines: &[&str], frame_w: u32, frame_h: u32, style:
     let room_w = frame_w as f32 * 0.92;
     let room_h = frame_h as f32 * (0.96 - style.bottom_margin);
     let fit = (room_w / widest.max(1.0)).min(room_h / tall.max(1.0)).min(1.0);
-    let px = (styled * fit).max(8.0);
+    // No floor: an extreme slide on a small program is tiny, but whole.
+    let px = (styled * fit).max(1.0);
     let sf = font.as_scaled(PxScale::from(px));
     let line_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil();
     let shadow = (px / 16.0).ceil().max(1.0);
@@ -184,6 +185,14 @@ mod tests {
         let l = render(&f, &[line; 16], 1920, 1080, &Style::default()).unwrap();
         assert!(l.height < 1080 && l.y > 0, "all 16 lines fit: height {} at y {}", l.height, l.y);
         assert!(l.width < 1920 && l.x > 0, "the long line fits: width {}", l.width);
+    }
+
+    #[test]
+    fn the_widest_allowed_line_fits_a_small_program() {
+        let f = font();
+        let line = "W".repeat(200); // 200 characters, the protocol's longest line
+        let l = render(&f, &[line.as_str()], 854, 480, &Style::default()).unwrap();
+        assert!(l.width < 854 && l.x > 0, "fits without being cut: width {}", l.width);
     }
 
     #[test]

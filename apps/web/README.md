@@ -2,7 +2,7 @@
 
 SvelteKit, built as a static single-page app (`adapter-static`): Cloudflare Pages serves it, and the daemon will serve the same files on the church's network with no server code. It talks to the daemon directly over its WebSocket channel using `packages/protocol`; nothing on this screen needs the cloud.
 
-Today: the run sheet screen. Build the service (songs, scripture, countdowns, text), send it to the screens, then Next/Back/Black or click any slide. Arrow keys, Page Up/Down and Space move slides; B goes black.
+Today: the run sheet screen. Build the service (songs, scripture, countdowns, text, a pre-service loop), send it to the screens, then Next/Back/Black or click any slide. Arrow keys, Page Up/Down and Space move slides; B goes black.
 
 ## Run it against the real daemon
 

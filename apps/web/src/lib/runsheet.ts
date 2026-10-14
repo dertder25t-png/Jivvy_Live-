@@ -3,9 +3,17 @@
  * The daemon only ever sees slides (packages/protocol `RunSheet`); the words typed here stay
  * in the browser until the local database item.
  */
-import { MAX_SLIDE_LINE, MAX_SLIDE_LINES, MAX_TITLE, type RunSheet, type Slide } from "@jivvy/protocol";
+import {
+  MAX_ADVANCE_SECONDS,
+  MAX_SLIDE_LINE,
+  MAX_SLIDE_LINES,
+  MAX_TITLE,
+  type RunSheet,
+  type RunSheetItem,
+  type Slide,
+} from "@jivvy/protocol";
 
-export type ItemKind = "song" | "scripture" | "countdown" | "text";
+export type ItemKind = "song" | "scripture" | "countdown" | "text" | "loop";
 
 export interface DraftItem {
   id: string;
@@ -15,6 +23,8 @@ export interface DraftItem {
   text: string;
   /** Countdowns: the time of day it counts down to, "HH:MM" (24-hour). */
   at?: string;
+  /** Pre-service loops: seconds on each slide before the next. */
+  seconds?: number;
 }
 
 export interface Draft {
@@ -22,6 +32,9 @@ export interface Draft {
   title: string;
   items: DraftItem[];
 }
+
+/** How long a pre-service loop shows each slide unless the operator says otherwise. */
+export const LOOP_SECONDS = 8;
 
 /** Most lines on one lyric slide; longer verses are split across slides. */
 export const SONG_LINES = 4;
@@ -32,10 +45,10 @@ export const SCRIPTURE_LINES = 4;
 export const newId = (): string => crypto.randomUUID();
 
 export function newItem(kind: ItemKind): DraftItem {
-  const title = { song: "New song", scripture: "", countdown: "Countdown", text: "Announcement" }[kind];
-  return kind === "countdown"
-    ? { id: newId(), kind, title, text: "Service starts in", at: "10:30" }
-    : { id: newId(), kind, title, text: "" };
+  const title = { song: "New song", scripture: "", countdown: "Countdown", text: "Announcement", loop: "Before the service" }[kind];
+  if (kind === "countdown") return { id: newId(), kind, title, text: "Service starts in", at: "10:30" };
+  if (kind === "loop") return { id: newId(), kind, title, text: "", seconds: LOOP_SECONDS };
+  return { id: newId(), kind, title, text: "" };
 }
 
 /** One line as the protocol accepts it: no control characters, not too long. */
@@ -90,7 +103,8 @@ export function nextTime(at: string, now: Date): number | null {
 export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
   switch (item.kind) {
     case "song":
-    case "text": {
+    case "text":
+    case "loop": {
       const size = item.kind === "song" ? SONG_LINES : MAX_SLIDE_LINES;
       return paragraphs(item.text)
         .flatMap((p) => chunks(p, size))
@@ -112,16 +126,20 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
   }
 }
 
+/** Seconds a loop waits on each slide, as the protocol accepts it. */
+export function loopSeconds(s: number | undefined): number {
+  const n = Math.round(Number(s));
+  return Number.isFinite(n) ? Math.min(Math.max(n, 1), MAX_ADVANCE_SECONDS) : LOOP_SECONDS;
+}
+
 /** The run sheet to send to the daemon. */
 export function build(draft: Draft, now = new Date()): RunSheet {
   return {
     id: draft.id,
     title: clean(draft.title, MAX_TITLE),
-    items: draft.items.map((item) => ({
-      id: item.id,
-      kind: item.kind,
-      title: clean(item.title, MAX_TITLE),
-      slides: slidesFor(item, now),
-    })),
+    items: draft.items.map((item): RunSheetItem => {
+      const built = { id: item.id, kind: item.kind, title: clean(item.title, MAX_TITLE), slides: slidesFor(item, now) };
+      return item.kind === "loop" ? { ...built, advanceSeconds: loopSeconds(item.seconds) } : built;
+    }),
   };
 }

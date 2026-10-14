@@ -193,6 +193,8 @@ export const MAX_SLIDE_LINES = 16;
 /** Longest line on a slide, and longest title, in characters. */
 export const MAX_SLIDE_LINE = 200;
 export const MAX_TITLE = 200;
+/** Longest time a looping item waits on one slide. */
+export const MAX_ADVANCE_SECONDS = 3600;
 /** An item's kind: "song", "scripture", "countdown", "text" today; newer UIs may add others. */
 const KIND = /^[a-z][a-z0-9-]{0,31}$/;
 
@@ -237,7 +239,13 @@ export function parseRunSheet(x: unknown): RunSheet | null {
       if (!slide) return null;
       slides.push(slide);
     }
-    items.push({ id: it.id, kind: it.kind, title: itemTitle, slides });
+    const adv = it.advanceSeconds;
+    if (adv === undefined) {
+      items.push({ id: it.id, kind: it.kind, title: itemTitle, slides });
+      continue;
+    }
+    if (typeof adv !== "number" || !Number.isInteger(adv) || adv < 1 || adv > MAX_ADVANCE_SECONDS) return null;
+    items.push({ id: it.id, kind: it.kind, title: itemTitle, slides, advanceSeconds: adv });
   }
   return { id: x.id, title, items };
 }
@@ -423,10 +431,17 @@ export interface Slide {
  */
 export interface RunSheetItem {
   id: string;
-  /** "song", "scripture", "countdown" or "text"; screens show unknown kinds as text. */
+  /** "song", "scripture", "countdown", "text" or "loop"; screens show unknown kinds as text. */
   kind: string;
   title: string;
   slides: Slide[];
+  /**
+   * Added in v1: while one of this item's slides is showing, the daemon moves to its next slide
+   * every this many seconds, and from its last back to its first (the pre-service loop). Next
+   * and Back still leave it as usual. 1 to MAX_ADVANCE_SECONDS; left out for items that wait
+   * for the operator.
+   */
+  advanceSeconds?: number;
 }
 
 export interface RunSheet {

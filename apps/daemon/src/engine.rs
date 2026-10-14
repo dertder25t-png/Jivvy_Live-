@@ -465,6 +465,11 @@ impl Engine {
                 crate::log("engine", format!("snapshot save failed: {e}"));
                 return protocol::nack(id, ErrorCode::Unavailable, "could not save state; try again");
             }
+            if next.slide_index != self.state.slide_index {
+                // Moved by the operator: a loop's wait starts again from the next tick, even if
+                // they come straight back to the same slide before it.
+                self.shown_since = None;
+            }
             self.state = next;
             self.broadcast();
         }
@@ -1137,6 +1142,12 @@ mod tests {
         assert_eq!(e.view().slide_index, 1);
         e.tick_at(t0 + Duration::from_secs(10));
         assert_eq!(e.view().slide_index, 0, "back to the loop's first slide");
+        // Away and straight back between two ticks: the slide gets its full time again.
+        e.tick_at(t0 + Duration::from_secs(14));
+        send(&mut e, json!({ "type": "slide.goto", "index": 1 }));
+        send(&mut e, json!({ "type": "slide.goto", "index": 0 }));
+        e.tick_at(t0 + Duration::from_secs(15));
+        assert_eq!(e.view().slide_index, 0, "not moved on at once");
         let r = send(&mut e, json!({ "type": "slide.next" }));
         assert_eq!(r["state"]["slideIndex"], 2, "Next leaves the loop for the song");
         e.tick_at(t0 + Duration::from_secs(60));

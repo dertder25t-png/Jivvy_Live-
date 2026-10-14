@@ -121,6 +121,8 @@ pub struct Engine {
     run_sheet: Option<crate::runsheet::Saved>,
     /// Images arriving in pieces.
     uploads: crate::images::Uploads,
+    /// The latest clean-up of unused images, running on its own thread.
+    pruning: Option<std::thread::JoinHandle<()>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
     subscribers: Vec<Outbox>,
@@ -179,6 +181,7 @@ impl Engine {
             slide_count: slide_count.max(1),
             run_sheet,
             uploads: Default::default(),
+            pruning: None,
             shown_since: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
@@ -624,12 +627,25 @@ impl Engine {
 
     /// Keeps only the images the run sheet shows (and uploads arriving now), so the folder
     /// never grows week after week.
+    /// Runs on its own thread: deleting many files must never hold the engine's lock (the
+    /// heartbeat waits on it).
     fn prune_images(&mut self) {
-        let keep: std::collections::HashSet<&str> =
-            self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.as_deref()).collect();
-        let removed = crate::images::prune(self.store.dir(), &keep, &self.uploads);
-        if removed > 0 {
-            crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
+        let keep: std::collections::HashSet<String> =
+            self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.clone()).collect();
+        let (dir, arriving) = (self.store.dir().to_path_buf(), self.uploads.ids());
+        self.pruning = Some(std::thread::spawn(move || {
+            let removed = crate::images::prune(&dir, &keep, &arriving);
+            if removed > 0 {
+                crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
+            }
+        }));
+    }
+
+    /// Tests: waits for the latest clean-up to finish.
+    #[cfg(test)]
+    fn wait_for_pruning(&mut self) {
+        if let Some(t) = self.pruning.take() {
+            t.join().unwrap();
         }
     }
 
@@ -1304,6 +1320,7 @@ mod tests {
         // The next run sheet doesn't show it: the church computer doesn't keep it.
         let next = json!({ "id": "next", "title": "", "items": [] });
         send(&mut e, json!({ "type": "runsheet.set", "runSheet": next }));
+        e.wait_for_pruning();
         assert!(!crate::images::has(&dir, &id));
     }
 

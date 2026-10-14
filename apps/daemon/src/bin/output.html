@@ -8,7 +8,7 @@
   html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; user-select: none; }
   /* The slide is laid out at the output's canvas size, then scaled to fit with black bars. */
   #stage { position: absolute; left: 50%; top: 50%; background: #000; overflow: hidden; transform-origin: center; }
-  #slide { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  #slide { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; align-items: center; justify-content: center;
            padding: 0 6%; color: #fff; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 700; text-align: center;
            line-height: 1.2; }
   #clock { font-variant-numeric: tabular-nums; margin-top: .3em; font-size: 1.6em; }
@@ -27,12 +27,23 @@
   const ident = document.getElementById("ident");
   const canvas = window.__jivvyCanvas || { w: 1920, h: 1080, label: "" };
 
+  // The slide's text at 9% of the canvas height, smaller if that's what it takes for every
+  // line to fit (run sheets allow 16 lines): shrunk, never cut off.
+  function fitText() {
+    let size = Math.round(canvas.h * 0.09);
+    slide.style.fontSize = size + "px";
+    while (slide.scrollHeight > canvas.h * 0.92 && size > 12) {
+      size = Math.floor(size * 0.92);
+      slide.style.fontSize = size + "px";
+    }
+  }
+
   function fit() {
     const scale = Math.min(innerWidth / canvas.w, innerHeight / canvas.h);
     stage.style.width = canvas.w + "px";
     stage.style.height = canvas.h + "px";
     stage.style.transform = `translate(-50%, -50%) scale(${scale})`;
-    slide.style.fontSize = Math.round(canvas.h * 0.09) + "px";
+    fitText();
     ident.style.fontSize = Math.round(canvas.h * 0.025) + "px";
   }
 
@@ -69,6 +80,7 @@
         tick();
       }
       slide.classList.toggle("hidden", state.black);
+      fitText();
     },
   };
 

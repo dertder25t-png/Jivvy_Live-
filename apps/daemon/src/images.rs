@@ -29,16 +29,30 @@ pub fn usage(data_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Removes images the run sheet doesn't show (`keep`) and pieces of uploads this engine isn't
-/// following (left by a crash or an abandoned send). Returns how many files went.
-pub fn prune(data_dir: &Path, keep: &std::collections::HashSet<&str>, uploads: &Uploads) -> usize {
+/// A piece of an upload this recent is never pruned, even if it started after the list of
+/// uploads arriving was taken (pruning runs on its own thread).
+const FRESH_PART: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes images the run sheet doesn't show (`keep`) and pieces of uploads not arriving now
+/// (`arriving`; left by a crash or an abandoned send). Returns how many files went.
+pub fn prune(
+    data_dir: &Path,
+    keep: &std::collections::HashSet<String>,
+    arriving: &std::collections::HashSet<String>,
+) -> usize {
     let Ok(entries) = fs::read_dir(dir(data_dir)) else { return 0 };
     let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let stale = match name.strip_suffix(".part") {
-            Some(id) => !uploads.0.contains_key(id),
-            None => !keep.contains(name.as_str()),
+            Some(id) => {
+                let fresh = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < FRESH_PART));
+                !arriving.contains(id) && !fresh
+            }
+            None => !keep.contains(&name),
         };
         if stale && entry.metadata().is_ok_and(|m| m.is_file()) && fs::remove_file(entry.path()).is_ok() {
             removed += 1;
@@ -74,9 +88,22 @@ pub fn serve(data_dir: &Path, url_path: &str) -> Option<(&'static str, Vec<u8>)>
 /// piece is checked without reading the whole file again under the engine's lock. Kept in
 /// memory: after a restart an upload starts again from 0.
 #[derive(Default)]
-pub struct Uploads(std::collections::HashMap<String, Upload>);
+pub struct Uploads(std::collections::HashMap<String, Upload>, u64);
+
+/// Most uploads in progress at once; starting another drops the one idle longest. A real send
+/// does one at a time, so this only stops a device piling up half-uploads.
+pub const MAX_ARRIVING: usize = 8;
+
+impl Uploads {
+    /// The ids arriving now, for pruning on another thread.
+    pub fn ids(&self) -> std::collections::HashSet<String> {
+        self.0.keys().cloned().collect()
+    }
+}
 
 struct Upload {
+    /// When it last took a piece (a counter, not a clock), to find the one idle longest.
+    touched: u64,
     received: u64,
     hash: ring::digest::Context,
     head: Vec<u8>,
@@ -113,7 +140,19 @@ pub fn put(
     fs::create_dir_all(dir(data_dir)).map_err(io)?;
     let part = dir(data_dir).join(format!("{id}.part"));
     if offset == 0 {
-        let fresh = Upload { received: 0, hash: ring::digest::Context::new(&ring::digest::SHA256), head: Vec::new() };
+        if !uploads.0.contains_key(id) && uploads.0.len() >= MAX_ARRIVING {
+            let idle = uploads.0.iter().min_by_key(|(_, u)| u.touched).map(|(k, _)| k.clone());
+            if let Some(idle) = idle {
+                uploads.0.remove(&idle);
+                let _ = fs::remove_file(dir(data_dir).join(format!("{idle}.part")));
+            }
+        }
+        let fresh = Upload {
+            touched: 0,
+            received: 0,
+            hash: ring::digest::Context::new(&ring::digest::SHA256),
+            head: Vec::new(),
+        };
         uploads.0.insert(id.into(), fresh);
     }
     // Only an upload this engine has been following can carry on; anything else starts over.
@@ -140,7 +179,10 @@ pub fn put(
         uploads.0.remove(id); // the file may hold part of this piece: start again
         return Err(io(e));
     }
+    uploads.1 += 1;
+    let tick = uploads.1;
     let upload = uploads.0.get_mut(id).expect("inserted above or checked by offset");
+    upload.touched = tick;
     upload.received += bytes.len() as u64;
     upload.hash.update(bytes);
     let room = 12usize.saturating_sub(upload.head.len());
@@ -198,6 +240,20 @@ mod tests {
     }
 
     #[test]
+    fn only_a_few_uploads_can_be_half_done_at_once() {
+        let dir = std::env::temp_dir().join(format!("jivvy-cap-{}-{}", std::process::id(), crate::now_ms()));
+        let mut up = Uploads::default();
+        let ids: Vec<String> = (0..=MAX_ARRIVING).map(|n| format!("{n:064x}")).collect();
+        for id in &ids {
+            put(&mut up, &dir, id, 0, &[0xFF, 0xD8], false).unwrap();
+        }
+        assert_eq!(up.ids().len(), MAX_ARRIVING);
+        assert_eq!(put(&mut up, &dir, &ids[0], 2, &[0xFF], true), Err(PutError::Offset(0)), "the idlest was dropped");
+        assert!(!super::dir(&dir).join(format!("{}.part", ids[0])).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pruning_keeps_what_the_run_sheet_shows_and_uploads_still_arriving() {
         let dir = std::env::temp_dir().join(format!("jivvy-prune-{}-{}", std::process::id(), crate::now_ms()));
         let hash = |b: &[u8]| -> String {
@@ -211,9 +267,14 @@ mod tests {
         put(&mut up, &dir, &hash(&arriving), 0, &arriving[..2], false).unwrap();
         fs::write(super::dir(&dir).join(format!("{}.part", "c".repeat(64))), b"left by a crash").unwrap();
 
-        let keep = [hash(&shown)];
-        let keep: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
-        assert_eq!(prune(&dir, &keep, &up), 2, "the unused image and the abandoned piece");
+        // The abandoned piece is old; one that started a moment ago is left alone.
+        let old = super::dir(&dir).join(format!("{}.part", "c".repeat(64)));
+        let a_while_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        fs::File::options().write(true).open(&old).unwrap().set_modified(a_while_ago).unwrap();
+        fs::write(super::dir(&dir).join(format!("{}.part", "d".repeat(64))), b"just started").unwrap();
+
+        let keep = std::collections::HashSet::from([hash(&shown)]);
+        assert_eq!(prune(&dir, &keep, &up.ids()), 2, "the unused image and the abandoned piece");
         assert!(has(&dir, &hash(&shown)) && !has(&dir, &hash(&unused)));
         assert!(put(&mut up, &dir, &hash(&arriving), 2, &arriving[2..], true).unwrap().complete, "still arriving");
         let _ = fs::remove_dir_all(&dir);

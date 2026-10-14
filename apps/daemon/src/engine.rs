@@ -119,6 +119,9 @@ pub struct Engine {
     run_sheet: Option<crate::runsheet::Saved>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
+    /// Next on a loop with no slide after it lands on its last slide, which then stays until
+    /// the slide changes.
+    loop_held: Option<u64>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -173,6 +176,7 @@ impl Engine {
             slide_count: slide_count.max(1),
             run_sheet,
             shown_since: None,
+            loop_held: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -367,7 +371,15 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
-            Command::SlideNext => next.slide_index = self.next_slide().min(self.slide_count() - 1),
+            Command::SlideNext => {
+                let target = self.next_slide();
+                next.slide_index = target.min(self.slide_count() - 1);
+                if target >= self.slide_count() && target != self.state.slide_index + 1 {
+                    // A loop at the end of the run sheet: nothing after it, so Next goes to its
+                    // last slide and stops the loop there.
+                    self.loop_held = Some(next.slide_index);
+                }
+            }
             Command::SlidePrev => next.slide_index = next.slide_index.saturating_sub(1),
             Command::SlideGoto { index } => {
                 if index >= self.slide_count() {
@@ -475,9 +487,13 @@ impl Engine {
             Some((shown, since)) if shown == index => since,
             _ => {
                 self.shown_since = Some((index, now));
+                self.loop_held = self.loop_held.filter(|held| *held == index);
                 return;
             }
         };
+        if self.loop_held == Some(index) {
+            return;
+        }
         let Some((item, start)) = self.run_sheet.as_ref().and_then(|s| s.run_sheet.item_at(index)) else { return };
         let Some(secs) = item.advance_seconds.filter(|_| item.slides.len() > 1) else { return };
         if now.saturating_duration_since(since) < Duration::from_secs(secs) {
@@ -1114,6 +1130,27 @@ mod tests {
         assert_eq!(r["state"]["slideIndex"], 2, "Next leaves the loop for the song");
         e.tick_at(t0 + Duration::from_secs(60));
         assert_eq!(e.view().slide_index, 2, "the song waits for the operator");
+    }
+
+    #[test]
+    fn next_stops_a_loop_at_the_end_of_the_run_sheet() {
+        let (mut e, _) = engine("loop-end", 100);
+        let sheet = json!({ "id": "pre", "title": "", "items": [
+            { "id": "s1", "kind": "song", "title": "", "slides": [{ "lines": ["Amazing grace"] }] },
+            { "id": "post", "kind": "loop", "title": "", "advanceSeconds": 5,
+              "slides": [{ "lines": ["Thanks for coming"] }, { "lines": ["See you next week"] }] },
+        ] });
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        send(&mut e, json!({ "type": "slide.goto", "index": 1 }));
+        let t0 = Instant::now();
+        e.tick_at(t0);
+        send(&mut e, json!({ "type": "slide.next" }));
+        e.tick_at(t0 + Duration::from_secs(60));
+        assert_eq!(e.view().slide_index, 2, "on the loop's last slide, and it stays there");
+        send(&mut e, json!({ "type": "slide.goto", "index": 1 }));
+        e.tick_at(t0 + Duration::from_secs(61));
+        e.tick_at(t0 + Duration::from_secs(66));
+        assert_eq!(e.view().slide_index, 2, "going back into it loops again");
     }
 
     #[test]

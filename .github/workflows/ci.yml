@@ -42,7 +42,9 @@ jobs:
           workspaces: apps/daemon
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # Tests listed in docs/HARDENING.md as failing on this runner are skipped here only;
+      # the nightly job still runs them at full strength.
+      - run: cargo test -- --skip preflight::tests::the_stream_starting_stops_the_test
         env:
           JIVVY_CHAOS_ITERATIONS: 10
   daemon:

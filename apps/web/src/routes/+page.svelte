@@ -111,7 +111,7 @@
 <svelte:window onkeydown={keydown} />
 
 <header>
-  <div class="brand"><span class="dot" aria-hidden="true"></span>Jivvy Live</div>
+  <img class="brand" src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="147" height="60" />
   <form
     class="connect"
     onsubmit={(e) => {
@@ -268,18 +268,12 @@
     background: var(--navy);
     color: var(--paper);
   }
+  /* The lockup carries its own navy background, the same as this header. */
   .brand {
-    font-weight: 700;
-    font-size: 18px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .dot {
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    background: var(--orange);
+    display: block;
+    height: 44px;
+    width: auto;
+    margin: -6px 0;
   }
   .connect {
     display: flex;

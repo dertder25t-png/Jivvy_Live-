@@ -11,7 +11,7 @@ The church-computer side of Jivvy Live. See `docs/BUILD_PLAN.md` (Stage 1, Daemo
 
 ## Run sheet
 
-`runsheet.set` (from the web app, or any paired device) replaces the run sheet: items (song, scripture, countdown, text, ...) already turned into slides by the UI. The engine saves it to `runsheet.json` (temp file, flushed, renamed) before acknowledging, so a restart shows the same service; the slide count comes from it (`--slides` only applies with no run sheet). Another run sheet starts on its first slide; an edit of the same one (same `id`) stays on the current slide, clamped. Every screen's state carries `runSheetId`, `runSheetRev` (up by one per set), `slideCount` and the current `slide`; `runsheet.get` returns the whole sheet. WebSocket messages may be up to 256 KiB to fit one.
+`runsheet.set` (from the web app, or any paired device) replaces the run sheet: items (song, scripture, countdown, text, ...) already turned into slides by the UI. The engine saves it to `runsheet.json` (temp file, flushed, renamed) before acknowledging, so a restart shows the same service; the slide count comes from it (`--slides` only applies with no run sheet). Another run sheet starts on its first slide; an edit of the same one (same `id`) stays on the current slide, clamped. Every screen's state carries `runSheetId`, `runSheetRev` (up by one per set), `slideCount` and the current `slide`; `runsheet.get` returns the whole sheet. WebSocket messages may be up to 1 MiB (`MAX_MESSAGE_BYTES` in the protocol, which the web app checks before sending). The snapshot names the run sheet its slide number belongs to, so a crash between saving a new run sheet and the snapshot still starts the new one on its first slide.
 
 ## Output windows
 

@@ -23,7 +23,8 @@ use crate::tls::TlsFiles;
 /// Longest line accepted on the command channel; protocol messages are tiny.
 const MAX_LINE: usize = 16 * 1024;
 /// Longest message on the WebSocket channel: room for a whole run sheet (`runsheet.set`).
-const MAX_WS_MESSAGE: usize = 256 * 1024;
+/// The same as the TypeScript `MAX_MESSAGE_BYTES`, which UIs check before sending.
+const MAX_WS_MESSAGE: usize = 1024 * 1024;
 /// Messages queued for one connection before it counts as stuck and is disconnected.
 const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
@@ -148,6 +149,13 @@ impl Engine {
     pub fn new(store: Store, state: Snapshot, slide_count: u64) -> Self {
         let run_sheet = crate::runsheet::load(store.dir());
         let mut state = state;
+        // The slide number belongs to another run sheet: the new one starts at its beginning.
+        if let Some(saved) = &run_sheet
+            && state.run_sheet_id.as_deref() != Some(saved.run_sheet.id.as_str())
+        {
+            state.slide_index = 0;
+            state.run_sheet_id = Some(saved.run_sheet.id.clone());
+        }
         // A snapshot from a longer run sheet must not point past the end of this one.
         let count = run_sheet.as_ref().map_or(slide_count, |s| s.run_sheet.slides().count() as u64).max(1);
         state.slide_index = state.slide_index.min(count - 1);
@@ -455,15 +463,17 @@ impl Engine {
             return protocol::nack(id, ErrorCode::Unavailable, "could not save the run sheet; try again");
         }
         crate::log("engine", format!("run sheet {} rev {rev}", saved.run_sheet.id));
-        self.run_sheet = Some(saved);
         let mut next = self.state.clone();
+        next.run_sheet_id = Some(saved.run_sheet.id.clone());
+        self.run_sheet = Some(saved);
         next.slide_index = if same { next.slide_index.min(self.slide_count() - 1) } else { 0 };
         if next != self.state {
             next.saved_at = crate::now_ms();
-            // Not acknowledged, so the screen tries again; the run sheet itself is already saved.
+            // Safe even if this save fails or the engine dies first: the snapshot still names the
+            // old run sheet, so a restart starts the new one on its first slide (an edit of the
+            // same one is clamped the same way), which is what screens are shown now.
             if let Err(e) = self.store.save(&next) {
                 crate::log("engine", format!("snapshot save failed: {e}"));
-                return protocol::nack(id, ErrorCode::Unavailable, "could not save state; try again");
             }
             self.state = next;
         }
@@ -1017,6 +1027,17 @@ mod tests {
         let mut e = Engine::new(store, snap, 100);
         let r = send(&mut e, json!({ "type": "runsheet.get" }));
         assert_eq!((r["runSheet"].clone(), r["state"]["slideIndex"].clone()), (sheet, json!(1)));
+
+        // A crash after a new run sheet was saved but before the snapshot: it starts at the top.
+        drop(e);
+        let other: protocol::RunSheet = serde_json::from_value(json!({ "id": "wed", "title": "", "items": [
+            { "id": "t", "kind": "text", "title": "", "slides": [{ "lines": ["a"] }, { "lines": ["b"] }] },
+        ] }))
+        .unwrap();
+        crate::runsheet::save(&dir, &crate::runsheet::Saved { version: 1, rev: 2, run_sheet: other }).unwrap();
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        assert_eq!(Engine::new(store, snap, 100).view().slide_index, 0);
     }
 
     #[test]

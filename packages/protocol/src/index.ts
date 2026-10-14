@@ -84,8 +84,8 @@ export type Command =
    * Added in v1 without a version bump. Replaces the run sheet the screens show; saved on the
    * church computer before the ack, so it survives a crash or restart. A run sheet with another
    * `id` starts again on its first slide; the same `id` (an edit) stays on the current slide.
-   * The ack carries the new state (`slideCount`, `runSheetRev`). Over WebSocket a message may be
-   * up to 256 KiB. Older daemons answer unknown_command.
+   * The ack carries the new state (`slideCount`, `runSheetRev`). The whole message must fit in
+   * MAX_MESSAGE_BYTES (check with `messageBytes` before sending). Older daemons answer unknown_command.
    */
   | { type: "runsheet.set"; runSheet: RunSheet }
   /** Added in v1 without a version bump. The ack carries `runSheet` (left out when none is set). */
@@ -241,6 +241,16 @@ export function parseRunSheet(x: unknown): RunSheet | null {
   }
   return { id: x.id, title, items };
 }
+
+/**
+ * Largest message the daemon takes over WebSocket, in UTF-8 bytes. A run sheet within the limits
+ * above can be bigger than this (the limits allow ~6 MB of text); a real service is a few tens of
+ * KB. UIs check with `messageBytes` and say so plainly rather than send one that gets refused.
+ */
+export const MAX_MESSAGE_BYTES = 1024 * 1024;
+
+/** The size of an envelope as sent, in UTF-8 bytes. */
+export const messageBytes = (envelope: Envelope): number => new TextEncoder().encode(JSON.stringify(envelope)).length;
 
 /** Every slide of the run sheet in order: what `slideIndex` counts. */
 export function runSheetSlides(sheet: RunSheet): { item: RunSheetItem; itemIndex: number; slide: Slide }[] {

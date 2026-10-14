@@ -6,6 +6,8 @@
 import {
   authMessage,
   makeEnvelope,
+  MAX_MESSAGE_BYTES,
+  messageBytes,
   type Ack,
   type Command,
   type DaemonEvent,
@@ -83,6 +85,14 @@ export class DaemonConnection {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(failed("not connected"));
     const env = makeEnvelope(command);
+    // The daemon would refuse it and close the connection; say so here instead.
+    const bytes = messageBytes(env);
+    if (bytes > MAX_MESSAGE_BYTES) {
+      const kb = (n: number) => Math.ceil(n / 1024);
+      return Promise.resolve(
+        failed(`This is too big to send (${kb(bytes)} KB; the limit is ${kb(MAX_MESSAGE_BYTES)} KB). Remove some items.`),
+      );
+    }
     return new Promise((resolve) => {
       this.waiting.set(env.id, resolve);
       ws.send(JSON.stringify(env));

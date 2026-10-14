@@ -159,6 +159,8 @@ impl Engine {
         {
             state.slide_index = 0;
             state.run_sheet_id = Some(saved.run_sheet.id.clone());
+            // A stop pressed in the old run sheet doesn't hold a loop in the new one.
+            state.loop_stopped = false;
         }
         // A snapshot from a longer run sheet must not point past the end of this one.
         let count = run_sheet.as_ref().map_or(slide_count, |s| s.run_sheet.slides().count() as u64).max(1);
@@ -382,7 +384,7 @@ impl Engine {
                 next.slide_index = target.min(self.slide_count() - 1);
                 // A loop at the end of the run sheet: nothing after it, so Next goes to its
                 // last slide and stops the loop there (saved, so a restart doesn't restart it).
-                stop_loop = target >= self.slide_count() && target != self.state.slide_index + 1;
+                stop_loop = target >= self.slide_count() && self.in_loop(self.state.slide_index);
             }
             Command::SlidePrev => next.slide_index = next.slide_index.saturating_sub(1),
             Command::SlideGoto { index } => {
@@ -476,6 +478,14 @@ impl Engine {
             self.broadcast();
         }
         protocol::ack(id, Some(self.view()))
+    }
+
+    /// Whether slide `index` belongs to a pre-service loop.
+    fn in_loop(&self, index: u64) -> bool {
+        self.run_sheet
+            .as_ref()
+            .and_then(|s| s.run_sheet.item_at(index))
+            .is_some_and(|(i, _)| i.advance_seconds.is_some())
     }
 
     /// Where Next goes: the following slide, except from a pre-service loop, which Next leaves
@@ -1209,6 +1219,25 @@ mod tests {
         e.tick_at(t0 + Duration::from_secs(61));
         e.tick_at(t0 + Duration::from_secs(66));
         assert_eq!(e.view().slide_index, 2, "going back into it loops again");
+        // Next on the loop's last slide stops it too.
+        send(&mut e, json!({ "type": "slide.next" }));
+        e.tick_at(t0 + Duration::from_secs(120));
+        assert_eq!(e.view().slide_index, 2, "Next on the last slide holds it");
+
+        // A crash after another run sheet was saved: its loop isn't held by the old stop.
+        drop(e);
+        let other: protocol::RunSheet = serde_json::from_value(json!({ "id": "next", "title": "", "items": [
+            { "id": "pre", "kind": "loop", "title": "", "advanceSeconds": 5,
+              "slides": [{ "lines": ["Welcome"] }, { "lines": ["Coffee"] }] },
+        ] }))
+        .unwrap();
+        crate::runsheet::save(&dir, &crate::runsheet::Saved { version: 1, rev: 9, run_sheet: other }).unwrap();
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut e = Engine::new(store, snap, 100);
+        e.tick_at(t0);
+        e.tick_at(t0 + Duration::from_secs(5));
+        assert_eq!(e.view().slide_index, 1, "the new run sheet's loop runs");
     }
 
     #[test]

@@ -10,22 +10,38 @@ export type Store = "keys" | "media";
 let opened: Promise<IDBDatabase> | null = null;
 
 export function open(): Promise<IDBDatabase> {
-  opened ??= new Promise((resolve, reject) => {
+  opened ??= new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(DB, VERSION);
     req.onupgradeneeded = () => {
       for (const name of ["keys", "media"] satisfies Store[])
         if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      // A newer version opened in another tab can upgrade instead of waiting on this one.
+      req.result.onversionchange = () => req.result.close();
+      resolve(req.result);
+    };
     req.onerror = () => reject(req.error);
+    // An older version of this page in another tab holds the database open.
+    req.onblocked = () =>
+      reject(new Error("Jivvy Live is open in another tab with an older version. Close that tab and reload this one."));
+  }).catch((e: unknown) => {
+    opened = null; // try again next time
+    throw e;
   });
   return opened;
 }
 
+/**
+ * One request in its own transaction. Resolves only once the transaction has committed, so a
+ * write that is later rolled back (disk full, quota) is reported, never taken as saved.
+ */
 export function run<T>(db: IDBDatabase, store: Store, mode: IDBTransactionMode, op: (s: IDBObjectStore) => IDBRequest): Promise<T> {
   return new Promise((resolve, reject) => {
-    const req = op(db.transaction(store, mode).objectStore(store));
-    req.onsuccess = () => resolve(req.result as T);
-    req.onerror = () => reject(req.error);
+    const tx = db.transaction(store, mode);
+    const req = op(tx.objectStore(store));
+    tx.oncomplete = () => resolve(req.result as T);
+    tx.onabort = () => reject(tx.error ?? req.error ?? new Error("This browser couldn't save it."));
+    tx.onerror = () => reject(tx.error ?? req.error);
   });
 }

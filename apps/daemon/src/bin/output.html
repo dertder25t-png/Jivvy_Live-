@@ -8,8 +8,10 @@
   html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; user-select: none; }
   /* The slide is laid out at the output's canvas size, then scaled to fit with black bars. */
   #stage { position: absolute; left: 50%; top: 50%; background: #000; overflow: hidden; transform-origin: center; }
-  #slide { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-           color: #fff; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 700; text-align: center; }
+  #slide { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+           padding: 0 6%; color: #fff; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 700; text-align: center;
+           line-height: 1.2; }
+  #clock { font-variant-numeric: tabular-nums; margin-top: .3em; font-size: 1.6em; }
   #ident { position: absolute; left: 4%; bottom: 4%; color: rgba(244, 241, 234, .55);
            font-family: Consolas, ui-monospace, monospace; letter-spacing: .08em; }
   /* !important: #slide sets display by id, which would otherwise win over this class. */
@@ -37,11 +39,35 @@
   // Until the first state arrives, show which output this is (helps setup; never shown again).
   ident.textContent = `Jivvy Live · ${canvas.label || "Output"} · ${canvas.w}×${canvas.h}`;
 
+  // A countdown slide's clock, ticking here so the engine never has to send the time.
+  let countdownTo = null;
+  let clock = null;
+  function tick() {
+    if (!clock || countdownTo === null) return;
+    const s = Math.max(0, Math.ceil((countdownTo - Date.now()) / 1000));
+    clock.textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  }
+  setInterval(tick, 250);
+
   window.jivvy = {
     render(state) {
       ident.classList.add("hidden");
-      // Placeholder content until run sheets reach the engine: the slide number.
-      slide.textContent = "Slide " + (state.slideIndex + 1);
+      slide.replaceChildren();
+      // The run sheet's slide; with no run sheet set, the slide number.
+      const lines = state.slide ? state.slide.lines : ["Slide " + (state.slideIndex + 1)];
+      for (const text of lines) {
+        const line = document.createElement("div");
+        line.textContent = text;
+        slide.append(line);
+      }
+      countdownTo = state.slide && state.slide.countdownTo !== undefined ? state.slide.countdownTo : null;
+      clock = null;
+      if (countdownTo !== null) {
+        clock = document.createElement("div");
+        clock.id = "clock";
+        slide.append(clock);
+        tick();
+      }
       slide.classList.toggle("hidden", state.black);
     },
   };

@@ -9,6 +9,10 @@ The church-computer side of Jivvy Live. See `docs/BUILD_PLAN.md` (Stage 1, Daemo
 - **`jivvy-outputs`** shows the state fullscreen on the projector and TVs. It follows the engine over the command channel like any other device, so **an engine restart never blanks a screen**: windows keep the last slide until the engine is back.
 - **`jivvy-video`** (built with `--features video`; needs GStreamer) captures the camera or capture card and the audio input, sends audio levels to the engine for live meters, and builds the **program feed**: lyrics composited over the camera and encoded once, for the recording and the stream. Skipped by the watchdog when not installed.
 
+## Run sheet
+
+`runsheet.set` (from the web app, or any paired device) replaces the run sheet: items (song, scripture, countdown, text, ...) already turned into slides by the UI. The engine saves it to `runsheet.json` (temp file, flushed, renamed) before acknowledging, so a restart shows the same service; the slide count comes from it (`--slides` only applies with no run sheet). Another run sheet starts on its first slide; an edit of the same one (same `id`) stays on the current slide, clamped. Every screen's state carries `runSheetId`, `runSheetRev` (up by one per set), `slideCount` and the current `slide`; `runsheet.get` returns the whole sheet. WebSocket messages may be up to 256 KiB to fit one.
+
 ## Output windows
 
 Borderless, always-on-top fullscreen windows placed in physical pixels on each monitor, so per-monitor DPI scaling and monitors left of or above the primary work (the GameWall DisplayHost pattern). Each window is a WebView showing `src/bin/output.html`, which works offline and hides the cursor.
@@ -26,7 +30,7 @@ Borderless, always-on-top fullscreen windows placed in physical pixels on each m
 - **A broken `outputs.json` keeps the screens as they were** and is reported as a problem.
 - **`outputs-status.json`** lists monitors, outputs, problems, whether the engine is connected, and the state on screen. The System screen will read it.
 
-Until run sheets reach the engine, an output shows "Slide N" (or nothing when black). Configuring outputs from the web app comes with the System screen.
+An output shows the run sheet's current slide (its lines, and a ticking clock on a countdown slide), "Slide N" when no run sheet is set, or nothing when black. Configuring outputs from the web app comes with the System screen.
 
 ## Camera and audio input
 
@@ -53,7 +57,7 @@ Camera and microphone run as separate GStreamer pipelines, so one failing never 
 `mic ────┘                                   └─> stream`
 
 - **Never stops because an input does.** The capture pipelines hand frames and audio to a clock-driven pacer that pushes exactly 30 frames a second (configurable) into the program: the newest camera frame, or a black slate when the camera is missing or has sent nothing for 500 ms, and a steady run of audio (the microphone, padded with silence; never more than 200 ms of backlog). Unplugging the camera mid-service switches to the slate without a dropped frame.
-- **Lyric layer** drawn natively in Rust (from the spike) only when the text changes, composited on the GPU (Direct3D 12) where available, on the CPU otherwise. Shows "Slide N" until run sheets reach the engine; nothing while the screen is black.
+- **Lyric layer** drawn natively in Rust (from the spike) only when the text changes, composited on the GPU (Direct3D 12) where available, on the CPU otherwise. Shows the run sheet's current slide ("Slide N" with no run sheet; a countdown's clock is on the output windows only); nothing while the screen is black.
 - **Encoded once:** H.264 + AAC, then a tee the recording and the stream will branch from. Encoder order: the configured one first, then Media Foundation, then x264. Each gets 4 seconds to produce a frame; a failure mid-service restarts from the preferred one. Quick Sync only when asked for by name (it crashed in the spike).
 - **Settings** in `media.json` (all optional): `"program": { "width": 1920, "height": 1080, "fps": 30, "bitrateKbps": 6000, "encoder": "auto", "path": "auto" }`; `encoder` is `auto`, `mf`, `qsv` or `x264`, `path` is `auto`, `gpu` or `cpu`. Whatever is left out, or `auto`, comes from the hardware check (below); whatever is set wins: that's the tech lead's override.
 - **Status** in `media-status.json` → `program`: encoder, picture path (`gpu`/`cpu`), frames per second out, bitrate, whether the slate is on, and the lyric text on screen; `hardware` holds the hardware check's reason in plain words.

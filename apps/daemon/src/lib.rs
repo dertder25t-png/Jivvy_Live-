@@ -22,6 +22,7 @@ pub mod preflight;
 pub mod program;
 pub mod protocol;
 pub mod recording;
+pub mod runsheet;
 pub mod snapshot;
 pub mod stream;
 pub mod tls;

@@ -320,7 +320,7 @@ impl Streamer {
 }
 
 pub(crate) fn wanted(feed: &Feed) -> bool {
-    feed.live.lock().unwrap().is_some_and(|s| s.stream_wanted)
+    feed.live.lock().unwrap().as_ref().is_some_and(|s| s.stream_wanted)
 }
 
 /// Sets a destination's state. Never call with an argument that locks `status` itself.

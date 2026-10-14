@@ -322,7 +322,7 @@ impl Program {
         let cache: Mutex<(Option<Vec<String>>, Option<gst_video::VideoOverlayComposition>)> = Mutex::default();
         let face = ab_glyph::FontRef::try_from_slice(font).map_err(|e| format!("font: {e}"))?;
         get("lyrics")?.connect("draw", false, move |_| {
-            let lines = lines_for(*feed.live.lock().unwrap());
+            let lines = lines_for(feed.live.lock().unwrap().as_ref());
             let mut c = cache.lock().unwrap();
             if c.0.as_ref() != Some(&lines) {
                 let refs: Vec<&str> = lines.iter().map(String::as_str).collect();

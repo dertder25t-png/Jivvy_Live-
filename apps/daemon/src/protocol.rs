@@ -87,6 +87,109 @@ pub enum Command {
         #[serde(rename = "deviceId")]
         device_id: String,
     },
+    /// Replace the run sheet the screens show; saved before the ack.
+    #[serde(rename = "runsheet.set")]
+    RunSheetSet {
+        #[serde(rename = "runSheet")]
+        run_sheet: RunSheet,
+    },
+    #[serde(rename = "runsheet.get")]
+    RunSheetGet,
+}
+
+/// One slide as the screens show it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Slide {
+    pub lines: Vec<String>,
+    /// A countdown slide counts down to this time (ms since epoch) under its lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub countdown_to: Option<u64>,
+}
+
+/// One item in the service (a song, a reading, a countdown...), already turned into slides
+/// by the UI; the daemon only shows slides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct RunSheetItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub slides: Vec<Slide>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct RunSheet {
+    pub id: String,
+    pub title: String,
+    pub items: Vec<RunSheetItem>,
+}
+
+impl RunSheet {
+    /// Every slide in order: what `slideIndex` counts.
+    pub fn slides(&self) -> impl Iterator<Item = &Slide> {
+        self.items.iter().flat_map(|i| i.slides.iter())
+    }
+}
+
+/// Run sheet limits, the same as the TypeScript package's.
+pub const MAX_RUNSHEET_ITEMS: usize = 200;
+pub const MAX_RUNSHEET_SLIDES: usize = 2000;
+pub const MAX_SLIDE_LINES: usize = 16;
+pub const MAX_SLIDE_LINE: usize = 200;
+pub const MAX_TITLE: usize = 200;
+
+/// At most `max` characters (code points, as JavaScript's `[...s]` counts), no control characters.
+fn plain_text(v: Option<&Value>, max: usize) -> Option<String> {
+    let s = v?.as_str()?;
+    let control = s.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f);
+    (s.chars().count() <= max && !control).then(|| s.to_string())
+}
+
+fn slide(v: &Value) -> Option<Slide> {
+    let obj = v.as_object()?;
+    let lines = obj.get("lines")?.as_array()?;
+    if lines.len() > MAX_SLIDE_LINES {
+        return None;
+    }
+    let lines = lines.iter().map(|l| plain_text(Some(l), MAX_SLIDE_LINE)).collect::<Option<Vec<_>>>()?;
+    let countdown_to = match obj.get("countdownTo") {
+        None => None,
+        Some(t) => Some(js_integer(t).filter(|f| *f >= 0.0)? as u64),
+    };
+    Some(Slide { lines, countdown_to })
+}
+
+/// A valid run sheet with unknown fields dropped, as the TypeScript `parseRunSheet`.
+pub fn run_sheet(v: Option<&Value>) -> Option<RunSheet> {
+    let obj = v?.as_object()?;
+    let id = id_field(obj.get("id"))?;
+    let title = plain_text(obj.get("title"), MAX_TITLE)?;
+    let raw_items = obj.get("items")?.as_array()?;
+    if raw_items.len() > MAX_RUNSHEET_ITEMS {
+        return None;
+    }
+    let mut total = 0;
+    let mut items = Vec::with_capacity(raw_items.len());
+    for it in raw_items {
+        let it = it.as_object()?;
+        let id = id_field(it.get("id"))?;
+        let kind = it.get("kind")?.as_str()?;
+        let kind_ok = (1..=32).contains(&kind.len())
+            && kind.starts_with(|c: char| c.is_ascii_lowercase())
+            && kind.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !kind_ok {
+            return None;
+        }
+        let title = plain_text(it.get("title"), MAX_TITLE)?;
+        let raw_slides = it.get("slides")?.as_array()?;
+        total += raw_slides.len();
+        if total > MAX_RUNSHEET_SLIDES {
+            return None;
+        }
+        let slides = raw_slides.iter().map(slide).collect::<Option<Vec<_>>>()?;
+        items.push(RunSheetItem { id, kind: kind.into(), title, slides });
+    }
+    Some(RunSheet { id, title, items })
 }
 
 /// One streaming platform, as the video process reports it.
@@ -338,6 +441,17 @@ pub struct StateSnapshot {
     /// Each platform's state and quality while streaming; left out when there's nothing to show.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stream_destinations: Vec<StreamDestination>,
+    /// The run sheet on the daemon; these four are left out when none is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_sheet_id: Option<String>,
+    /// Goes up by one every time a run sheet is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_sheet_rev: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slide_count: Option<u64>,
+    /// The slide at `slide_index`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slide: Option<Slide>,
 }
 
 /// A device waiting for approval, as the church computer sees it.
@@ -392,6 +506,9 @@ pub struct AckExtras {
     pub devices: Option<Vec<DeviceInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preflight: Option<Preflight>,
+    /// runsheet.get
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_sheet: Option<RunSheet>,
 }
 
 /// One platform in the pre-flight summary.
@@ -587,6 +704,11 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "pair.close" => Command::PairClose,
         "device.list" => Command::DeviceList,
         "stream.preflight" => Command::StreamPreflight,
+        "runsheet.get" => Command::RunSheetGet,
+        "runsheet.set" => match run_sheet(obj.get("runSheet")) {
+            Some(run_sheet) => Command::RunSheetSet { run_sheet },
+            None => return Err((ErrorCode::BadArguments, "runsheet.set needs a valid runSheet")),
+        },
         "pair.request" => match (public_key(obj.get("publicKey")), device_name(obj.get("name"))) {
             (Some(public_key), Some(name)) => Command::PairRequest { public_key, name },
             _ => {
@@ -759,6 +881,10 @@ mod tests {
             recording_wanted: false,
             recording_low_disk: false,
             stream_destinations: Vec::new(),
+            run_sheet_id: None,
+            run_sheet_rev: None,
+            slide_count: None,
+            slide: None,
         };
         assert_eq!(
             serde_json::to_string(&ack("x", Some(state))).unwrap(),
@@ -774,6 +900,10 @@ mod tests {
             recording_wanted: true,
             recording_low_disk: true,
             stream_destinations: Vec::new(),
+            run_sheet_id: None,
+            run_sheet_rev: None,
+            slide_count: None,
+            slide: None,
         };
         assert_eq!(
             serde_json::to_string(&state_event(state)).unwrap(),

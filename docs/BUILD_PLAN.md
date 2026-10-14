@@ -166,7 +166,7 @@ Everything a church needs to run a whole service. Built and tested by us on our 
 - [x] Watchdog + engine as separate processes, state snapshot every second, auto-restart on the same slide
   - Done (`apps/daemon`): the snapshot is saved before every change is acknowledged. Chaos tests: 100 kills, slowest return to the same slide 1.68 s; a hung engine is restarted after 2 s without a heartbeat; the engine exits if the watchdog dies; a corrupted snapshot falls back to the previous one.
 - [x] Fullscreen output windows per monitor, custom resolutions (reuse the GameWall DisplayHost pattern)
-  - Done (`jivvy-outputs`): its own supervised process that follows the engine, so an engine restart never blanks a screen. Automatic on every non-operator monitor, or `outputs.json` for named outputs and custom (letterboxed) resolutions; never falls back to the operator's screen; hot-plug re-checked every second. Shows "Slide N" until run sheets reach the engine; configuring outputs from the UI comes with the System screen.
+  - Done (`jivvy-outputs`): its own supervised process that follows the engine, so an engine restart never blanks a screen. Automatic on every non-operator monitor, or `outputs.json` for named outputs and custom (letterboxed) resolutions; never falls back to the operator's screen; hot-plug re-checked every second. Shows the run sheet's slides (or "Slide N" with none); configuring outputs from the UI comes with the System screen.
 - [x] Camera/capture card and audio interface input, with live audio meter
   - Done (`jivvy-video`): camera and audio as separate GStreamer pipelines, chosen in `media.json` (auto by default), retried every second when unplugged, never swapped for another device. Levels reach every screen ten times a second as `levels` events; the meter widget itself comes with the operator view. Tested on the laptop camera (30 fps) and microphone, and on test sources in CI (Linux).
 - [x] Lyric layer composited over camera, hardware encode, one encode sent to stream and recording
@@ -192,6 +192,7 @@ Everything a church needs to run a whole service. Built and tested by us on our 
 **Next, in order (web app first, against the real daemon with `--test-sources`)**
 
 - [ ] Run sheet: songs, scripture, images, PDF slides, countdown, pre-service loop
+  - In progress: `apps/web` started (SvelteKit, a static single-page app: Cloudflare Pages serves it, and the daemon can serve the same files on the LAN with no server code). The run sheet screen builds songs, scripture, countdowns and text slides, pairs the browser as a device (key in IndexedDB, never extractable), sends the sheet with `runsheet.set` and drives Next/Back/Black/go-to over the WebSocket channel. The engine saves the run sheet (`runsheet.json`) and every screen and the stream's lyric layer show its slides. Left: images and PDF slides (need media sent to the church computer), the pre-service loop (auto-advancing slides), and keeping the editable words (today they stay in the browser until the local database item).
 - [ ] Song editor with arrangement blocks; paste-to-slides with section detection; public-domain hymn library
 - [ ] Operator view and locked volunteer mode
 - [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all

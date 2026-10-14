@@ -5,9 +5,10 @@
   "workspaces": ["apps/*", "packages/*"],
   "engines": { "node": ">=22" },
   "scripts": {
-    "build": "npm run build -w @jivvy/site",
+    "build": "npm run build -w @jivvy/site && npm run build -w @jivvy/web",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "dev:site": "npm run dev -w @jivvy/site"
+    "dev:site": "npm run dev -w @jivvy/site",
+    "dev:web": "npm run dev -w @jivvy/web"
   }
 }

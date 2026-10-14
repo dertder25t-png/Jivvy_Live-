@@ -58,11 +58,15 @@ function chunks<T>(list: T[], size: number): T[][] {
   return out;
 }
 
-/** Words wrapped into lines of at most `width` characters (a longer word gets its own line). */
+/** A line longer than the protocol allows is wrapped at about this many characters. */
+export const LONG_LINE_WIDTH = 60;
+
+/** Words wrapped into lines of at most `width` characters; a longer word is split. */
 export function wrap(text: string, width: number): string[] {
   const lines: string[] = [];
   let line = "";
-  for (const word of clean(text.replace(/\s+/g, " "), Infinity).split(" ").filter(Boolean)) {
+  const words = clean(text.replace(/\s+/g, " "), Infinity).split(" ").filter(Boolean);
+  for (const word of words.flatMap((w) => chunks([...w], width).map((c) => c.join("")))) {
     if (line && line.length + 1 + word.length > width) {
       lines.push(line);
       line = word;
@@ -105,7 +109,10 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
     // Songs and text; also any kind this version doesn't know (a draft saved by a newer one).
     default: {
       const size = item.kind === "song" ? SONG_LINES : MAX_SLIDE_LINES;
+      // A line too long for a slide (a pasted paragraph) is wrapped, never cut short.
+      const fit = (l: string) => ([...l].length > MAX_SLIDE_LINE ? wrap(l, LONG_LINE_WIDTH) : [l]);
       return paragraphs(item.text ?? "")
+        .map((p) => p.flatMap(fit))
         .flatMap((p) => chunks(p, size))
         .map((lines) => ({ lines: lines.map((l) => clean(l)) }));
     }

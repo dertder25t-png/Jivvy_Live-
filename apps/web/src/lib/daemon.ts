@@ -40,11 +40,14 @@ const pairedKey = (url: string) => `jivvy.paired:${url}`;
 const pairedInMemory = new Map<string, string>();
 const paired = {
   get(url: string): string | null {
+    let stored: string | null = null;
     try {
-      return localStorage.getItem(pairedKey(url));
+      stored = localStorage.getItem(pairedKey(url));
     } catch {
-      return pairedInMemory.get(url) ?? null;
+      // blocked storage: memory only
     }
+    // Also when the write failed but reads work (storage full): memory has it for this visit.
+    return stored ?? pairedInMemory.get(url) ?? null;
   },
   set(url: string, deviceId: string): void {
     pairedInMemory.set(url, deviceId);
@@ -89,7 +92,7 @@ export class DaemonConnection {
       return;
     }
     this.ws = ws;
-    ws.onopen = () => void this.start();
+    ws.onopen = () => void this.start(ws);
     ws.onmessage = (m) => this.receive(String(m.data));
     ws.onclose = () => {
       if (this.ws !== ws) return;
@@ -107,12 +110,22 @@ export class DaemonConnection {
     if (this.retry) clearTimeout(this.retry);
     this.ws?.close();
     this.ws = null;
+    // Anything still waiting (an upload mid-way) hears now, rather than never.
+    for (const done of this.waiting.values()) done(failed("disconnected"));
+    this.waiting.clear();
   }
 
   /** Sends a command and resolves with its ack (a failed ack when disconnected). */
   send(command: Command): Promise<Ack> {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(failed("not connected"));
+    return this.sendOn(this.ws, command);
+  }
+
+  /**
+   * Sends on `ws` only if it is still this connection's socket: a step begun on a socket that
+   * has since closed must never land on the next one (an old auth.prove would spoil its sign-in).
+   */
+  private sendOn(ws: WebSocket | null, command: Command): Promise<Ack> {
+    if (!ws || ws !== this.ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(failed("not connected"));
     const env = makeEnvelope(command);
     // The daemon would refuse it and close the connection; say so here instead.
     const bytes = messageBytes(env);
@@ -154,7 +167,7 @@ export class DaemonConnection {
     else if (e.event === "pair.result") {
       if (e.approved) {
         paired.set(this.url, e.deviceId ?? "paired");
-        void this.start();
+        void this.start(this.ws);
       } else {
         this.h.status({ kind: "unpaired", message: "The church computer didn't approve this device." });
       }
@@ -171,24 +184,26 @@ export class DaemonConnection {
     });
   }
 
-  /** Proves this device's key, then follows the state. */
-  private async start(): Promise<void> {
+  /** Proves this device's key on `ws`, then follows the state. Stops if `ws` is replaced meanwhile. */
+  private async start(ws: WebSocket | null): Promise<void> {
+    const current = () => ws !== null && ws === this.ws;
     if (!paired.get(this.url)) return this.h.status({ kind: "unpaired" });
     const key = await deviceKey();
-    const hello = await this.send({ type: "auth.hello", publicKey: await publicKey(key) });
-    // Disconnected mid-way: the reconnect tries again, still paired.
-    if (!hello.ok && hello.code === "unavailable") return;
+    const hello = await this.sendOn(ws, { type: "auth.hello", publicKey: await publicKey(key) });
+    // Disconnected mid-way (or this socket was replaced): the reconnect tries again, still paired.
+    if (!current() || (!hello.ok && hello.code === "unavailable")) return;
     if (!hello.ok || !hello.challenge || !hello.daemonId) return this.h.status({ kind: "unpaired" });
     const signature = await sign(key, authMessage(hello.daemonId, hello.challenge));
-    const proof = await this.send({ type: "auth.prove", signature });
-    if (!proof.ok && proof.code !== "unauthorized") return; // disconnected: the reconnect tries again
+    const proof = await this.sendOn(ws, { type: "auth.prove", signature });
+    if (!current() || (!proof.ok && proof.code !== "unauthorized")) return;
     if (!proof.ok) {
       // Removed on the church computer, or another daemon at this address: pair again.
       paired.remove(this.url);
       return this.h.status({ kind: "unpaired", message: "This device isn't paired with this church computer." });
     }
     this.rev = undefined;
-    const sub = await this.send({ type: "state.subscribe" });
+    const sub = await this.sendOn(ws, { type: "state.subscribe" });
+    if (!current()) return;
     if (!sub.ok) return this.h.status({ kind: "offline", message: sub.message });
     this.h.status({ kind: "ready" });
     if (sub.state) this.gotState(sub.state);

@@ -10,8 +10,23 @@ export type Store = "keys" | "media";
 let opened: Promise<IDBDatabase> | null = null;
 
 export function open(): Promise<IDBDatabase> {
-  opened ??= new Promise<IDBDatabase>((resolve, reject) => {
-    const req = indexedDB.open(DB, VERSION);
+  opened ??= openAt(VERSION)
+    .catch((e: unknown) => {
+      // A newer version of this page has upgraded it: open it as it is (its stores are a
+      // superset of ours), so going back a version never loses the key or the pictures.
+      if (e instanceof DOMException && e.name === "VersionError") return openAt(undefined);
+      throw e;
+    })
+    .catch((e: unknown) => {
+      opened = null; // try again next time
+      throw e;
+    });
+  return opened;
+}
+
+function openAt(version: number | undefined): Promise<IDBDatabase> {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const req = version === undefined ? indexedDB.open(DB) : indexedDB.open(DB, version);
     req.onupgradeneeded = () => {
       for (const name of ["keys", "media"] satisfies Store[])
         if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
@@ -25,11 +40,7 @@ export function open(): Promise<IDBDatabase> {
     // An older version of this page in another tab holds the database open.
     req.onblocked = () =>
       reject(new Error("Jivvy Live is open in another tab with an older version. Close that tab and reload this one."));
-  }).catch((e: unknown) => {
-    opened = null; // try again next time
-    throw e;
   });
-  return opened;
 }
 
 /**

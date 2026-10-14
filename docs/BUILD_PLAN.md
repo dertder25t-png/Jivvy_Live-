@@ -144,15 +144,24 @@ Prove the hardest piece works before building on it.
 
 Decided Oct 6, 2026: build a complete, working system and prove it in-house before contacting any church. No surveys, calls, pilots or preorders until Stage 1 is done. The website's waitlist collects interest passively in the meantime; nobody gets an email until alpha testing opens.
 
-1. **Stage 1, Build and test in-house:** everything a church needs to run a whole service, built and tested by us on our own hardware.
+1. **Stage 1, Build and test in-house:** everything a church needs to run a whole service, built and tested by us on our own hardware. Split into 1A (Build) and 1B (Harden); see below.
 2. **Stage 2, Alpha testing and launch:** email the waitlist, churches that asked to test join the alpha, then launch.
 3. Stages 3 onward, shaped by what alpha test churches ask for.
 
 ## Stage 1: Build the complete system, tested in-house (12–16 weeks)
 
-Everything a church needs to run a whole service, with every reliability feature built in from the start. Built and tested by us on our own hardware before any church sees it.
+Everything a church needs to run a whole service. Built and tested by us on our own hardware before any church sees it.
 
-**Daemon (church computer)**
+**Build now, harden later (decided Oct 14, 2026).** Through the first daemon items we built every feature and its full chaos coverage at the same time: 180 tests that rely on exact timing, 100 engine kills on two operating systems, every feature built three times (protocol, simulated daemon, real daemon). Keeping those tests green took more time than building, the web app hadn't been started, and nobody could run a service end to end. So Stage 1 now runs in two phases:
+
+- **Stage 1A, Build:** get to a complete, working system fast. Each feature ships with one or two happy-path tests that show it works. No new chaos tests, timing thresholds or kill loops. The existing chaos, video and streaming tests still run nightly in CI but don't block merges. Anything they catch goes in `docs/HARDENING.md` to be fixed later. The protocol rule (never break it) still applies.
+- **Stage 1B, Harden:** with the system complete, work through `docs/HARDENING.md`, script every row of the reliability table, and run the hardware lab, the soak test and the mock Sundays. The reliability targets are unchanged and are the exit bar for Stage 1.
+
+### Stage 1A: Build
+
+**Done when:** one person can plan a service in the web app and run it end to end on the founder's laptop: slides on the output screen, lyrics over camera, stream to the local test server, and a recording, controlled from a phone on the LAN.
+
+**Daemon (church computer), built so far**
 
 - [x] Watchdog + engine as separate processes, state snapshot every second, auto-restart on the same slide
   - Done (`apps/daemon`): the snapshot is saved before every change is acknowledged. Chaos tests: 100 kills, slowest return to the same slide 1.68 s; a hung engine is restarted after 2 s without a heartbeat; the engine exits if the watchdog dies; a corrupted snapshot falls back to the previous one.
@@ -173,39 +182,57 @@ Everything a church needs to run a whole service, with every reliability feature
 - [x] Hardware check and automatic settings (was "Encoder self-test and fallback"; moved ahead of the secure channel on Oct 9, 2026, since a PC without a working GPU would stream at ~7 fps today): during setup after download, after driver or hardware changes, and in pre-flight, check the machine and run the real program pipeline for a few seconds on each path: GPU compositing (D3D12 on Windows, Metal on Mac, VA-API/GL on Linux) and the CPU path, with each encoder (Media Foundation, vendor plugins, VideoToolbox, VA-API, x264). Pick the fastest combination that holds the frame rate with headroom; if none does at 1080p30, step the program and recording quality down (720p30, then 480p30) until one does, and show what was chosen and why in plain words. A path or encoder is used only if it measurably keeps up, never just because it is installed (today a PC without a working GPU picks D3D12 and Media Foundation in software and streams at ~7 fps). Must work with no GPU at all, weak integrated graphics, small or cheap eGPUs and older machines, with the CPU path as the backup. Windows first, then Mac and Linux. The tech lead can override; the check never runs during a service window. The encoder runs where the watchdog can restart it without losing the recording
   - Done (`jivvy-video --hardware-check`, merged as #27 to #29): measures each picture path and encoder, the program uses the choice, the watchdog runs it on first start and again when the machine changes. The System screen and pre-flight button wait on the web app; Mac and Linux graphics paths wait on lab hardware.
   - In progress: `jivvy-video --hardware-check` measures each path and encoder with the lyric layer on and writes `hardware.json` (choice and reason); the watchdog runs it before video on first start and whenever the machine no longer matches the report (a new graphics card or driver, GStreamer update, another computer; slides don't wait), and the program uses its choice for whatever `media.json` leaves out or sets to `auto` (the tech lead's override). Left: the pre-flight re-check button, the System screen and override UI (they need the web app), and the Mac and Linux GPU paths (Metal, VA-API).
-- [ ] Local secure command channel (per-church hostname + certificate); certificate renewal stays free forever for every church
-  - In progress: the protocol over WebSocket is done (`--listen-ws`, off by default; same envelopes, acks and events as the TCP channel; browsers only from allowed origins), and so is TLS on it (`--ws-cert`/`--ws-key`: `wss://` only, never a plain fallback; a renewed certificate is picked up without a restart). Pairing and device keys are done too: a device pairs while the church computer has pairing open, both screens show the same code, the church computer approves, and the device proves its key (ECDSA P-256) on every connection; devices can be listed and removed (removal cuts them off at once); the local channel only takes connections from the church computer itself. Left: issuing the per-church hostname and certificate, and how devices find the daemon when the internet is down.
+- [x] Command channel on the local network (WebSocket, TLS, pairing and device keys). The per-church hostname and certificate, and the offline QR/short-code path, are parked (see Parked below); certificate renewal stays free forever for every church
+  - Done: the protocol over WebSocket is done (`--listen-ws`, off by default; same envelopes, acks and events as the TCP channel; browsers only from allowed origins), and so is TLS on it (`--ws-cert`/`--ws-key`: `wss://` only, never a plain fallback; a renewed certificate is picked up without a restart). Pairing and device keys are done too: a device pairs while the church computer has pairing open, both screens show the same code, the church computer approves, and the device proves its key (ECDSA P-256) on every connection; devices can be listed and removed (removal cuts them off at once); the local channel only takes connections from the church computer itself. Left: issuing the per-church hostname and certificate, and how devices find the daemon when the internet is down.
   - Decided (Oct 9, 2026): the per-church hostname stays the normal way in. When it can't be reached (internet down, DNS blocked), the church computer shows a QR code with its local address, plus a short code a phone can type instead of scanning; a device pairs by entering the code shown on the church computer. Nothing about joining or pairing needs the internet.
   - The fallback must stay authenticated and encrypted, and the certificate can't provide that: it covers the hostname, not a raw local address, and browsers block plain `ws://` from the secure web app. So the QR code (or short code) leads to the web app the daemon serves on the local network, and that page talks to the daemon over an application-layer encrypted, authenticated channel: the pairing code (or the secret in the QR code) is the shared secret for a key exchange (a password-authenticated handshake, e.g. Noise with a pre-shared key or SPAKE2), with the daemon's key fingerprint carried in the QR code; devices paired while online keep their keys and need no code offline. Crypto runs in the page's own code, since browsers withhold WebCrypto from non-https pages. No control traffic or pairing secret ever crosses the network in plain text. The exact scheme is designed and reviewed with the secure channel before any of it ships.
-- [ ] Streaming, the rest: bandwidth manager Advanced mode, the pre-flight streaming summary and lowered/paused alerts, two-connection support, and the check on a private YouTube event once the channel can go live
-  - In progress: lowered/paused alerts are done: every screen sees each platform's state and quality (`streamDestinations`), and gets an alert in plain words when a platform is lowered, paused or resumed (tested on a throttled upload with one and two platforms). Push and email to the tech lead come with the No-audio and stream-down alerts item. Advanced mode is done too: ranking by order, a top quality per platform, and lower, audio only (sound plus a 2 fps picture at 100 kbps, since platforms need video) or pause when short; with nothing set it is exactly Auto (tested on a throttled upload: YouTube capped at 480p, then kept live on audio only where Auto would pause it). The settings live in `stream.json` until the web app's settings screen. The pre-flight summary is done: a 5 s upload test to our own endpoint on live.jivvy.org (decided Oct 13, 2026: our endpoint, not a third party's), then "YouTube 1080p + Facebook 720p" from the bandwidth manager's own rules, falling back to the last speed measured when offline; never while streaming. Left: two connections, the private YouTube event check.
-- [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all
-- [ ] Local database on the church computer (SQLite) holding the library, plans, themes and settings. It is the master copy during a service and the only copy for churches without Plus; the cloud is a synced copy, never the source of truth on Sunday
-- [ ] Automatic local backups: a snapshot after every successful save (keep the last 5 good states) plus one per day for 30 days, each integrity-checked, with one-click restore. Backups never run mid-service and never fill the disk (pre-flight warns first)
-- [ ] Keyboard and clicker control on the computer itself
-- [ ] Blocks sleep during services; no updates during service windows; signed auto-updates with rollback
+- [x] Streaming, the rest: bandwidth manager Advanced mode, the pre-flight streaming summary and lowered/paused alerts (two-connection support and the private YouTube event check are parked)
+  - Lowered/paused alerts are done: every screen sees each platform's state and quality (`streamDestinations`), and gets an alert in plain words when a platform is lowered, paused or resumed (tested on a throttled upload with one and two platforms). Push and email to the tech lead come with the No-audio and stream-down alerts item. Advanced mode is done too: ranking by order, a top quality per platform, and lower, audio only (sound plus a 2 fps picture at 100 kbps, since platforms need video) or pause when short; with nothing set it is exactly Auto (tested on a throttled upload: YouTube capped at 480p, then kept live on audio only where Auto would pause it). The settings live in `stream.json` until the web app's settings screen. The pre-flight summary is done: a 5 s upload test to our own endpoint on live.jivvy.org (decided Oct 13, 2026: our endpoint, not a third party's), then "YouTube 1080p + Facebook 720p" from the bandwidth manager's own rules, falling back to the last speed measured when offline; never while streaming.
 
-**Web app**
+**Next, in order (web app first, against the real daemon with `--test-sources`)**
 
 - [ ] Run sheet: songs, scripture, images, PDF slides, countdown, pre-service loop
 - [ ] Song editor with arrangement blocks; paste-to-slides with section detection; public-domain hymn library
-- [ ] Themes (fonts, colors, backgrounds)
 - [ ] Operator view and locked volunteer mode
+- [ ] Daemon serves the full web app on the local network, so a church can run with no cloud account at all
+- [ ] Local database on the church computer (SQLite) holding the library, plans, themes and settings. It is the master copy during a service and the only copy for churches without Plus; the cloud is a synced copy, never the source of truth on Sunday
+- [ ] Themes (fonts, colors, backgrounds)
+- [ ] Pre-flight check (a web app screen using the daemon's checks and streaming summary)
 - [ ] Installable PWA that keeps working offline
-- [ ] Pre-flight check
+- [ ] Keyboard and clicker control on the computer itself
+
+**Then**
+
 - [ ] No-audio and stream-down alerts (web push + email)
+- [ ] Blocks sleep during services; no updates during service windows
 - [ ] Church account, Stripe checkout, license key, 30-day trial
-- [ ] Feature gating by release date: every gated feature has a `releasedAt`; a license unlocks local features released before its updates window ends and cloud features while Plus is active. Checked offline, never during a service window, never shown to volunteers or on screen
 - [ ] Export of songs, run sheets, themes and settings in open formats, available on every license
-- [ ] Sync engine between the church computer and Supabase: queues edits made offline, syncs when the connection returns, resolves edits made in two places (per-field last-writer-wins with a visible "changed elsewhere" notice; songs keep both versions), and shows sync status. Pauses cleanly when Plus ends, leaving the local copy complete. Chaos test: edit on two devices while the internet is cut
+- [ ] Sync engine between the church computer and Supabase: queues edits made offline, syncs when the connection returns, resolves edits made in two places (per-field last-writer-wins with a visible "changed elsewhere" notice; songs keep both versions), and shows sync status. Pauses cleanly when Plus ends, leaving the local copy complete. (Its chaos test, editing on two devices while the internet is cut, is written in 1B.)
+
+**Parked until Stage 1B or Stage 2 (nothing here is dropped)**
+
+- [ ] Per-church hostname under d.jivvy.org, with its certificate issued and renewed automatically
+- [ ] Offline joining: a QR code or short code with the local address, and the application-layer encrypted, authenticated channel keyed from the pairing code (see the command channel notes above)
+- [ ] Streaming: two connections at once (church internet plus a hotspot or USB modem)
+- [ ] Streaming: the check on a private YouTube event once the channel can go live
+- [ ] Automatic local backups: a snapshot after every successful save (keep the last 5 good states) plus one per day for 30 days, each integrity-checked, with one-click restore. Backups never run mid-service and never fill the disk (pre-flight warns first)
+- [ ] Signed auto-updates with rollback
+- [ ] Feature gating by release date: every gated feature has a `releasedAt`; a license unlocks local features released before its updates window ends and cloud features while Plus is active. Checked offline, never during a service window, never shown to volunteers or on screen
 - [ ] System screen for tech leads: sync status and last sync, local backups (browse, restore, export), cameras, audio and encoders (with the self-test result), disk space, license and updates. Locked behind the admin PIN once roles exist; hidden in volunteer mode
+- [ ] Recording: join the parts of a crashed recording into one MP4; fsync so a power cut loses only the last moments
+- [ ] Hardware check: Mac and Linux GPU paths (Metal, VA-API), once lab hardware exists
+- [ ] Simulated daemon (`packages/sim-daemon`) catches up with everything the real daemon gained in 1A (needed for the Stage 2 demo)
 
-**In-house testing (no churches)**
+### Stage 1B: Harden
 
+Starts when 1A is done. The reliability targets are the same as always; this is where they're enforced.
+
+- [ ] Work through `docs/HARDENING.md`: every test the nightly run flagged passes at full strength on Windows and Linux
 - [ ] Hardware lab: the founder's laptop plus a ~$300 Windows laptop (repeat the Stage 0 spike on it first), an older machine with weak integrated graphics, a machine (or VM) with no usable GPU, a USB capture card and a USB audio interface; a Mac when Mac support starts
-- [ ] Chaos test suite: every row of the reliability table scripted and passing, against the simulated daemon in CI and the real daemon on the lab machines
+- [ ] Chaos test suite: every row of the reliability table scripted and passing, against the simulated daemon in CI and the real daemon on the lab machines, including the 1A features (web app, SQLite, sync)
 - [ ] Soak test: a 4-hour simulated service (camera, lyrics, stream, recording) on every lab machine
-- [ ] Mock Sundays: run a full service plan end to end, as a church would, every week of Stage 1; each failure gets a write-up and a test that reproduces it
+- [ ] Mock Sundays: run a full service plan end to end, as a church would, every week of Stage 1B; each failure gets a write-up and a test that reproduces it
+- [ ] The parked items above that alpha needs (at least the per-church hostname, offline joining, backups and signed updates)
 
 **Done when:** 4 mock Sundays in a row run on the lab machines with zero service-stopping failures, every chaos test passes, the stream reaches a private YouTube event, and a first-time volunteer (a friend, not a church) runs a service after a 5-minute walkthrough.
 
@@ -328,7 +355,7 @@ Reliability comes from testing like it's Sunday every day, and from never shippi
 
 - **Hardware lab:** at least 3 machines that match real booths — a cheap Intel laptop, a cheap AMD laptop, and a Mac — plus a USB capture card and a USB audio interface.
 - **Soak test:** every release candidate runs a 4-hour simulated service (camera, lyrics, stream to a private YouTube event, recording) on all lab machines.
-- **Chaos tests:** each item in the failure-mode table above is scripted and run before every release.
+- **Chaos tests:** each item in the failure-mode table above is scripted and run before every release. During Stage 1A they run nightly and report; they gate releases from Stage 1B on.
 - **Automated tests:** unit tests for the command protocol, song parsing and importers; end-to-end tests for the web app.
 
 **Release**
@@ -362,7 +389,7 @@ This plan is the source of truth for whoever (or whichever Claude session) is bu
 
 1. Read this plan and pick the next unchecked item in the current stage; don't start later stages early.
 2. One item per branch and pull request, small enough to review in one sitting.
-3. Every change ships with tests; daemon changes also pass the chaos tests in the reliability table.
+3. Build first, harden later: in Stage 1A each feature ships with one or two happy-path tests; chaos tests, timing thresholds and kill loops are written in Stage 1B. Failures from the nightly full run go in `docs/HARDENING.md`, not into the current PR.
 4. Never break the command protocol: add fields, don't rename or remove them, and keep the previous version working.
 5. Nothing during a service may depend on the cloud. If a change would add that dependency, stop and flag it.
 6. Keep secrets (stream keys, API keys) out of the repo and out of logs.
@@ -372,7 +399,7 @@ This plan is the source of truth for whoever (or whichever Claude session) is bu
 1. Stage 0 tech spike (daemon prototype: lyrics over camera, hardware encode, recording) — done
 2. `packages/protocol` and a simulated daemon — done
 3. Website on Cloudflare Pages — done
-4. Stage 1 items, in order — next
+4. Stage 1A items, in order, starting with the web app — next; then Stage 1B hardening
 5. Stage 2: alpha testing, demo and launch — only after Stage 1 is done
 
 ## Costs, pricing and business

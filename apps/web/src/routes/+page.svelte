@@ -115,18 +115,29 @@
     adding = "";
   }
 
-  /** A PDF item holds one document: picking another replaces its pages. */
+  /**
+   * A PDF item holds one document: picking another replaces its pages. Only the newest pick
+   * for an item counts, so a slow earlier one can't land on top of it.
+   */
+  const pdfPicks = new Map<string, number>();
   async function addPdfTo(item: DraftItem, file: File | undefined) {
     if (!file) return;
+    const pick = (pdfPicks.get(item.id) ?? 0) + 1;
+    pdfPicks.set(item.id, pick);
+    const newest = () => pdfPicks.get(item.id) === pick;
     sendError = "";
     try {
-      const pages = await addPdf(file, (page, total) => (adding = `Reading page ${page} of ${total}…`));
+      const pages = await addPdf(file, (page, total) => {
+        if (newest()) adding = `Reading page ${page} of ${total}…`;
+      });
+      if (!newest()) return;
       item.images = pages;
       if (!item.title || item.title === "PDF slides") item.title = file.name.replace(/\.pdf$/i, "");
     } catch (e) {
-      sendError = e instanceof Error ? e.message : String(e);
+      if (newest()) sendError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (newest()) adding = "";
     }
-    adding = "";
   }
 
   const go = (type: "slide.next" | "slide.prev") => conn?.send({ type });

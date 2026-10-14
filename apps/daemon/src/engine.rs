@@ -20,11 +20,10 @@ use crate::protocol::{
 use crate::snapshot::{Snapshot, Store};
 use crate::tls::TlsFiles;
 
-/// Longest line accepted on the command channel; protocol messages are tiny.
-const MAX_LINE: usize = 16 * 1024;
-/// Longest message on the WebSocket channel: room for a whole run sheet (`runsheet.set`).
-/// The same as the TypeScript `MAX_MESSAGE_BYTES`, which UIs check before sending.
-const MAX_WS_MESSAGE: usize = 1024 * 1024;
+/// Longest message on either command channel (a TCP line or a WebSocket message): room for
+/// a whole run sheet (`runsheet.set`). The same as the TypeScript `MAX_MESSAGE_BYTES`, which
+/// UIs check before sending.
+const MAX_MESSAGE: usize = 1024 * 1024;
 /// Messages queued for one connection before it counts as stuck and is disconnected.
 const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
@@ -792,11 +791,11 @@ fn read_commands(stream: TcpStream, engine: &Mutex<Engine>, outbox: &Outbox) -> 
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let n = (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf)?;
+        let n = (&mut reader).take(MAX_MESSAGE as u64 + 1).read_until(b'\n', &mut buf)?;
         if n == 0 {
             return Ok(());
         }
-        let ack = if n > MAX_LINE && buf.last() != Some(&b'\n') {
+        let ack = if n > MAX_MESSAGE && buf.last() != Some(&b'\n') {
             discard_line(&mut reader)?;
             protocol::nack("", ErrorCode::BadMessage, "message too long")
         } else {
@@ -920,8 +919,8 @@ fn ws_session<S: OverTcp>(
         Err(no)
     };
     let config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_WS_MESSAGE))
-        .max_frame_size(Some(MAX_WS_MESSAGE));
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
     let Ok(mut ws) = tungstenite::accept_hdr_with_config(stream, check_origin, Some(config)) else {
         return Ok(());
     };
@@ -1329,11 +1328,16 @@ mod tests {
         std::thread::spawn(move || serve(listener, engine));
         let mut s = TcpStream::connect(addr).unwrap();
         s.write_all(b"{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}\n\n").unwrap();
-        s.write_all(&vec![b'x'; MAX_LINE + 10]).unwrap();
+        s.write_all(&vec![b'x'; MAX_MESSAGE + 10]).unwrap();
         s.write_all(b"\n{\"v\":1,\"id\":\"b\",\"ts\":1,\"command\":{\"type\":\"state.get\"}}\n").unwrap();
+        // A line the size of a real run sheet (well past the old 16 KiB cap) is read whole.
+        let pad = "p".repeat(64 * 1024);
+        let big =
+            format!("{{\"v\":1,\"id\":\"c\",\"ts\":1,\"pad\":\"{pad}\",\"command\":{{\"type\":\"state.get\"}}}}\n");
+        s.write_all(big.as_bytes()).unwrap();
         let mut r = BufReader::new(s);
         let mut lines = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut l = String::new();
             r.read_line(&mut l).unwrap();
             lines.push(serde_json::from_str::<Value>(&l).unwrap());
@@ -1341,6 +1345,7 @@ mod tests {
         assert_eq!(lines[0]["state"]["slideIndex"], json!(1));
         assert_eq!(lines[1]["message"], json!("message too long"));
         assert_eq!((lines[2]["id"].clone(), lines[2]["state"]["slideIndex"].clone()), (json!("b"), json!(1)));
+        assert_eq!((lines[3]["id"].clone(), lines[3]["ok"].clone()), (json!("c"), json!(true)));
     }
 
     type Ws = tungstenite::WebSocket<TcpStream>;
@@ -1478,7 +1483,7 @@ mod tests {
         let mut ws = ws_connect(ws_addr, None).unwrap();
         // The engine refuses from the frame header, so it may cut the connection while the
         // client is still writing; either way nothing this big gets through.
-        let _ = ws.send(tungstenite::Message::text("x".repeat(MAX_WS_MESSAGE + 10)));
+        let _ = ws.send(tungstenite::Message::text("x".repeat(MAX_MESSAGE + 10)));
         match ws.read() {
             Ok(tungstenite::Message::Text(t)) => {
                 assert_eq!(serde_json::from_str::<Value>(&t).unwrap()["message"], "message too long")
@@ -1488,7 +1493,7 @@ mod tests {
         }
         // A message under the limit, such as a run sheet, still works on a new connection.
         let mut ws = ws_connect(ws_addr, None).unwrap();
-        ws_send(&mut ws, &"x".repeat(MAX_LINE + 10));
+        ws_send(&mut ws, &"x".repeat(64 * 1024));
         assert_eq!(ws_next(&mut ws)["message"], "invalid JSON");
     }
 

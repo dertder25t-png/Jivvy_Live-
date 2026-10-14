@@ -14,17 +14,21 @@ let cached: Promise<CryptoKeyPair> | null = null;
 /** The saved key pair, or a new one saved for next time. */
 export function deviceKey(): Promise<CryptoKeyPair> {
   cached ??= (async () => {
-    let db: IDBDatabase;
     try {
-      db = await open();
+      const db = await open();
+      const saved = await run<CryptoKeyPair | undefined>(db, "keys", "readonly", (s) => s.get(KEY));
+      if (saved) return saved;
+      const pair = await generate();
+      try {
+        await run(db, "keys", "readwrite", (s) => s.put(pair, KEY));
+      } catch {
+        // Can't keep it (storage refuses keys): this one works for this visit
+      }
+      return pair;
     } catch {
-      return generate(); // no IndexedDB (some private windows): paired for this visit only
+      // No usable IndexedDB (some private windows and privacy settings): paired for this visit only
+      return generate();
     }
-    const saved = await run<CryptoKeyPair | undefined>(db, "keys", "readonly", (s) => s.get(KEY));
-    if (saved) return saved;
-    const pair = await generate();
-    await run(db, "keys", "readwrite", (s) => s.put(pair, KEY));
-    return pair;
   })();
   return cached;
 }

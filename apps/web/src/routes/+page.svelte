@@ -278,8 +278,19 @@
 
   /** What happened to each song's last save to the library, by item id. */
   let songNotes = $state<Record<string, string>>({});
+  /** Songs with a save on its way: a second one would be based on the same revision and be refused. */
+  let songSaving = $state<Record<string, boolean>>({});
   async function saveSong(item: DraftItem) {
-    if (!conn || !item.song) return;
+    if (!conn || !item.song || songSaving[item.id]) return;
+    songSaving[item.id] = true;
+    try {
+      await saveSongNow(conn, item);
+    } finally {
+      songSaving[item.id] = false;
+    }
+  }
+  async function saveSongNow(conn: DaemonConnection, item: DraftItem) {
+    if (!item.song) return;
     const id = item.libraryId ?? newSongId(item.title);
     const title = item.title.trim() || "Untitled song";
     const body = { ...item.song, title } as unknown as Record<string, unknown>;
@@ -322,21 +333,29 @@
   /**
    * One plan save at a time: a second one sent before the first is acknowledged would be based
    * on the same revision and be refused as if another device had changed the plan. Edits made
-   * meanwhile wait, and only the newest of them is sent next.
+   * meanwhile wait, and only the newest of them is sent next: the newest for each plan, so
+   * switching to another plan never drops the last edits of the one before.
    */
-  let planPending: { id: string; title: string; items: string } | null = null;
+  const planPending = new Map<string, { title: string; items: string }>();
+  /** Before this browser moves to another plan: the current one's last edit goes now, not after the wait. */
+  function saveCurrentPlanNow() {
+    clearTimeout(planTimer);
+    if (ready && conn && planHeld !== planKey(draft.id))
+      queuePlanSave({ id: draft.id, title: draft.title, items: JSON.stringify(draft.items) });
+  }
   let planSaving = false;
   function queuePlanSave(plan: { id: string; title: string; items: string }) {
-    planPending = plan;
+    planPending.delete(plan.id); // re-added last: plans save in the order they were edited
+    planPending.set(plan.id, { title: plan.title, items: plan.items });
     if (!planSaving) void flushPlanSaves();
   }
   async function flushPlanSaves() {
     planSaving = true;
     try {
-      while (planPending) {
-        const next: { id: string; title: string; items: string } = planPending;
-        planPending = null;
-        await savePlan(next.id, next.title, next.items);
+      for (let next = planPending.entries().next(); !next.done; next = planPending.entries().next()) {
+        const [id, plan] = next.value;
+        planPending.delete(id);
+        await savePlan(id, plan.title, plan.items);
       }
     } finally {
       planSaving = false;
@@ -375,6 +394,7 @@
       const doc = await getDoc(conn, "plan", info.id);
       const plan = planFromDoc(doc);
       if (!plan) return void (planNote = "That plan was saved by a newer version of Jivvy Live.");
+      if (doc.id !== draft.id) saveCurrentPlanNow();
       planRevs[planKey(doc.id)] = doc.rev;
       if (planHeld === planKey(doc.id)) planHeld = "";
       draft = plan;
@@ -399,6 +419,7 @@
   function startNew() {
     if (draft.items.length && !confirm("Start a new run sheet? This one stays on the screens until you send the new one."))
       return;
+    saveCurrentPlanNow();
     draft = { id: newId(), title: "Sunday service", items: [] };
   }
 
@@ -619,7 +640,7 @@
         {:else if item.kind === "song" && item.song}
           <SongEditor bind:song={item.song} />
           <div class="row library">
-            <button class="quiet" onclick={() => saveSong(item)} disabled={!ready}
+            <button class="quiet" onclick={() => saveSong(item)} disabled={!ready || songSaving[item.id]}
               >{item.libraryId ? "Save changes to the library" : "Save to the library"}</button
             >
             {#if songNotes[item.id]}<span class="hint">{songNotes[item.id]}</span>{/if}

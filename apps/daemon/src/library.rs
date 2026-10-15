@@ -48,16 +48,27 @@ impl Library {
                 body TEXT NOT NULL,
                 rev INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
+                -- A deleted document stays as a marker, so its revisions keep counting up and a
+                -- copy from before the delete can never match a document made again later.
+                deleted INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (kind, id)
             )",
         )?;
+        // A library made before deletes left markers: add the column, every row still there.
+        let has_deleted: bool =
+            db.query_row("SELECT COUNT(*) > 0 FROM pragma_table_info('docs') WHERE name = 'deleted'", [], |r| {
+                r.get(0)
+            })?;
+        if !has_deleted {
+            db.execute_batch("ALTER TABLE docs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Library { db })
     }
 
     /// The documents of a kind, newest first, without bodies.
     pub fn list(&self, kind: &str) -> Result<Vec<DocInfo>, Error> {
         let mut q = self.db.prepare_cached(
-            "SELECT id, title, rev, updated_at FROM docs WHERE kind = ?1 ORDER BY updated_at DESC, id",
+            "SELECT id, title, rev, updated_at FROM docs WHERE kind = ?1 AND deleted = 0 ORDER BY updated_at DESC, id",
         )?;
         let rows = q.query_map(params![kind], |r| {
             Ok(DocInfo {
@@ -75,7 +86,7 @@ impl Library {
         let row = self
             .db
             .query_row(
-                "SELECT title, body, rev, updated_at FROM docs WHERE kind = ?1 AND id = ?2",
+                "SELECT title, body, rev, updated_at FROM docs WHERE kind = ?1 AND id = ?2 AND deleted = 0",
                 params![kind, id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u64>(2)?, r.get::<_, u64>(3)?)),
             )
@@ -85,6 +96,16 @@ impl Library {
             // Only this code writes bodies, always objects; a damaged one reads as empty.
             body: serde_json::from_str::<Map<String, Value>>(&body).unwrap_or_default(),
         }))
+    }
+
+    /// The highest revision this id has had (deleted or not), and whether it exists now.
+    fn revision(db: &Connection, kind: &str, id: &str) -> Result<(u64, bool), Error> {
+        let row = db
+            .query_row("SELECT rev, deleted FROM docs WHERE kind = ?1 AND id = ?2", params![kind, id], |r| {
+                Ok((r.get::<_, u64>(0)?, r.get::<_, bool>(1)?))
+            })
+            .optional()?;
+        Ok(row.map_or((0, false), |(rev, deleted)| (rev, !deleted)))
     }
 
     /// Saves a document; with `base_rev`, only if the saved copy is that revision (0: new).
@@ -98,38 +119,49 @@ impl Library {
         now: u64,
     ) -> Result<DocInfo, Error> {
         let tx = self.db.transaction()?;
-        let current: u64 = tx
-            .query_row("SELECT rev FROM docs WHERE kind = ?1 AND id = ?2", params![kind, id], |r| r.get(0))
-            .optional()?
-            .unwrap_or(0);
+        let (last, exists) = Self::revision(&tx, kind, id)?;
+        // A deleted one counts as not there (0), but its revisions carry on from where they were.
+        let current = if exists { last } else { 0 };
         if base_rev.is_some_and(|b| b != current) {
             return Err(Error::Conflict { current });
         }
-        let rev = current + 1;
+        let rev = last + 1;
         let json = serde_json::to_string(body).map_err(|e| Error::Db(e.to_string()))?;
         tx.execute(
-            "INSERT INTO docs (kind, id, title, body, rev, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT (kind, id) DO UPDATE SET title = ?3, body = ?4, rev = ?5, updated_at = ?6",
+            "INSERT INTO docs (kind, id, title, body, rev, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+             ON CONFLICT (kind, id) DO UPDATE SET title = ?3, body = ?4, rev = ?5, updated_at = ?6, deleted = 0",
             params![kind, id, title, json, rev, now],
         )?;
         tx.commit()?;
         Ok(DocInfo { kind: kind.into(), id: id.into(), title: title.into(), rev, updated_at: now })
     }
 
-    /// Removes a document; with `base_rev`, only that revision. None if there was none.
-    pub fn delete(&mut self, kind: &str, id: &str, base_rev: Option<u64>) -> Result<Option<DocInfo>, Error> {
-        let Some(doc) = self.get(kind, id)? else {
+    /// Removes a document (leaving a marker, one revision on); with `base_rev`, only that
+    /// revision. None if there was none.
+    pub fn delete(&mut self, kind: &str, id: &str, base_rev: Option<u64>, now: u64) -> Result<Option<DocInfo>, Error> {
+        let tx = self.db.transaction()?;
+        let Some((title, rev)) = tx
+            .query_row(
+                "SELECT title, rev FROM docs WHERE kind = ?1 AND id = ?2 AND deleted = 0",
+                params![kind, id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)),
+            )
+            .optional()?
+        else {
             return match base_rev {
                 Some(b) if b != 0 => Err(Error::Conflict { current: 0 }),
                 _ => Ok(None),
             };
         };
-        if base_rev.is_some_and(|b| b != doc.info.rev) {
-            return Err(Error::Conflict { current: doc.info.rev });
+        if base_rev.is_some_and(|b| b != rev) {
+            return Err(Error::Conflict { current: rev });
         }
-        self.db
-            .execute("DELETE FROM docs WHERE kind = ?1 AND id = ?2 AND rev = ?3", params![kind, id, doc.info.rev])?;
-        Ok(Some(doc.info))
+        tx.execute(
+            "UPDATE docs SET deleted = 1, body = '{}', rev = ?3, updated_at = ?4 WHERE kind = ?1 AND id = ?2",
+            params![kind, id, rev + 1, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(DocInfo { kind: kind.into(), id: id.into(), title, rev: rev + 1, updated_at: now }))
     }
 }
 
@@ -159,10 +191,33 @@ mod tests {
         assert_eq!(lib.get("song", "grace").unwrap().unwrap().body, body("mine"));
         assert!(lib.get("song", "nope").unwrap().is_none());
 
-        assert_eq!(lib.delete("song", "grace", Some(1)), Err(Error::Conflict { current: 2 }));
-        assert_eq!(lib.delete("song", "grace", Some(2)).unwrap().unwrap().rev, 2);
-        assert!(lib.list("song").unwrap().is_empty());
-        assert_eq!(lib.delete("song", "grace", None), Ok(None), "deleting one that's gone is fine");
+        assert_eq!(lib.delete("song", "grace", Some(1), 5), Err(Error::Conflict { current: 2 }));
+        assert_eq!(lib.delete("song", "grace", Some(2), 5).unwrap().unwrap().rev, 3);
+        assert!(lib.list("song").unwrap().is_empty() && lib.get("song", "grace").unwrap().is_none());
+        assert_eq!(lib.delete("song", "grace", None, 6), Ok(None), "deleting one that's gone is fine");
+        // Made again after the delete: it is new (base 0), but its revisions carry on, so a copy
+        // from before the delete (revision 1 or 2) can never overwrite it.
+        assert_eq!(lib.put("song", "grace", "Again", &body("new"), Some(0), 7).unwrap().rev, 4);
+        assert_eq!(lib.put("song", "grace", "x", &body("stale"), Some(2), 8), Err(Error::Conflict { current: 4 }));
+        drop(lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_from_before_delete_markers_is_upgraded_and_keeps_its_songs() {
+        let dir = std::env::temp_dir().join(format!("jivvy-lib-old-{}-{}", std::process::id(), crate::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Connection::open(dir.join(FILE)).unwrap();
+        old.execute_batch(
+            "CREATE TABLE docs (kind TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+                rev INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (kind, id));
+             INSERT INTO docs VALUES ('song', 'grace', 'Amazing Grace', '{}', 3, 1);",
+        )
+        .unwrap();
+        drop(old);
+        let mut lib = Library::open(&dir).unwrap();
+        assert_eq!(lib.list("song").unwrap()[0].rev, 3);
+        assert_eq!(lib.put("song", "grace", "Amazing Grace", &Map::new(), Some(3), 2).unwrap().rev, 4);
         drop(lib);
         let _ = std::fs::remove_dir_all(&dir);
     }

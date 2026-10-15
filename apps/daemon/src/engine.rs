@@ -902,11 +902,13 @@ impl Engine {
                     Err(e) => return failed(e),
                 }
             }
-            Command::DocDelete { kind, id: doc_id, base_rev } => match lib.delete(&kind, &doc_id, base_rev) {
-                Ok(Some(gone)) => (gone, true),
-                Ok(None) => return protocol::ack(id, None),
-                Err(e) => return failed(e),
-            },
+            Command::DocDelete { kind, id: doc_id, base_rev } => {
+                match lib.delete(&kind, &doc_id, base_rev, crate::now_ms()) {
+                    Ok(Some(gone)) => (gone, true),
+                    Ok(None) => return protocol::ack(id, None),
+                    Err(e) => return failed(e),
+                }
+            }
             _ => unreachable!("only doc commands come here"),
         };
         let (saved, deleted) = changed;

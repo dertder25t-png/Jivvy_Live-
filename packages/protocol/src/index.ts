@@ -652,7 +652,7 @@ export interface AckExtras {
   docs?: DocInfo[];
   /** doc.get */
   doc?: Doc;
-  /** doc.put, doc.delete: the document as saved (after a delete, its last revision). */
+  /** doc.put, doc.delete: the document as saved (a delete is a revision too, so revisions never repeat). */
   saved?: DocInfo;
 }
 

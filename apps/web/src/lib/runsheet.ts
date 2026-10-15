@@ -25,6 +25,9 @@ export interface DraftItem {
   text: string;
   /** Songs: sections and the order they are sung in. */
   song?: Song;
+  /** Songs saved to the church computer's library: its id there and the revision this copy is from. */
+  libraryId?: string;
+  libraryRev?: number;
   /** Countdowns: the time of day it counts down to, "HH:MM" (24-hour). */
   at?: string;
   /** Pre-service loops: seconds on each slide before the next. */

@@ -11,6 +11,7 @@ import {
   type Ack,
   type Command,
   type DaemonEvent,
+  type DocInfo,
   type Levels,
   type RunSheet,
   type StateSnapshot,
@@ -33,6 +34,8 @@ export interface Handlers {
   runSheet(r: RunSheet | null): void;
   /** Live audio input levels, about ten a second, for the meter. */
   levels?(l: Levels): void;
+  /** A document in the church computer's library was saved or deleted, here or elsewhere. */
+  docChanged?(doc: DocInfo, deleted: boolean): void;
 }
 
 /**
@@ -181,6 +184,7 @@ export class DaemonConnection {
       }
     }
     else if (e.event === "levels") this.h.levels?.(e.levels);
+    else if (e.event === "doc.changed") this.h.docChanged?.(e.doc, e.deleted === true);
     // Other events (alerts, ...) come with the screens that show them.
   }
 

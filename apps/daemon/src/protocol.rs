@@ -101,6 +101,83 @@ pub enum Command {
     /// Which of these images the church computer lacks.
     #[serde(rename = "media.has")]
     MediaHas { ids: Vec<String> },
+    /// The library's documents of a kind, without bodies.
+    #[serde(rename = "doc.list")]
+    DocList { kind: String },
+    #[serde(rename = "doc.get")]
+    DocGet { kind: String, id: String },
+    /// Save a document; with `base_rev`, only if the saved copy is still that revision.
+    #[serde(rename = "doc.put")]
+    DocPut {
+        kind: String,
+        id: String,
+        title: String,
+        body: Map<String, Value>,
+        #[serde(rename = "baseRev", skip_serializing_if = "Option::is_none")]
+        base_rev: Option<u64>,
+    },
+    #[serde(rename = "doc.delete")]
+    DocDelete {
+        kind: String,
+        id: String,
+        #[serde(rename = "baseRev", skip_serializing_if = "Option::is_none")]
+        base_rev: Option<u64>,
+    },
+}
+
+/// Largest document body (as JSON), the same as the TypeScript `MAX_DOC_BYTES`.
+pub const MAX_DOC_BYTES: usize = 512 * 1024;
+
+/// A document kind: 1-32 of a-z 0-9 -, starting with a letter.
+fn doc_kind(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    let mut chars = s.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && s.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then(|| s.to_string())
+}
+
+/// An optional baseRev: Ok(None) when left out, Err when it isn't a whole number from 0.
+fn base_rev(v: Option<&Value>) -> Result<Option<u64>, ()> {
+    match v {
+        None => Ok(None),
+        Some(v) => {
+            js_integer(v).filter(|f| *f >= 0.0 && *f <= 9_007_199_254_740_991.0).map(|f| Some(f as u64)).ok_or(())
+        }
+    }
+}
+
+/// A document in the library, without its body.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocInfo {
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub rev: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Doc {
+    #[serde(flatten)]
+    pub info: DocInfo,
+    pub body: Map<String, Value>,
+}
+
+/// A library document was saved or deleted.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DocChangedEvent<'a> {
+    pub v: u32,
+    pub event: &'static str,
+    pub doc: &'a DocInfo,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+}
+
+pub fn doc_changed_event(doc: &DocInfo, deleted: bool) -> DocChangedEvent<'_> {
+    DocChangedEvent { v: PROTOCOL_VERSION, event: "doc.changed", doc, deleted }
 }
 
 /// One slide as the screens show it.
@@ -455,6 +532,8 @@ pub enum ErrorCode {
     /// This connection may not do that: an unpaired or unproven device, a command only the
     /// church computer may send, or pairing that isn't open.
     Unauthorized,
+    /// doc.put / doc.delete with a `baseRev` that is no longer the saved revision.
+    Conflict,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -580,6 +659,15 @@ pub struct AckExtras {
     /// media.has
     #[serde(skip_serializing_if = "Option::is_none")]
     pub missing: Option<Vec<String>>,
+    /// doc.list
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs: Option<Vec<DocInfo>>,
+    /// doc.get
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<Doc>,
+    /// doc.put, doc.delete
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<DocInfo>,
 }
 
 /// How much of an image the church computer has.
@@ -807,6 +895,39 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
                 Some(ids) => Command::MediaHas { ids },
                 None => return Err((ErrorCode::BadArguments, "media.has needs ids: SHA-256 ids")),
             }
+        }
+        "doc.list" => match doc_kind(obj.get("kind")) {
+            Some(kind) => Command::DocList { kind },
+            None => return Err((ErrorCode::BadArguments, "doc commands need a kind: 1-32 of a-z 0-9 -")),
+        },
+        "doc.get" | "doc.delete" => {
+            let (Some(kind), Some(id)) = (doc_kind(obj.get("kind")), id_field(obj.get("id"))) else {
+                return Err((ErrorCode::BadArguments, "doc commands need kind and id"));
+            };
+            if ty == "doc.get" {
+                Command::DocGet { kind, id }
+            } else {
+                let base_rev = base_rev(obj.get("baseRev"))
+                    .map_err(|_| (ErrorCode::BadArguments, "baseRev must be a whole number from 0"))?;
+                Command::DocDelete { kind, id, base_rev }
+            }
+        }
+        "doc.put" => {
+            let kind = doc_kind(obj.get("kind"));
+            let id = id_field(obj.get("id"));
+            let title = plain_text(obj.get("title"), MAX_TITLE);
+            let body = obj.get("body").and_then(Value::as_object);
+            let rev = base_rev(obj.get("baseRev"));
+            let (Some(kind), Some(id), Some(title), Some(body), Ok(base_rev)) = (kind, id, title, body, rev) else {
+                return Err((
+                    ErrorCode::BadArguments,
+                    "doc.put needs kind, id, title, a body object and an optional baseRev",
+                ));
+            };
+            if serde_json::to_vec(body).map_or(usize::MAX, |b| b.len()) > MAX_DOC_BYTES {
+                return Err((ErrorCode::BadArguments, "a document's body can be at most 512 KB"));
+            }
+            Command::DocPut { kind, id, title, body: body.clone(), base_rev }
         }
         "runsheet.set" => match run_sheet(obj.get("runSheet")) {
             Some(run_sheet) => Command::RunSheetSet { run_sheet },

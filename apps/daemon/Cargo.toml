@@ -49,6 +49,8 @@ tao = "0.37"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+# The library (songs, plans, themes, settings): SQLite compiled in, nothing to install.
+rusqlite = { version = "0.37", features = ["bundled"] }
 # The command channel over WebSocket (same envelopes as the TCP one).
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # HTTP: YouTube's HLS segment upload, and the pre-flight upload test.

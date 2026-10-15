@@ -64,6 +64,7 @@ export function sectionHeader(line: string): { label: string; repeat: number } |
     repeat = Number(times[1] ?? times[2]);
     s = s.slice(0, times.index);
   }
+  const marked = /^[[(]|[\]):]$/.test(s);
   s = s
     .replace(/^[[(]\s*/, "")
     .replace(/\s*[\])]$/, "")
@@ -71,8 +72,11 @@ export function sectionHeader(line: string): { label: string; repeat: number } |
     .replace(/^repeat\s+(?:the\s+)?/, "")
     .trim();
   const m = /^([a-z][a-z -]*?)\.?\s*(\d{1,2})?$/.exec(s);
-  const name = m?.[1] ? NAMES[m[1].replace(/[\s-]+/g, "")] : undefined;
+  const key = m?.[1]?.replace(/[\s-]+/g, "") ?? "";
+  const name = NAMES[key];
   if (!m || !name || repeat < 1) return null;
+  // A lone letter ("C", "b") is a lyric unless numbered or marked: "C2", "[C]", "C:".
+  if (key.length === 1 && !m[2] && !marked) return null;
   return { label: m[2] ? `${name} ${Number(m[2])}` : name, repeat };
 }
 
@@ -182,7 +186,8 @@ function refrainAfterEachVerse(sections: Section[], arrangement: string[]): stri
   if (choruses.length !== 1 || !chorus || arrangement.filter((id) => id === chorus.id).length !== 1) return arrangement;
   const label = (id: string) => sections.find((s) => s.id === id)?.label ?? "";
   const first = arrangement.indexOf(chorus.id);
-  if (first === 0 || !isVerse(label(arrangement[first - 1] ?? ""))) return arrangement;
+  // Only the hymnal pattern: the refrain right after the first verse, and nothing before that verse.
+  if (first !== 1 || !isVerse(label(arrangement[0] ?? ""))) return arrangement;
   return arrangement.flatMap((id, i) =>
     i > first && isVerse(label(id)) && arrangement[i + 1] !== chorus.id ? [id, chorus.id] : [id],
   );

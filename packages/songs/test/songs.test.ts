@@ -9,6 +9,7 @@ describe("songs", () => {
     );
     expect(sectionHeader("Chorus x2")).toEqual({ label: "Chorus", repeat: 2 });
     expect(sectionHeader("Was blind, but now I see")).toBeNull();
+    expect([sectionHeader("C"), sectionHeader("C:")?.label, sectionHeader("[b]")?.label]).toEqual([null, "Chorus", "Bridge"]);
 
     // Headers, a chorus named again with nothing under it, and a bridge sung twice.
     const song = { title: "", ...parseLyrics("Verse 1\na\nb\n\nChorus\nc\nd\n\nVerse 2\ne\n\nChorus\n\nBridge x2\nf") };
@@ -30,5 +31,8 @@ describe("songs", () => {
     const song = hymnSong(hymn!);
     expect(sung(song).map((s) => s.label)).toEqual(["Verse 1", "Refrain", "Verse 2", "Refrain", "Verse 3", "Refrain"]);
     expect(song.copyright).toBe("Public domain");
+    // A chorus written once anywhere else is sung where it is written, and nowhere more.
+    const later = parseLyrics("Verse 1\na\n\nVerse 2\nb\n\nChorus\nc\n\nVerse 3\nd");
+    expect(later.arrangement).toEqual(["verse-1", "verse-2", "chorus", "verse-3"]);
   });
 });

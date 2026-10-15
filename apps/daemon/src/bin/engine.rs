@@ -45,6 +45,8 @@ fn main() {
             "--supervised" => supervised = true,
             "--listen-ws" => listen_ws = Some(val()),
             "--ws-origin" => ws_access.origins.push(val()),
+            // The built web app to serve on the WebSocket port (default: `web` beside this program).
+            "--web-dir" => ws_access.web_dir = Some(PathBuf::from(val())),
             "--ws-cert" => ws_cert = Some(PathBuf::from(val())),
             "--ws-key" => ws_key = Some(PathBuf::from(val())),
             // Pre-flight's upload test (tests point it at a local stand-in).
@@ -96,7 +98,15 @@ fn main() {
         }
         ok
     });
+    if ws_access.web_dir.is_none() {
+        let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("web")));
+        ws_access.web_dir = beside.filter(|d| d.join("index.html").is_file());
+    }
     if let Some(addr) = listen_ws {
+        match &ws_access.web_dir {
+            Some(dir) => log("engine", format!("serving the web app from {}", dir.display())),
+            None => log("engine", "no web app to serve (--web-dir); devices use app.jivvy.org"),
+        }
         let (engine, access) = (engine.clone(), Arc::new(ws_access));
         if let Some(tls) = &ws_tls {
             tls.config(); // logs now if the certificate can't be used, not at the first device

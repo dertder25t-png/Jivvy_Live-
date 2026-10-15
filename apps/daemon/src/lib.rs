@@ -28,6 +28,7 @@ pub mod snapshot;
 pub mod stream;
 pub mod tls;
 pub mod watchdog;
+pub mod web;
 
 use std::path::{Path, PathBuf};
 

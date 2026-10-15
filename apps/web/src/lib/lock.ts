@@ -4,7 +4,9 @@
  * salted hash of the PIN. Clearing the browser's data does remove it, but also removes this
  * device's key, so the church computer has to approve the device again before it can do anything.
  */
-const KEY = "jivvy.lock";
+/** Other tabs watch this key (`storage` events), so locking one tab locks them all. */
+export const LOCK_KEY = "jivvy.lock";
+const KEY = LOCK_KEY;
 
 interface Lock {
   salt: string;

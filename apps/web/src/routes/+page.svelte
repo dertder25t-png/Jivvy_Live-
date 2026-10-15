@@ -6,7 +6,7 @@
   import { addPdf } from "$lib/pdf";
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
-  import { isLocked, lock, unlock, validPin } from "$lib/lock";
+  import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
@@ -60,6 +60,12 @@
   let view = $state<"edit" | "operate">(stored(VIEW_KEY, "edit"));
   $effect(() => store(VIEW_KEY, view));
   let locked = $state(isLocked());
+  /** Locked or unlocked in another tab of this browser: follow it at once. */
+  function lockChanged(e: StorageEvent) {
+    if (e.key !== LOCK_KEY && e.key !== null) return; // null: storage cleared
+    locked = isLocked();
+    pinForm = "";
+  }
   let levels = $state<Levels | null>(null);
   let levelsAt = $state(0);
 
@@ -248,7 +254,7 @@
   const kindLabel = (k: string) => KINDS.find((x) => x.kind === k)?.label ?? "Text";
 </script>
 
-<svelte:window onkeydown={keydown} />
+<svelte:window onkeydown={keydown} onstorage={lockChanged} />
 
 <header>
   <img class="brand" src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="147" height="60" />

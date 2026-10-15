@@ -11,6 +11,7 @@ import {
   type Ack,
   type Command,
   type DaemonEvent,
+  type Levels,
   type RunSheet,
   type StateSnapshot,
 } from "@jivvy/protocol";
@@ -30,6 +31,8 @@ export interface Handlers {
   state(s: StateSnapshot): void;
   /** The daemon's run sheet, whenever it changes (null when none is set). */
   runSheet(r: RunSheet | null): void;
+  /** Live audio input levels, about ten a second, for the meter. */
+  levels?(l: Levels): void;
 }
 
 /**
@@ -177,7 +180,8 @@ export class DaemonConnection {
         this.h.status({ kind: "unpaired", message: "The church computer didn't approve this device." });
       }
     }
-    // Other events (levels, alerts, ...) come with the screens that show them.
+    else if (e.event === "levels") this.h.levels?.(e.levels);
+    // Other events (alerts, ...) come with the screens that show them.
   }
 
   private gotState(s: StateSnapshot): void {

@@ -1,16 +1,19 @@
 <script lang="ts">
-  import { runSheetSlides, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
+  import { runSheetSlides, type Levels, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
   import { onDestroy, onMount } from "svelte";
   import { DaemonConnection, type Status } from "$lib/daemon";
   import { addImage, upload } from "$lib/media";
   import { addPdf } from "$lib/pdf";
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
+  import { isLocked, lock, unlock, validPin } from "$lib/lock";
+  import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
 
   const DRAFT_KEY = "jivvy.draft";
   const ADDRESS_KEY = "jivvy.address";
+  const VIEW_KEY = "jivvy.view";
   const KINDS: { kind: ItemKind; label: string }[] = [
     { kind: "song", label: "Song" },
     { kind: "scripture", label: "Scripture" },
@@ -53,6 +56,38 @@
 
   $effect(() => store(DRAFT_KEY, draft));
 
+  /** Edit builds the run sheet; Operate runs the service. A locked browser only operates. */
+  let view = $state<"edit" | "operate">(stored(VIEW_KEY, "edit"));
+  $effect(() => store(VIEW_KEY, view));
+  let locked = $state(isLocked());
+  let levels = $state<Levels | null>(null);
+  let levelsAt = $state(0);
+
+  // Locking (choose a PIN twice) and unlocking (enter it), each a small form in the header.
+  let pinForm = $state<"" | "lock" | "unlock">("");
+  let pin = $state("");
+  let pinAgain = $state("");
+  let pinError = $state("");
+  function openPin(kind: "lock" | "unlock") {
+    pinForm = pinForm === kind ? "" : kind;
+    pin = pinAgain = pinError = "";
+  }
+  async function submitPin() {
+    pinError = "";
+    if (pinForm === "lock") {
+      if (!validPin(pin)) return void (pinError = "Choose 4 to 8 digits.");
+      if (pin !== pinAgain) return void (pinError = "The two PINs don't match.");
+      await lock(pin);
+      locked = true;
+    } else {
+      const result = await unlock(pin);
+      if (!result.ok) return void (pinError = result.message);
+      locked = false;
+    }
+    pinForm = "";
+    pin = pinAgain = "";
+  }
+
   // Countdowns are built for the moment of sending; `builtAt` moves on each send so the
   // comparison below uses the same build that was sent.
   let builtAt = $state(new Date());
@@ -73,6 +108,10 @@
       status: (s) => (status = s),
       state: (s) => (live = s),
       runSheet: (r) => (onScreens = r),
+      levels: (l) => {
+        levels = l;
+        levelsAt = Date.now();
+      },
     });
     conn.connect();
   }
@@ -213,17 +252,31 @@
 
 <header>
   <img class="brand" src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="147" height="60" />
-  <form
-    class="connect"
-    onsubmit={(e) => {
-      e.preventDefault();
-      connect();
-    }}
-  >
-    <label for="address">Church computer</label>
-    <input id="address" bind:value={address} spellcheck="false" autocomplete="off" />
-    <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
-  </form>
+  {#if locked}
+    <span class="mode">Volunteer mode</span>
+    <span class="spacer"></span>
+  {:else}
+    <nav class="tabs" aria-label="View">
+      <button class:active={view === "edit"} aria-pressed={view === "edit"} onclick={() => (view = "edit")}>Edit</button>
+      <button class:active={view === "operate"} aria-pressed={view === "operate"} onclick={() => (view = "operate")}
+        >Operate</button
+      >
+    </nav>
+    <form
+      class="connect"
+      onsubmit={(e) => {
+        e.preventDefault();
+        connect();
+      }}
+    >
+      <label for="address">Church computer</label>
+      <input id="address" bind:value={address} spellcheck="false" autocomplete="off" />
+      <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
+    </form>
+  {/if}
+  <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
+    {locked ? "Unlock" : "Lock for volunteers"}
+  </button>
   <div class="status" data-kind={status.kind} role="status">
     {#if status.kind === "ready"}Connected
     {:else if status.kind === "connecting"}Connecting…
@@ -232,6 +285,54 @@
     {:else}{status.message}{/if}
   </div>
 </header>
+
+{#if pinForm}
+  <form
+    class="banner pin"
+    onsubmit={(e) => {
+      e.preventDefault();
+      void submitPin();
+    }}
+  >
+    <p>
+      {#if pinForm === "lock"}
+        Volunteer mode shows only the operator view: no editing, no settings, no connecting elsewhere.
+        Choose a PIN to leave it; it is kept on this device only.
+      {:else}
+        Enter the PIN this device was locked with.
+      {/if}
+    </p>
+    <div class="row">
+      <label
+        >PIN <input
+          type="password"
+          inputmode="numeric"
+          autocomplete="off"
+          maxlength="8"
+          aria-label="PIN"
+          bind:value={pin}
+          required
+        /></label
+      >
+      {#if pinForm === "lock"}
+        <label
+          >Again <input
+            type="password"
+            inputmode="numeric"
+            autocomplete="off"
+            maxlength="8"
+            aria-label="PIN again"
+            bind:value={pinAgain}
+            required
+          /></label
+        >
+      {/if}
+      <button type="submit" class="primary">{pinForm === "lock" ? "Lock" : "Unlock"}</button>
+      <button type="button" class="quiet" onclick={() => (pinForm = "")}>Cancel</button>
+    </div>
+    {#if pinError}<p class="error" role="alert">{pinError}</p>{/if}
+  </form>
+{/if}
 
 {#if status.kind === "unpaired"}
   <section class="banner">
@@ -257,6 +358,9 @@
   </section>
 {/if}
 
+{#if locked || view === "operate"}
+  <Operator {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
+{:else}
 <main>
   <section class="plan" aria-label="Run sheet">
     <div class="plan-head">
@@ -440,8 +544,50 @@
     {/if}
   </section>
 </main>
+{/if}
 
 <style>
+  .tabs {
+    display: flex;
+    gap: 2px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 3px;
+  }
+  .tabs button {
+    background: transparent;
+    border-color: transparent;
+    color: var(--paper);
+    padding: 5px 14px;
+  }
+  .tabs button.active {
+    background: var(--paper);
+    color: var(--navy);
+    font-weight: 600;
+  }
+  .mode {
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .spacer {
+    flex: 1;
+  }
+  button.lock {
+    background: transparent;
+    color: var(--paper);
+    border-color: rgba(255, 255, 255, 0.35);
+    font-size: 13px;
+  }
+  .pin .row {
+    align-items: flex-end;
+  }
+  .pin input {
+    width: 130px;
+  }
+  .error {
+    color: #c0392b;
+    font-size: 13px;
+  }
   header {
     display: flex;
     flex-wrap: wrap;

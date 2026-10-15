@@ -28,6 +28,8 @@ describe("run sheet", () => {
     expect(sheet.items[3]?.advanceSeconds).toBe(8);
     // A song saved before the song editor: its verses found, five lines shared over two slides.
     expect(sheet.items[0]?.slides[1]?.lines).toEqual(["I once was lost", "but now am found", "Was blind"]);
+    // Each song slide names its section for the operator's list.
+    expect(sheet.items[0]?.slides.map((s) => s.label)).toEqual(["Verse 1", "Verse 2", "Verse 2"]);
     expect(sheet.items[1]?.slides[0]?.lines.at(-1)).toBe("John 3:16-17");
     expect(sheet.items[1]?.slides[1]?.lines.at(-2)).toBe("might be saved.");
     expect(sheet.items[2]?.slides[0]?.countdownTo).toBe(new Date(2026, 9, 18, 10, 30).getTime());

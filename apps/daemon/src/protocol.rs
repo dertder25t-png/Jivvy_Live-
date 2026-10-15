@@ -114,6 +114,9 @@ pub struct Slide {
     /// An image slide: the image's id (its SHA-256), sent first with `media.put`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Which part of its item this is ("Verse 1"), for the operator only; never on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// One item in the service (a song, a reading, a countdown...), already turned into slides
@@ -164,6 +167,7 @@ pub const MAX_RUNSHEET_SLIDES: usize = 2000;
 pub const MAX_SLIDE_LINES: usize = 16;
 pub const MAX_SLIDE_LINE: usize = 200;
 pub const MAX_TITLE: usize = 200;
+pub const MAX_SLIDE_LABEL: usize = 40;
 pub const MAX_ADVANCE_SECONDS: u64 = 3600;
 
 /// At most `max` characters (code points, as JavaScript's `[...s]` counts), no control characters.
@@ -188,7 +192,11 @@ fn slide(v: &Value) -> Option<Slide> {
         None => None,
         Some(i) => Some(media_id(Some(i))?),
     };
-    Some(Slide { lines, countdown_to, image })
+    let label = match obj.get("label") {
+        None => None,
+        Some(l) => Some(plain_text(Some(l), MAX_SLIDE_LABEL)?),
+    };
+    Some(Slide { lines, countdown_to, image, label })
 }
 
 /// Largest image the church computer keeps, and largest piece of one per `media.put`.

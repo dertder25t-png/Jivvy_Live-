@@ -81,6 +81,8 @@ export class DaemonConnection {
   private closed = false;
   private retry: ReturnType<typeof setTimeout> | null = null;
   private rev: number | undefined;
+  /** The church computer this connection signed in to (its id never changes), once it has. */
+  daemonId: string | null = null;
   /** A state event arrived since subscribing: newer than the snapshot on the subscribe ack. */
   private sawEvent = false;
 
@@ -206,6 +208,7 @@ export class DaemonConnection {
     // Disconnected mid-way (or this socket was replaced): the reconnect tries again, still paired.
     if (!current() || (!hello.ok && hello.code === "unavailable")) return;
     if (!hello.ok || !hello.challenge || !hello.daemonId) return this.h.status({ kind: "unpaired" });
+    this.daemonId = hello.daemonId;
     const signature = await sign(key, authMessage(hello.daemonId, hello.challenge));
     const proof = await this.sendOn(ws, { type: "auth.prove", signature });
     if (!current() || (!proof.ok && proof.code !== "unauthorized")) return;

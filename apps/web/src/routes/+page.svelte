@@ -267,7 +267,8 @@
     try {
       const doc = await getDoc(conn, "song", info.id);
       const song = songFromDoc(doc);
-      draft.items.push({ ...newItem("song"), title: doc.title, song, libraryId: doc.id, libraryRev: doc.rev });
+      const libraryDaemon = conn.daemonId ?? undefined;
+      draft.items.push({ ...newItem("song"), title: doc.title, song, libraryId: doc.id, libraryRev: doc.rev, libraryDaemon });
       hymnsOpen = false;
       hymnSearch = "";
     } catch (e) {
@@ -282,10 +283,14 @@
     const id = item.libraryId ?? newSongId(item.title);
     const title = item.title.trim() || "Untitled song";
     const body = { ...item.song, title } as unknown as Record<string, unknown>;
-    const result = await saveDoc(conn, { kind: "song", id, title, body }, item.libraryRev ?? 0);
+    // A revision from another church computer means nothing here: this one gets it as new.
+    const here = conn.daemonId ?? undefined;
+    const baseRev = item.libraryDaemon === here ? (item.libraryRev ?? 0) : 0;
+    const result = await saveDoc(conn, { kind: "song", id, title, body }, baseRev);
     if (result.ok) {
       item.libraryId = id;
       item.libraryRev = result.rev;
+      item.libraryDaemon = here;
       songNotes[item.id] = "Saved to the church computer's library.";
     } else {
       songNotes[item.id] = result.conflict
@@ -294,8 +299,12 @@
     }
   }
 
-  /** Plans: this run sheet is kept on the church computer as you edit (the revision each save was from, by plan id). */
-  const PLAN_REVS_KEY = "jivvy.planRevs";
+  /**
+   * Plans: this run sheet is kept on the church computer as you edit. The revision each save
+   * was from, by church computer and plan id: another church computer has its own copies.
+   */
+  const PLAN_REVS_KEY = "jivvy.planRevs.v2";
+  const planKey = (id: string) => `${conn?.daemonId ?? "?"}/${id}`;
   let planRevs = $state<Record<string, number>>(stored(PLAN_REVS_KEY, {}));
   $effect(() => store(PLAN_REVS_KEY, planRevs));
   let planNote = $state("");
@@ -303,22 +312,46 @@
   let planHeld = $state("");
   let planTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
-    const body = JSON.stringify(draft.items); // re-run on every edit
+    const items = JSON.stringify(draft.items); // re-run on every edit
     const { id, title } = draft;
-    if (!ready || !conn || planHeld === id) return;
+    if (!ready || !conn || planHeld === planKey(id)) return;
     clearTimeout(planTimer);
-    planTimer = setTimeout(() => void savePlan(id, title, body), 1500);
+    planTimer = setTimeout(() => queuePlanSave({ id, title, items }), 1500);
     return () => clearTimeout(planTimer);
   });
+  /**
+   * One plan save at a time: a second one sent before the first is acknowledged would be based
+   * on the same revision and be refused as if another device had changed the plan. Edits made
+   * meanwhile wait, and only the newest of them is sent next.
+   */
+  let planPending: { id: string; title: string; items: string } | null = null;
+  let planSaving = false;
+  function queuePlanSave(plan: { id: string; title: string; items: string }) {
+    planPending = plan;
+    if (!planSaving) void flushPlanSaves();
+  }
+  async function flushPlanSaves() {
+    planSaving = true;
+    try {
+      while (planPending) {
+        const next: { id: string; title: string; items: string } = planPending;
+        planPending = null;
+        await savePlan(next.id, next.title, next.items);
+      }
+    } finally {
+      planSaving = false;
+    }
+  }
   async function savePlan(id: string, title: string, items: string) {
-    if (!conn) return;
+    const key = planKey(id);
+    if (!conn || planHeld === key) return;
     const body = { items: JSON.parse(items) as unknown };
-    const result = await saveDoc(conn, { kind: "plan", id, title: title.trim() || "Untitled plan", body }, planRevs[id] ?? 0);
+    const result = await saveDoc(conn, { kind: "plan", id, title: title.trim() || "Untitled plan", body }, planRevs[key] ?? 0);
     if (result.ok) {
-      planRevs[id] = result.rev;
+      planRevs[key] = result.rev;
       planNote = "Saved on the church computer.";
     } else if (result.conflict) {
-      planHeld = id;
+      planHeld = key;
       planNote = "This plan was changed on another device. Open it again from Plans to continue; your changes stay in this browser.";
     } else {
       planNote = result.message;
@@ -342,8 +375,8 @@
       const doc = await getDoc(conn, "plan", info.id);
       const plan = planFromDoc(doc);
       if (!plan) return void (planNote = "That plan was saved by a newer version of Jivvy Live.");
-      planRevs[doc.id] = doc.rev;
-      if (planHeld === doc.id) planHeld = "";
+      planRevs[planKey(doc.id)] = doc.rev;
+      if (planHeld === planKey(doc.id)) planHeld = "";
       draft = plan;
       plansOpen = false;
       planNote = "";

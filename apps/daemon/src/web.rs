@@ -119,9 +119,14 @@ pub fn respond<W: Write>(w: &mut W, root: Option<&Path>, head: &Head) -> std::io
     }
 }
 
+/// On every response. A page framed by another site would still be this origin, with this
+/// device's key and the channel open to it, so a click there could press Next or Black:
+/// never let it be framed (`frame-ancestors`, and `X-Frame-Options` for older browsers).
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
+
 fn reply<W: Write>(w: &mut W, head: &Head, status: &str, kind: &str, cache: &str, body: &[u8]) -> std::io::Result<()> {
     let mut out = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n",
         body.len()
     );
     if !cache.is_empty() {
@@ -182,6 +187,11 @@ mod tests {
             assert!(get(bad).starts_with("HTTP/1.1 404"), "{bad}");
         }
         assert!(get("/.well-known/jivvy").ends_with(r#"{"service":"jivvy-live"}"#));
+        // No other site may frame the app (it would hold this device's key and channel).
+        for path in ["/", "/operate", "/missing.js"] {
+            let page = get(path);
+            assert!(page.contains("frame-ancestors 'none'") && page.contains("X-Frame-Options: DENY"), "{path}");
+        }
         let up = parse(b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: WebSocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
         assert!(up.upgrade);
         let _ = std::fs::remove_dir_all(&root);

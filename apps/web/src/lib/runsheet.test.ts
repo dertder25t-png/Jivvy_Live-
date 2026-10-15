@@ -26,7 +26,8 @@ describe("run sheet", () => {
     // A letter-size PDF page (612×792 points) is drawn as tall as the screen: 835×1080.
     expect(Math.round(612 * pageScale(612, 792))).toBe(835);
     expect(sheet.items[3]?.advanceSeconds).toBe(8);
-    expect(sheet.items[0]?.slides[1]?.lines).toEqual(["I once was lost", "but now am found", "Was blind", "but now"]);
+    // A song saved before the song editor: its verses found, five lines shared over two slides.
+    expect(sheet.items[0]?.slides[1]?.lines).toEqual(["I once was lost", "but now am found", "Was blind"]);
     expect(sheet.items[1]?.slides[0]?.lines.at(-1)).toBe("John 3:16-17");
     expect(sheet.items[1]?.slides[1]?.lines.at(-2)).toBe("might be saved.");
     expect(sheet.items[2]?.slides[0]?.countdownTo).toBe(new Date(2026, 9, 18, 10, 30).getTime());

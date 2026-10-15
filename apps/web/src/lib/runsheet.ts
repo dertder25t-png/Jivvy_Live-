@@ -12,6 +12,7 @@ import {
   type RunSheetItem,
   type Slide,
 } from "@jivvy/protocol";
+import { balance, songFromLyrics, sung, type Song } from "@jivvy/songs";
 
 export type ItemKind = "song" | "scripture" | "countdown" | "text" | "loop" | "image" | "pdf";
 
@@ -19,8 +20,10 @@ export interface DraftItem {
   id: string;
   kind: ItemKind;
   title: string;
-  /** Song lyrics, scripture text or announcement text. Unused by countdowns. */
+  /** Scripture text or announcement text; a song's lyrics from before the song editor. */
   text: string;
+  /** Songs: sections and the order they are sung in. */
+  song?: Song;
   /** Countdowns: the time of day it counts down to, "HH:MM" (24-hour). */
   at?: string;
   /** Pre-service loops: seconds on each slide before the next. */
@@ -61,6 +64,7 @@ export function newItem(kind: ItemKind): DraftItem {
   if (kind === "image" || kind === "pdf") return { id: newId(), kind, title, text: "", images: [] };
   if (kind === "countdown") return { id: newId(), kind, title, text: "Service starts in", at: "10:30" };
   if (kind === "loop") return { id: newId(), kind, title, text: "", seconds: LOOP_SECONDS };
+  if (kind === "song") return { id: newId(), kind, title, text: "", song: { title, sections: [], arrangement: [] } };
   return { id: newId(), kind, title, text: "" };
 }
 
@@ -116,6 +120,12 @@ export function nextTime(at: string, now: Date): number | null {
   return t.getTime();
 }
 
+/** A song item's song; one saved before the song editor gets its sections from its lyrics. */
+export const songOf = (item: DraftItem): Song => item.song ?? songFromLyrics(item.title, item.text ?? "");
+
+/** A line too long for a slide (a pasted paragraph) is wrapped, never cut short. */
+const fit = (l: string) => ([...l].length > MAX_SLIDE_LINE ? wrap(l, LONG_LINE_WIDTH) : [l]);
+
 /** The slides one item shows. */
 export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
   switch (item.kind) {
@@ -135,16 +145,19 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
       const lines = [clean(item.text)].filter(Boolean);
       return [to === null ? { lines } : { lines, countdownTo: to }];
     }
-    // Songs, text and pre-service loops; also any kind this version doesn't know (a draft saved by a newer one).
-    default: {
-      const size = item.kind === "song" ? SONG_LINES : MAX_SLIDE_LINES;
-      // A line too long for a slide (a pasted paragraph) is wrapped, never cut short.
-      const fit = (l: string) => ([...l].length > MAX_SLIDE_LINE ? wrap(l, LONG_LINE_WIDTH) : [l]);
+    case "song":
+      // Each section in the order it is sung, its lines shared evenly over its slides.
+      return sung(songOf(item))
+        .flatMap((section) => paragraphs(section.text))
+        .map((p) => p.flatMap(fit))
+        .flatMap((p) => balance(p, SONG_LINES))
+        .map((lines) => ({ lines: lines.map((l) => clean(l)) }));
+    // Text and pre-service loops; also any kind this version doesn't know (a draft saved by a newer one).
+    default:
       return paragraphs(item.text ?? "")
         .map((p) => p.flatMap(fit))
-        .flatMap((p) => chunks(p, size))
+        .flatMap((p) => chunks(p, MAX_SLIDE_LINES))
         .map((lines) => ({ lines: lines.map((l) => clean(l)) }));
-    }
   }
 }
 

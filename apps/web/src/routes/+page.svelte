@@ -4,7 +4,9 @@
   import { DaemonConnection, type Status } from "$lib/daemon";
   import { addImage, upload } from "$lib/media";
   import { addPdf } from "$lib/pdf";
-  import { build, imagesIn, newId, newItem, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
+  import type { Hymn } from "@jivvy/songs/hymns";
+  import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
+  import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
 
   const DRAFT_KEY = "jivvy.draft";
@@ -36,7 +38,10 @@
     }
   }
 
-  let draft = $state<Draft>(stored(DRAFT_KEY, { id: newId(), title: "Sunday service", items: [] }));
+  const saved = stored<Draft>(DRAFT_KEY, { id: newId(), title: "Sunday service", items: [] });
+  // Songs saved before the song editor get their sections from their lyrics, once.
+  for (const item of saved.items) if (item.kind === "song" && !item.song) item.song = songOf(item);
+  let draft = $state<Draft>(saved);
   let address = $state(stored(ADDRESS_KEY, "ws://127.0.0.1:47801"));
   let deviceName = $state("Run sheet (browser)");
   let status = $state<Status>({ kind: "offline", message: "Not connected." });
@@ -149,6 +154,33 @@
 
   function add(kind: ItemKind) {
     draft.items.push(newItem(kind));
+  }
+
+  /** The public-domain hymn library, loaded the first time it is opened. */
+  let hymns = $state<Hymn[] | null>(null);
+  let hymnsOpen = $state(false);
+  let hymnSearch = $state("");
+  let hymnSong: ((h: Hymn) => DraftItem["song"]) | null = null;
+  const hymnMatches = $derived(
+    (hymns ?? []).filter((h) => `${h.title} ${h.author}`.toLowerCase().includes(hymnSearch.trim().toLowerCase())),
+  );
+  async function openHymns() {
+    hymnsOpen = !hymnsOpen;
+    if (hymns) return;
+    try {
+      const lib = await import("@jivvy/songs/hymns");
+      hymnSong = lib.hymnSong;
+      hymns = lib.HYMNS;
+    } catch (e) {
+      sendError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  function addHymn(h: Hymn) {
+    const song = hymnSong?.(h);
+    if (!song) return;
+    draft.items.push({ ...newItem("song"), title: h.title, song });
+    hymnsOpen = false;
+    hymnSearch = "";
   }
   function move(i: number, by: number) {
     const [item] = draft.items.splice(i, 1);
@@ -292,6 +324,8 @@
             {#if adding}<span class="hint">{adding}</span>{/if}
             <p class="hint">Each picture is one slide, shown filling the screen.</p>
           {/if}
+        {:else if item.kind === "song" && item.song}
+          <SongEditor bind:song={item.song} />
         {:else if item.kind === "countdown"}
           <div class="row">
             <label>Text <input bind:value={item.text} maxlength="200" /></label>
@@ -327,7 +361,30 @@
       {#each KINDS as k (k.kind)}
         <button class="quiet" onclick={() => add(k.kind)}>+ {k.label}</button>
       {/each}
+      <button class="quiet" onclick={openHymns} aria-expanded={hymnsOpen}>+ Hymn</button>
     </div>
+
+    {#if hymnsOpen}
+      <div class="hymns">
+        <input bind:value={hymnSearch} placeholder="Search the hymn library" aria-label="Search hymns" />
+        {#if !hymns}
+          <p class="hint">Loading…</p>
+        {:else}
+          <ul>
+            {#each hymnMatches as h (h.id)}
+              <li>
+                <button class="hymn" onclick={() => addHymn(h)}>
+                  <strong>{h.title}</strong> <span class="hint">{h.author}, {h.year}</span>
+                </button>
+              </li>
+            {:else}
+              <li class="hint">No hymn matches.</li>
+            {/each}
+          </ul>
+          <p class="hint">Public domain, free to project and stream.</p>
+        {/if}
+      </div>
+    {/if}
 
     <div class="send">
       <button class="primary" onclick={send} disabled={!ready || inFlight}>Send to screens</button>
@@ -588,6 +645,32 @@
     flex-wrap: wrap;
     gap: 6px;
     margin: 4px 0 16px;
+  }
+  .hymns {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+  }
+  .hymns input {
+    width: 100%;
+  }
+  .hymns ul {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0 0;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .hymn {
+    width: 100%;
+    text-align: left;
+    border-color: transparent;
+    background: transparent;
+  }
+  .hymn:hover {
+    background: rgba(46, 107, 255, 0.08);
   }
   .send {
     display: flex;

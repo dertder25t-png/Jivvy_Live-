@@ -38,7 +38,8 @@
     if (!here?.item.advanceSeconds) return current + 1;
     let end = current;
     while (slides[end + 1]?.itemIndex === here.itemIndex) end++;
-    return end + 1;
+    // A loop at the end of the run sheet: Next stops it on its last slide.
+    return end + 1 < slides.length || end === current ? end + 1 : end;
   });
   const next = $derived(slides[nextIndex]);
 

@@ -31,7 +31,16 @@
   const slides = $derived(onScreens ? runSheetSlides(onScreens) : []);
   const current = $derived(live?.slideIndex ?? 0);
   const now = $derived(slides[current]);
-  const next = $derived(slides[current + 1]);
+  // Where Next goes, as the daemon decides it: from a pre-service loop, the slide after the
+  // whole loop (Next leaves it); otherwise the following slide.
+  const nextIndex = $derived.by(() => {
+    const here = slides[current];
+    if (!here?.item.advanceSeconds) return current + 1;
+    let end = current;
+    while (slides[end + 1]?.itemIndex === here.itemIndex) end++;
+    return end + 1;
+  });
+  const next = $derived(slides[nextIndex]);
 
   // Levels arrive about ten a second; none for 2 s means the meter has nothing to show.
   let clock = $state(Date.now());

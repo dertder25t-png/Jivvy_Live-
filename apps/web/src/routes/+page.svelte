@@ -244,6 +244,8 @@
   function keydown(e: KeyboardEvent) {
     const t = e.target as HTMLElement;
     if (!ready || t.closest("input, textarea, select, [contenteditable]")) return;
+    // Space presses a focused button (Back, Black, a slide in the list), as it should.
+    if (e.key === " " && t.closest("button, a, summary, [role=button]")) return;
     if (["ArrowRight", "ArrowDown", "PageDown", " "].includes(e.key)) go("slide.next");
     else if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) go("slide.prev");
     else if (e.key === "b" || e.key === "B") black();

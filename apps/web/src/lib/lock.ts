@@ -13,7 +13,10 @@ interface Lock {
   hash: string;
 }
 
-/** Where the browser blocks storage, the lock holds for this visit. */
+/**
+ * Where the browser blocks storage, the lock holds for this visit. Used only then: with
+ * storage working, what is stored is the truth (another tab may have unlocked).
+ */
 let inMemory: Lock | null = null;
 
 export const validPin = (pin: string): boolean => /^\d{4,8}$/.test(pin);
@@ -23,13 +26,13 @@ export function isLocked(): boolean {
 }
 
 function read(): Lock | null {
+  if (inMemory) return inMemory; // only set when storage refused the lock
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) return JSON.parse(raw) as Lock;
+    return raw ? (JSON.parse(raw) as Lock) : null;
   } catch {
-    // blocked or corrupt storage: fall back to this visit's lock
+    return null; // blocked storage and no lock this visit
   }
-  return inMemory;
 }
 
 async function hash(salt: string, pin: string): Promise<string> {
@@ -41,11 +44,12 @@ async function hash(salt: string, pin: string): Promise<string> {
 export async function lock(pin: string): Promise<void> {
   if (!validPin(pin)) throw new Error("The PIN is 4 to 8 digits.");
   const salt = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
-  inMemory = { salt, hash: await hash(salt, pin) };
+  const locked: Lock = { salt, hash: await hash(salt, pin) };
   try {
-    localStorage.setItem(KEY, JSON.stringify(inMemory));
+    localStorage.setItem(KEY, JSON.stringify(locked));
+    inMemory = null;
   } catch {
-    // locked for this visit only
+    inMemory = locked; // storage refused: locked for this visit only
   }
 }
 

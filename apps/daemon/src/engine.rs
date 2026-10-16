@@ -132,6 +132,9 @@ pub struct Engine {
     protected: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
+    /// When an operator command last changed what is shown (slide, black, run sheet); the
+    /// engine's start counts. Not saved: for `in_service` only.
+    last_shown_change: Instant,
     /// Songs, plans, themes and settings (`library.sqlite3`); None if it couldn't be opened,
     /// which never stops a service: the doc commands answer `unavailable`.
     library: Option<crate::library::Library>,
@@ -197,6 +200,7 @@ impl Engine {
             pruning: None,
             protected: Default::default(),
             shown_since: None,
+            last_shown_change: Instant::now(),
             library,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
@@ -221,6 +225,18 @@ impl Engine {
 
     pub fn state(&self) -> &Snapshot {
         &self.state
+    }
+
+    /// A service is on (see `power::in_service`). A future updater must not install or restart
+    /// anything while this is true.
+    pub fn in_service(&self) -> bool {
+        crate::power::in_service(&crate::power::Activity {
+            stream_wanted: self.state.stream_wanted,
+            recording_wanted: self.state.recording_wanted,
+            run_sheet_set: self.run_sheet.is_some(),
+            black: self.state.black,
+            since_last_change: self.last_shown_change.elapsed(),
+        })
     }
 
     /// How many slides there are: the run sheet's, else `--slides`. Never 0.
@@ -511,6 +527,9 @@ impl Engine {
                 // they come straight back to the same slide before it.
                 self.shown_since = None;
             }
+            if next.slide_index != self.state.slide_index || next.black != self.state.black {
+                self.last_shown_change = Instant::now();
+            }
             self.state = next;
             self.broadcast();
         }
@@ -632,6 +651,7 @@ impl Engine {
         next.run_sheet_id = Some(saved.run_sheet.id.clone());
         next.loop_stopped = false;
         self.run_sheet = Some(saved);
+        self.last_shown_change = Instant::now();
         // A loop in the new run sheet gets its full time on its first slide, even if the
         // slide number is the same as before.
         self.shown_since = None;

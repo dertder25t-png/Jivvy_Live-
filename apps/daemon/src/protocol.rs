@@ -110,11 +110,16 @@ pub struct Slide {
 /// One item in the service (a song, a reading, a countdown...), already turned into slides
 /// by the UI; the daemon only shows slides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSheetItem {
     pub id: String,
     pub kind: String,
     pub title: String,
     pub slides: Vec<Slide>,
+    /// While one of its slides shows, move to the next every this many seconds, wrapping
+    /// from the last to the first (the pre-service loop).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -129,6 +134,19 @@ impl RunSheet {
     pub fn slides(&self) -> impl Iterator<Item = &Slide> {
         self.items.iter().flat_map(|i| i.slides.iter())
     }
+
+    /// The item slide `index` belongs to, and the index of that item's first slide.
+    pub fn item_at(&self, index: u64) -> Option<(&RunSheetItem, u64)> {
+        let mut start = 0;
+        for item in &self.items {
+            let len = item.slides.len() as u64;
+            if index < start + len {
+                return Some((item, start));
+            }
+            start += len;
+        }
+        None
+    }
 }
 
 /// Run sheet limits, the same as the TypeScript package's.
@@ -137,6 +155,7 @@ pub const MAX_RUNSHEET_SLIDES: usize = 2000;
 pub const MAX_SLIDE_LINES: usize = 16;
 pub const MAX_SLIDE_LINE: usize = 200;
 pub const MAX_TITLE: usize = 200;
+pub const MAX_ADVANCE_SECONDS: u64 = 3600;
 
 /// At most `max` characters (code points, as JavaScript's `[...s]` counts), no control characters.
 fn plain_text(v: Option<&Value>, max: usize) -> Option<String> {
@@ -187,7 +206,11 @@ pub fn run_sheet(v: Option<&Value>) -> Option<RunSheet> {
             return None;
         }
         let slides = raw_slides.iter().map(slide).collect::<Option<Vec<_>>>()?;
-        items.push(RunSheetItem { id, kind: kind.into(), title, slides });
+        let advance_seconds = match it.get("advanceSeconds") {
+            None => None,
+            Some(v) => Some(js_integer(v).filter(|f| (1.0..=MAX_ADVANCE_SECONDS as f64).contains(f))? as u64),
+        };
+        items.push(RunSheetItem { id, kind: kind.into(), title, slides, advance_seconds });
     }
     Some(RunSheet { id, title, items })
 }

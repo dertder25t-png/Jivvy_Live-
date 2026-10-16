@@ -116,6 +116,8 @@ pub struct Engine {
     slide_count: u64,
     /// The run sheet and its revision, saved in `runsheet.json`.
     run_sheet: Option<crate::runsheet::Saved>,
+    /// The slide on screen and since when, for items that move on by themselves.
+    shown_since: Option<(u64, Instant)>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -154,6 +156,8 @@ impl Engine {
         {
             state.slide_index = 0;
             state.run_sheet_id = Some(saved.run_sheet.id.clone());
+            // A stop pressed in the old run sheet doesn't hold a loop in the new one.
+            state.loop_stopped = false;
         }
         // A snapshot from a longer run sheet must not point past the end of this one.
         let count = run_sheet.as_ref().map_or(slide_count, |s| s.run_sheet.slides().count() as u64).max(1);
@@ -169,6 +173,7 @@ impl Engine {
             store,
             slide_count: slide_count.max(1),
             run_sheet,
+            shown_since: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -252,6 +257,7 @@ impl Engine {
     }
 
     pub fn tick_at(&mut self, now: Instant) {
+        self.advance_loop(now);
         if self.last_sent.as_ref() != Some(&self.view_at(now)) {
             self.broadcast_at(now);
         }
@@ -311,6 +317,7 @@ impl Engine {
             }
         }
         let mut next = self.state.clone();
+        let mut stop_loop = false;
         match env.command {
             Command::PairOpen => {
                 self.pairing_until = Some(Instant::now() + protocol::PAIRING_WINDOW);
@@ -362,7 +369,13 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
-            Command::SlideNext => next.slide_index = (next.slide_index + 1).min(self.slide_count() - 1),
+            Command::SlideNext => {
+                let target = self.next_slide();
+                next.slide_index = target.min(self.slide_count() - 1);
+                // A loop at the end of the run sheet: nothing after it, so Next goes to its
+                // last slide and stops the loop there (saved, so a restart doesn't restart it).
+                stop_loop = target >= self.slide_count() && self.in_loop(self.state.slide_index);
+            }
             Command::SlidePrev => next.slide_index = next.slide_index.saturating_sub(1),
             Command::SlideGoto { index } => {
                 if index >= self.slide_count() {
@@ -438,6 +451,12 @@ impl Engine {
                 None => return protocol::nack(id, ErrorCode::Unavailable, "this connection can't receive events"),
             },
         }
+        // Any other slide change starts a stopped loop's slide moving again.
+        if stop_loop {
+            next.loop_stopped = true;
+        } else if next.slide_index != self.state.slide_index {
+            next.loop_stopped = false;
+        }
         if next != self.state {
             next.saved_at = crate::now_ms();
             if let Err(e) = self.store.save(&next) {
@@ -445,10 +464,67 @@ impl Engine {
                 crate::log("engine", format!("snapshot save failed: {e}"));
                 return protocol::nack(id, ErrorCode::Unavailable, "could not save state; try again");
             }
+            if next.slide_index != self.state.slide_index {
+                // Moved by the operator: a loop's wait starts again from the next tick, even if
+                // they come straight back to the same slide before it.
+                self.shown_since = None;
+            }
             self.state = next;
             self.broadcast();
         }
         protocol::ack(id, Some(self.view()))
+    }
+
+    /// Whether slide `index` belongs to a pre-service loop.
+    fn in_loop(&self, index: u64) -> bool {
+        self.run_sheet
+            .as_ref()
+            .and_then(|s| s.run_sheet.item_at(index))
+            .is_some_and(|(i, _)| i.advance_seconds.is_some())
+    }
+
+    /// Where Next goes: the following slide, except from a pre-service loop, which Next leaves
+    /// for the item after it (pressing Next to start the service must never keep it looping).
+    fn next_slide(&self) -> u64 {
+        let index = self.state.slide_index;
+        match self.run_sheet.as_ref().and_then(|s| s.run_sheet.item_at(index)) {
+            Some((item, start)) if item.advance_seconds.is_some() => start + item.slides.len() as u64,
+            _ => index + 1,
+        }
+    }
+
+    /// The pre-service loop: on a slide of an item with `advanceSeconds`, moves to that item's
+    /// next slide once it has shown that long, and from its last back to its first. Any other
+    /// slide change (Next, Back, a new run sheet) restarts the wait.
+    fn advance_loop(&mut self, now: Instant) {
+        let index = self.state.slide_index;
+        let since = match self.shown_since {
+            Some((shown, since)) if shown == index => since,
+            _ => {
+                self.shown_since = Some((index, now));
+                return;
+            }
+        };
+        if self.state.loop_stopped {
+            return;
+        }
+        let Some((item, start)) = self.run_sheet.as_ref().and_then(|s| s.run_sheet.item_at(index)) else { return };
+        let Some(secs) = item.advance_seconds.filter(|_| item.slides.len() > 1) else { return };
+        if now.saturating_duration_since(since) < Duration::from_secs(secs) {
+            return;
+        }
+        let mut next = self.state.clone();
+        next.slide_index = start + (index - start + 1) % item.slides.len() as u64;
+        next.saved_at = crate::now_ms();
+        // Saved like any slide change, so a restart carries on in the loop where it was. Not
+        // shown unless saved: the screens stay put and the next tick tries again.
+        if let Err(e) = self.store.save(&next) {
+            crate::log("engine", format!("snapshot save failed: {e}"));
+            return;
+        }
+        self.state = next;
+        self.shown_since = Some((self.state.slide_index, now));
+        self.broadcast_at(now);
     }
 
     /// Saves the new run sheet, then moves to its first slide (another run sheet) or stays on
@@ -464,7 +540,11 @@ impl Engine {
         crate::log("engine", format!("run sheet {} rev {rev}", saved.run_sheet.id));
         let mut next = self.state.clone();
         next.run_sheet_id = Some(saved.run_sheet.id.clone());
+        next.loop_stopped = false;
         self.run_sheet = Some(saved);
+        // A loop in the new run sheet gets its full time on its first slide, even if the
+        // slide number is the same as before.
+        self.shown_since = None;
         next.slide_index = if same { next.slide_index.min(self.slide_count() - 1) } else { 0 };
         if next != self.state {
             next.saved_at = crate::now_ms();
@@ -1037,6 +1117,88 @@ mod tests {
         let store = Store::new(&dir).unwrap();
         let (snap, _) = store.load();
         assert_eq!(Engine::new(store, snap, 100).view().slide_index, 0);
+    }
+
+    #[test]
+    fn a_looping_item_moves_on_by_itself_and_wraps_until_the_operator_leaves_it() {
+        let (mut e, _) = engine("loop", 100);
+        let sheet = json!({ "id": "sun", "title": "", "items": [
+            { "id": "pre", "kind": "loop", "title": "Welcome", "advanceSeconds": 5,
+              "slides": [{ "lines": ["Welcome"] }, { "lines": ["Coffee"] }] },
+            { "id": "s1", "kind": "song", "title": "", "slides": [{ "lines": ["Amazing grace"] }] },
+        ] });
+        // The daemon has sat on slide 1 for a while before the run sheet arrives.
+        let before = Instant::now();
+        e.tick_at(before);
+        e.tick_at(before + Duration::from_secs(60));
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        let t0 = before + Duration::from_secs(61);
+        e.tick_at(t0);
+        assert_eq!(e.view().slide_index, 0, "the loop's first slide gets its full time");
+        e.tick_at(t0 + Duration::from_secs(4));
+        assert_eq!(e.view().slide_index, 0, "not yet");
+        e.tick_at(t0 + Duration::from_secs(5));
+        assert_eq!(e.view().slide_index, 1);
+        e.tick_at(t0 + Duration::from_secs(10));
+        assert_eq!(e.view().slide_index, 0, "back to the loop's first slide");
+        // Away and straight back between two ticks: the slide gets its full time again.
+        e.tick_at(t0 + Duration::from_secs(14));
+        send(&mut e, json!({ "type": "slide.goto", "index": 1 }));
+        send(&mut e, json!({ "type": "slide.goto", "index": 0 }));
+        e.tick_at(t0 + Duration::from_secs(15));
+        assert_eq!(e.view().slide_index, 0, "not moved on at once");
+        let r = send(&mut e, json!({ "type": "slide.next" }));
+        assert_eq!(r["state"]["slideIndex"], 2, "Next leaves the loop for the song");
+        e.tick_at(t0 + Duration::from_secs(60));
+        assert_eq!(e.view().slide_index, 2, "the song waits for the operator");
+    }
+
+    #[test]
+    fn next_stops_a_loop_at_the_end_of_the_run_sheet() {
+        let (mut e, dir) = engine("loop-end", 100);
+        let sheet = json!({ "id": "pre", "title": "", "items": [
+            { "id": "s1", "kind": "song", "title": "", "slides": [{ "lines": ["Amazing grace"] }] },
+            { "id": "post", "kind": "loop", "title": "", "advanceSeconds": 5,
+              "slides": [{ "lines": ["Thanks for coming"] }, { "lines": ["See you next week"] }] },
+        ] });
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        send(&mut e, json!({ "type": "slide.goto", "index": 1 }));
+        let t0 = Instant::now();
+        e.tick_at(t0);
+        send(&mut e, json!({ "type": "slide.next" }));
+        e.tick_at(t0 + Duration::from_secs(60));
+        assert_eq!(e.view().slide_index, 2, "on the loop's last slide, and it stays there");
+        // Still stopped after the engine restarts.
+        drop(e);
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut e = Engine::new(store, snap, 100);
+        e.tick_at(t0);
+        e.tick_at(t0 + Duration::from_secs(60));
+        assert_eq!(e.view().slide_index, 2, "a restart doesn't start the loop again");
+        send(&mut e, json!({ "type": "slide.goto", "index": 1 }));
+        e.tick_at(t0 + Duration::from_secs(61));
+        e.tick_at(t0 + Duration::from_secs(66));
+        assert_eq!(e.view().slide_index, 2, "going back into it loops again");
+        // Next on the loop's last slide stops it too.
+        send(&mut e, json!({ "type": "slide.next" }));
+        e.tick_at(t0 + Duration::from_secs(120));
+        assert_eq!(e.view().slide_index, 2, "Next on the last slide holds it");
+
+        // A crash after another run sheet was saved: its loop isn't held by the old stop.
+        drop(e);
+        let other: protocol::RunSheet = serde_json::from_value(json!({ "id": "next", "title": "", "items": [
+            { "id": "pre", "kind": "loop", "title": "", "advanceSeconds": 5,
+              "slides": [{ "lines": ["Welcome"] }, { "lines": ["Coffee"] }] },
+        ] }))
+        .unwrap();
+        crate::runsheet::save(&dir, &crate::runsheet::Saved { version: 1, rev: 9, run_sheet: other }).unwrap();
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut e = Engine::new(store, snap, 100);
+        e.tick_at(t0);
+        e.tick_at(t0 + Duration::from_secs(5));
+        assert_eq!(e.view().slide_index, 1, "the new run sheet's loop runs");
     }
 
     #[test]

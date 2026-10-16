@@ -10,6 +10,7 @@
     { kind: "song", label: "Song" },
     { kind: "scripture", label: "Scripture" },
     { kind: "countdown", label: "Countdown" },
+    { kind: "loop", label: "Pre-service loop" },
     { kind: "text", label: "Text" },
   ];
 
@@ -192,6 +193,14 @@
             <label>Counts down to <input type="time" bind:value={item.at} /></label>
           </div>
         {:else}
+          {#if item.kind === "loop"}
+            <div class="row">
+              <label
+                >Seconds on each slide <input type="number" min="1" max="3600" bind:value={item.seconds} /></label
+              >
+            </div>
+            <p class="hint">Moves on by itself and starts over after the last slide, until you press Next.</p>
+          {/if}
           <textarea
             bind:value={item.text}
             rows="6"
@@ -199,7 +208,9 @@
               ? "Paste the lyrics. A blank line starts a new slide."
               : item.kind === "scripture"
                 ? "Paste the passage. It is split into slides for you."
-                : "A blank line starts a new slide."}
+                : item.kind === "loop"
+                  ? "Welcome, announcements, coffee… A blank line starts a new slide."
+                  : "A blank line starts a new slide."}
           ></textarea>
         {/if}
       </article>
@@ -251,7 +262,9 @@
       <ol class="slides">
         {#each slides as s, i (i)}
           {#if i === 0 || slides[i - 1]?.itemIndex !== s.itemIndex}
-            <li class="group">{s.item.title || kindLabel(s.item.kind)}</li>
+            <li class="group">
+              {s.item.title || kindLabel(s.item.kind)}{#if s.item.advanceSeconds}{` · loops every ${s.item.advanceSeconds} s`}{/if}
+            </li>
           {/if}
           <li>
             <button class="slide" class:current={i === current} onclick={() => goto(i)} disabled={!ready}>
@@ -447,6 +460,9 @@
     display: flex;
     flex-wrap: wrap;
     gap: 12px;
+  }
+  .row input[type="number"] {
+    width: 90px;
   }
   .row label {
     display: flex;

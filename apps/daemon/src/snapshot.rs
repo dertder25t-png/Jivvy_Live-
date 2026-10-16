@@ -29,6 +29,10 @@ pub struct Snapshot {
     /// between saving a new run sheet and this file) starts on its first slide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_sheet_id: Option<String>,
+    /// Next was pressed on a pre-service loop at the end of the run sheet: it stays on this
+    /// slide, even across a restart, until the slide changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_stopped: bool,
     pub saved_at: u64,
 }
 
@@ -41,6 +45,7 @@ impl Default for Snapshot {
             stream_wanted: false,
             recording_wanted: false,
             run_sheet_id: None,
+            loop_stopped: false,
             saved_at: 0,
         }
     }

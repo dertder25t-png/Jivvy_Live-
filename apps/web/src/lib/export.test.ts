@@ -37,7 +37,7 @@ describe("export", () => {
     ]);
     expect(crc32(new TextEncoder().encode("123456789"))).toBe(0xcbf43926);
     const text = files.find((f) => f.path === "songs/amazing-grace.txt")!.data as string;
-    expect(text).toBe("Amazing Grace\n\nVerse 1\nAmazing grace\n\nChorus\nPraise\n\nOrder: Verse 1, Chorus, Verse 1\n");
+    expect(text).toBe("Amazing Grace\nby John Newton\n\nVerse 1\nAmazing grace\n\nChorus\nPraise\n\nOrder: Verse 1, Chorus, Verse 1\n");
     const json = files.find((f) => f.path === "json/setting/output.json")!.data as string;
     expect(json).not.toMatch(/abc|apiKey|streamKey/);
     expect(files.find((f) => f.path === "json/setting/dest.json")!.data).not.toMatch(/abc123/);

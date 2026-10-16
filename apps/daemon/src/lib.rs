@@ -20,6 +20,7 @@ pub mod library;
 pub mod lyrics;
 pub mod media;
 pub mod outputs;
+pub mod power;
 pub mod preflight;
 pub mod program;
 pub mod protocol;

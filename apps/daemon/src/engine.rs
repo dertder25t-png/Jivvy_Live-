@@ -223,6 +223,17 @@ impl Engine {
         &self.state
     }
 
+    /// A service is on (see `power::in_service`). A future updater must not install or restart
+    /// anything while this is true.
+    pub fn in_service(&self) -> bool {
+        crate::power::in_service(
+            self.state.stream_wanted,
+            self.state.recording_wanted,
+            self.run_sheet.is_some(),
+            self.state.black,
+        )
+    }
+
     /// How many slides there are: the run sheet's, else `--slides`. Never 0.
     fn slide_count(&self) -> u64 {
         self.run_sheet.as_ref().map_or(self.slide_count, |s| s.run_sheet.slides().count() as u64).max(1)

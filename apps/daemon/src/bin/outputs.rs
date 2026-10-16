@@ -130,6 +130,8 @@ mod ui {
         Update(Update),
         /// An output's page finished loading and can be drawn.
         Ready(String),
+        /// A key pressed in an output window (a clicker's, usually).
+        Key(String),
     }
 
     struct OutputWindow {
@@ -222,6 +224,8 @@ mod ui {
             .with_ipc_handler(move |req| {
                 if req.body() == "ready" {
                     let _ = proxy.send_event(UserEvent::Ready(id.clone()));
+                } else if let Some(key) = req.body().strip_prefix("key:") {
+                    let _ = proxy.send_event(UserEvent::Key(key.to_string()));
                 }
             })
             .build(&window)
@@ -310,6 +314,18 @@ mod ui {
                 Event::UserEvent(UserEvent::Ready(id)) => {
                     if let (Some(w), Some(state)) = (windows.get(&id), model.shown.as_ref()) {
                         render(w, state);
+                    }
+                }
+                Event::UserEvent(UserEvent::Key(key)) => {
+                    let black = model.shown.as_ref().is_some_and(|s| s.black);
+                    if let Some(command) = client::key_command(&key, black) {
+                        // Off the UI thread, so a slow engine can't freeze the windows.
+                        let addr = args.connect.clone();
+                        std::thread::spawn(move || {
+                            if !client::send_command(&addr, command) {
+                                log("outputs", "key command was not accepted by the engine");
+                            }
+                        });
                     }
                 }
                 // Outputs close only when unplugged or reconfigured, never by accident.

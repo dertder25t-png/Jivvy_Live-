@@ -431,7 +431,7 @@
     if (e.key === " " && t.closest("button, a, summary, [role=button]")) return;
     if (["ArrowRight", "ArrowDown", "PageDown", " "].includes(e.key)) go("slide.next");
     else if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) go("slide.prev");
-    else if (e.key === "b" || e.key === "B") black();
+    else if (e.key === "b" || e.key === "B" || e.key === ".") black();
     else return;
     e.preventDefault();
   }

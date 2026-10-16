@@ -75,6 +75,25 @@ pub fn follow(addr: &str, mut on: impl FnMut(Update)) -> ! {
     }
 }
 
+/// The command a key pressed in an output window (a presentation clicker's Page Up/Down,
+/// arrows, Space, B or ".") stands for. `black_now` is whether the screen is black now.
+pub fn key_command(key: &str, black_now: bool) -> Option<Value> {
+    let kind = match key {
+        "ArrowRight" | "ArrowDown" | "PageDown" | " " => "slide.next",
+        "ArrowLeft" | "ArrowUp" | "PageUp" => "slide.prev",
+        "b" | "B" | "." => return Some(serde_json::json!({ "type": "output.black", "on": !black_now })),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "type": kind }))
+}
+
+/// Sends one command to the engine on its own short-lived connection and waits for the ack.
+/// True only if the engine answered ok.
+pub fn send_command(addr: &str, command: Value) -> bool {
+    let msg = serde_json::json!({ "v": 1, "id": "keys", "ts": 0, "command": command });
+    connect(addr).is_ok_and(|mut c| exchange(&mut c, &msg))
+}
+
 /// Sends the video process's reports (audio levels, stream status) to the engine from a
 /// background thread, reconnecting as needed, and reports whether the engine is actually
 /// acknowledging them. Reports are dropped (never queued up) while the engine is away: old
@@ -197,6 +216,30 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out waiting for: {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn clicker_keys_become_commands_and_reach_the_engine() {
+        assert_eq!(key_command("PageDown", false), Some(serde_json::json!({ "type": "slide.next" })));
+        assert_eq!(key_command("PageUp", false), Some(serde_json::json!({ "type": "slide.prev" })));
+        assert_eq!(key_command(".", false), Some(serde_json::json!({ "type": "output.black", "on": true })));
+        assert_eq!(key_command("b", true), Some(serde_json::json!({ "type": "output.black", "on": false })));
+        assert_eq!(key_command("F5", false), None);
+        assert_eq!(key_command("Escape", false), None);
+
+        let dir = std::env::temp_dir().join(format!("jivvy-keys-{}-{}", std::process::id(), crate::now_ms()));
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let engine = Arc::new(Mutex::new(Engine::new(store, snap, 10)));
+        let listener = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let e = engine.clone();
+        std::thread::spawn(move || serve(listener, e));
+        assert!(send_command(&addr, key_command("ArrowRight", false).unwrap()));
+        assert!(send_command(&addr, key_command(".", false).unwrap()));
+        let r = engine.lock().unwrap().handle_line(r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#);
+        let r = serde_json::to_value(r).unwrap();
+        assert_eq!(r["state"]["black"], serde_json::json!(true));
     }
 
     #[test]

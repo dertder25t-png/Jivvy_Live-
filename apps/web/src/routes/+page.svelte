@@ -7,6 +7,9 @@
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
   import { getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
+  import { BUILT_IN, DEFAULT_THEME_ID, newThemeId, themeBody, themeFromDoc, type Theme } from "$lib/theme";
+  import SlideView from "$lib/SlideView.svelte";
+  import ThemePicker from "$lib/ThemePicker.svelte";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
@@ -15,6 +18,7 @@
   const DRAFT_KEY = "jivvy.draft";
   const ADDRESS_KEY = "jivvy.address";
   const VIEW_KEY = "jivvy.view";
+  const THEME_KEY = "jivvy.theme";
   const KINDS: { kind: ItemKind; label: string }[] = [
     { kind: "song", label: "Song" },
     { kind: "scripture", label: "Scripture" },
@@ -404,8 +408,42 @@
       planNote = e instanceof Error ? e.message : String(e);
     }
   }
+  // ---- Themes: the look of the screens, one for the whole service ----
+
+  let savedThemes = $state<{ id: string; title: string; theme: Theme }[]>([]);
+  let themeId = $state(stored(THEME_KEY, DEFAULT_THEME_ID));
+  $effect(() => store(THEME_KEY, themeId));
+  const themes = $derived([...BUILT_IN, ...savedThemes]);
+  const theme = $derived((themes.find((t) => t.id === themeId) ?? BUILT_IN.find((t) => t.id === DEFAULT_THEME_ID)!).theme);
+  async function refreshThemes() {
+    if (!conn || !ready) return;
+    try {
+      const found = [];
+      for (const info of await listDocs(conn, "theme")) {
+        const t = themeFromDoc(await getDoc(conn, "theme", info.id));
+        if (t) found.push({ id: info.id, title: info.title, theme: t });
+      }
+      savedThemes = found;
+    } catch {
+      savedThemes = []; // an older church computer without a library: the built-in themes
+    }
+  }
+  $effect(() => {
+    if (ready) void refreshThemes();
+  });
+  async function saveTheme(title: string, t: Theme): Promise<string> {
+    if (!conn) return "Not connected.";
+    const id = newThemeId(title);
+    const result = await saveDoc(conn, { kind: "theme", id, title, body: themeBody(t) }, 0);
+    if (!result.ok) return result.message;
+    await refreshThemes();
+    themeId = id;
+    return "Saved to the church computer's library.";
+  }
+
   /** Another device saved or deleted something: open lists follow it. */
   function docChanged(doc: DocInfo) {
+    if (doc.kind === "theme") void refreshThemes();
     if (doc.kind === "song" && hymnsOpen) void refreshSaved();
     if (doc.kind === "plan" && plansOpen && conn) void listDocs(conn, "plan").then((p) => (plans = p), () => {});
   }
@@ -550,7 +588,7 @@
 {/if}
 
 {#if locked || view === "operate"}
-  <Operator {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
+  <Operator {theme} {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
 {:else}
 <main>
   <section class="plan" aria-label="Run sheet">
@@ -729,13 +767,12 @@
   </section>
 
   <section class="live" aria-label="Live">
+    <ThemePicker {themes} selected={themeId} canSave={ready} pick={(id) => (themeId = id)} save={saveTheme} />
     <div class="screen" class:black={live?.black}>
       {#if live?.black}
         <span class="note">Screens are black</span>
       {:else if live?.slide}
-        {#if live.slide.image}<Thumb id={live.slide.image} fill />{/if}
-        {#each live.slide.lines as line, i (i)}<div class="over">{line}</div>{/each}
-        {#if live.slide.countdownTo}<div class="note">Countdown</div>{/if}
+        <SlideView slide={live.slide} {theme} />
       {:else if live}
         <span class="note">Slide {live.slideIndex + 1}</span>
       {:else}
@@ -1100,10 +1137,6 @@
   }
   .pick:focus-within {
     outline: 2px solid var(--blue);
-  }
-  .over {
-    position: relative;
-    text-shadow: 0 0 0.25em #000;
   }
   .screen {
     aspect-ratio: 16 / 9;

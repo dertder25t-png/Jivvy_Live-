@@ -5,6 +5,7 @@
  */
 import {
   MAX_ADVANCE_SECONDS,
+  MAX_SLIDE_LABEL,
   MAX_SLIDE_LINE,
   MAX_SLIDE_LINES,
   MAX_TITLE,
@@ -147,11 +148,14 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
     }
     case "song":
       // Each section in the order it is sung, its lines shared evenly over its slides.
-      return sung(songOf(item))
-        .flatMap((section) => paragraphs(section.text))
-        .map((p) => p.flatMap(fit))
-        .flatMap((p) => balance(p, SONG_LINES))
-        .map((lines) => ({ lines: lines.map((l) => clean(l)) }));
+      // Each slide carries its section's name for the operator's list (never shown on screen).
+      return sung(songOf(item)).flatMap((section) => {
+        const label = clean(section.label, MAX_SLIDE_LABEL);
+        return paragraphs(section.text)
+          .map((p) => p.flatMap(fit))
+          .flatMap((p) => balance(p, SONG_LINES))
+          .map((lines) => ({ lines: lines.map((l) => clean(l)), ...(label ? { label } : {}) }));
+      });
     // Text and pre-service loops; also any kind this version doesn't know (a draft saved by a newer one).
     default:
       return paragraphs(item.text ?? "")

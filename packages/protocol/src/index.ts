@@ -203,6 +203,8 @@ export const MAX_SLIDE_LINES = 16;
 /** Longest line on a slide, and longest title, in characters. */
 export const MAX_SLIDE_LINE = 200;
 export const MAX_TITLE = 200;
+/** Longest slide label ("Verse 1", "Chorus"), in characters. */
+export const MAX_SLIDE_LABEL = 40;
 /** Longest time a looping item waits on one slide. */
 export const MAX_ADVANCE_SECONDS = 3600;
 /** An item's kind: "song", "scripture", "countdown", "text" today; newer UIs may add others. */
@@ -233,6 +235,11 @@ function parseSlide(x: unknown): Slide | null {
   if (x.image !== undefined) {
     if (!isMediaId(x.image)) return null;
     slide.image = x.image;
+  }
+  if (x.label !== undefined) {
+    const label = plainText(x.label, MAX_SLIDE_LABEL);
+    if (label === null) return null;
+    slide.label = label;
   }
   return slide;
 }
@@ -468,6 +475,11 @@ export interface Slide {
    * letterboxed, with any lines over it. runsheet.set is refused if the church computer lacks it.
    */
   image?: string;
+  /**
+   * Added in v1: which part of its item this slide is ("Verse 1", "Chorus"), for the operator's
+   * slide list. Never shown on the screens or the stream.
+   */
+  label?: string;
 }
 
 /**

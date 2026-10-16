@@ -2,7 +2,7 @@
   import { exportFiles, readAll, zip } from "./export";
   import type { Sender } from "./library";
 
-  let { ready, sender }: { ready: boolean; sender: () => Sender | null } = $props();
+  let { ready, sender, beforeExport }: { ready: boolean; sender: () => Sender | null; beforeExport?: () => Promise<void> } = $props();
   let busy = $state(false);
   let note = $state("");
 
@@ -12,6 +12,7 @@
     busy = true;
     note = "";
     try {
+      await beforeExport?.(); // a plan edit still waiting to be saved is in the export
       const { docs, skipped } = await readAll(conn);
       const files = exportFiles(docs);
       const blob = new Blob([zip(files) as BlobPart], { type: "application/zip" });

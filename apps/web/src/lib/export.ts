@@ -12,17 +12,25 @@ export const KINDS = ["song", "plan", "theme", "setting"];
 
 /** Settings documents that hold devices or the stream: never exported at all. */
 const SECRET_DOCS = new Set(["stream", "devices"]);
-const SECRET_NAME = /secret|token|password|passphrase|private|credential|auth|(stream|api|access)[-_ ]?key|[a-z_-]key$/i;
+/** Field names never exported (compared lower-case, without - _ or spaces). */
+const SECRET_NAMES = new Set(
+  ["streamKey", "apiKey", "secretKey", "accessKey", "privateKey", "secret", "clientSecret", "token", "accessToken", "refreshToken",
+   "password", "passcode", "passphrase", "pin", "authorization", "credentials"].map((n) => n.toLowerCase()),
+);
+const isSecretName = (k: string) => SECRET_NAMES.has(k.toLowerCase().replace(/[-_ ]/g, ""));
+/** A stream address that carries its key in the path. */
+const STREAM_URL = /^\s*(rtmps?|srt):\/\//i;
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 
 /** A copy of `value` without any field whose name looks like a key, secret or token. */
 export function scrub(value: unknown, kind = ""): unknown {
   if (Array.isArray(value)) return value.map((v) => scrub(v, kind));
+  if (typeof value === "string" && kind === "setting" && STREAM_URL.test(value)) return "";
   if (!isObj(value)) return value;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value)) {
-    if (SECRET_NAME.test(k) || (kind === "setting" && /^key$/i.test(k))) continue;
+    if (isSecretName(k) || (kind === "setting" && /^key$/i.test(k))) continue;
     out[k] = scrub(v, kind);
   }
   return out;
@@ -33,7 +41,7 @@ export interface ExportFile {
   data: string | Uint8Array;
 }
 
-/** A song as plain text that opens anywhere (and pastes back into the song editor). */
+/** A song as plain text that opens anywhere. */
 export function songText(song: Song): string {
   const out = [song.title];
   if (song.author) out.push(`by ${song.author}`);
@@ -55,7 +63,12 @@ export function planText(title: string, items: { kind: string; title: string; te
   return out.join("\n") + "\n";
 }
 
-const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "untitled";
+const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
+/** A file name part: letters and digits in any script; Windows reserved names get a suffix. */
+const slug = (s: string) => {
+  const t = s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/g, "").slice(0, 60) || "untitled";
+  return RESERVED.test(t) ? `${t}-file` : t;
+};
 
 const README = `Jivvy Live export
 =================
@@ -100,10 +113,18 @@ export function exportFiles(docs: Doc[]): ExportFile[] {
 }
 
 /** Every document of every kind, read from the church computer. */
-export async function readAll(conn: Sender, kinds = KINDS): Promise<Doc[]> {
+export async function readAll(conn: Sender, kinds = KINDS): Promise<{ docs: Doc[]; skipped: number }> {
   const docs: Doc[] = [];
-  for (const kind of kinds) for (const info of await listDocs(conn, kind)) docs.push(await getDoc(conn, kind, info.id));
-  return docs;
+  let skipped = 0;
+  for (const kind of kinds)
+    for (const info of await listDocs(conn, kind)) {
+      try {
+        docs.push(await getDoc(conn, kind, info.id));
+      } catch {
+        skipped++;
+      }
+    }
+  return { docs, skipped };
 }
 
 // --- A zip with no compression ("store"), so no dependency is needed. ---

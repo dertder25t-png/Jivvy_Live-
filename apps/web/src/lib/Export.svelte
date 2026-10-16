@@ -12,14 +12,15 @@
     busy = true;
     note = "";
     try {
-      const files = exportFiles(await readAll(conn));
+      const { docs, skipped } = await readAll(conn);
+      const files = exportFiles(docs);
       const blob = new Blob([zip(files) as BlobPart], { type: "application/zip" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
       a.download = `jivvy-live-export-${new Date().toISOString().slice(0, 10)}.zip`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
-      note = `Exported ${files.length - 1} files.`;
+      note = `Exported ${files.length - 1} files.` + (skipped ? ` ${skipped} could not be read and were left out.` : "");
     } catch (e) {
       note = e instanceof Error ? e.message : "Export failed.";
     } finally {

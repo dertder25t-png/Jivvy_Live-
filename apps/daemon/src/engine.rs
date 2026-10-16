@@ -20,8 +20,10 @@ use crate::protocol::{
 use crate::snapshot::{Snapshot, Store};
 use crate::tls::TlsFiles;
 
-/// Longest line accepted on the command channel; protocol messages are tiny.
-const MAX_LINE: usize = 16 * 1024;
+/// Longest message on either command channel (a TCP line or a WebSocket message): room for
+/// a whole run sheet (`runsheet.set`). The same as the TypeScript `MAX_MESSAGE_BYTES`, which
+/// UIs check before sending.
+const MAX_MESSAGE: usize = 1024 * 1024;
 /// Messages queued for one connection before it counts as stuck and is disconnected.
 const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
@@ -93,6 +95,8 @@ fn device_may(command: &Command) -> bool {
             | Command::StateGet
             | Command::StateSubscribe
             | Command::StreamPreflight
+            | Command::RunSheetSet { .. }
+            | Command::RunSheetGet
     )
 }
 
@@ -108,7 +112,10 @@ struct PendingPairing {
 pub struct Engine {
     state: Snapshot,
     store: Store,
+    /// Slides to count to when no run sheet is set (`--slides`).
     slide_count: u64,
+    /// The run sheet and its revision, saved in `runsheet.json`.
+    run_sheet: Option<crate::runsheet::Saved>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -139,10 +146,18 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(store: Store, state: Snapshot, slide_count: u64) -> Self {
-        let slide_count = slide_count.max(1);
+        let run_sheet = crate::runsheet::load(store.dir());
         let mut state = state;
+        // The slide number belongs to another run sheet: the new one starts at its beginning.
+        if let Some(saved) = &run_sheet
+            && state.run_sheet_id.as_deref() != Some(saved.run_sheet.id.as_str())
+        {
+            state.slide_index = 0;
+            state.run_sheet_id = Some(saved.run_sheet.id.clone());
+        }
         // A snapshot from a longer run sheet must not point past the end of this one.
-        state.slide_index = state.slide_index.min(slide_count - 1);
+        let count = run_sheet.as_ref().map_or(slide_count, |s| s.run_sheet.slides().count() as u64).max(1);
+        state.slide_index = state.slide_index.min(count - 1);
         let devices = Devices::load(store.dir());
         let daemon_id = devices::daemon_id(store.dir()).unwrap_or_else(|e| {
             // Devices check this id; one that changes makes them re-pair, never lets anyone in.
@@ -152,7 +167,8 @@ impl Engine {
         Engine {
             state,
             store,
-            slide_count,
+            slide_count: slide_count.max(1),
+            run_sheet,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -173,6 +189,11 @@ impl Engine {
 
     pub fn state(&self) -> &Snapshot {
         &self.state
+    }
+
+    /// How many slides there are: the run sheet's, else `--slides`. Never 0.
+    fn slide_count(&self) -> u64 {
+        self.run_sheet.as_ref().map_or(self.slide_count, |s| s.run_sheet.slides().count() as u64).max(1)
     }
 
     pub fn view(&self) -> StateSnapshot {
@@ -213,6 +234,14 @@ impl Engine {
             recording_wanted: self.state.recording_wanted,
             recording_low_disk,
             stream_destinations,
+            run_sheet_id: self.run_sheet.as_ref().map(|s| s.run_sheet.id.clone()),
+            run_sheet_rev: self.run_sheet.as_ref().map(|s| s.rev),
+            slide_count: self.run_sheet.as_ref().map(|_| self.slide_count()),
+            // An empty run sheet shows a blank slide, not "Slide 1".
+            slide: self
+                .run_sheet
+                .as_ref()
+                .map(|s| s.run_sheet.slides().nth(self.state.slide_index as usize).cloned().unwrap_or_default()),
         }
     }
 
@@ -327,10 +356,16 @@ impl Engine {
             Command::PairRequest { .. } | Command::AuthHello { .. } | Command::AuthProve { .. } => {
                 return protocol::nack(id, ErrorCode::BadArguments, "the church computer doesn't need to pair");
             }
-            Command::SlideNext => next.slide_index = (next.slide_index + 1).min(self.slide_count - 1),
+            Command::RunSheetGet => {
+                let extras =
+                    AckExtras { run_sheet: self.run_sheet.as_ref().map(|s| s.run_sheet.clone()), ..Default::default() };
+                return protocol::ack_with(id, Some(self.view()), extras);
+            }
+            Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
+            Command::SlideNext => next.slide_index = (next.slide_index + 1).min(self.slide_count() - 1),
             Command::SlidePrev => next.slide_index = next.slide_index.saturating_sub(1),
             Command::SlideGoto { index } => {
-                if index >= self.slide_count {
+                if index >= self.slide_count() {
                     return protocol::nack(id, ErrorCode::BadArguments, "slide out of range");
                 }
                 next.slide_index = index;
@@ -413,6 +448,35 @@ impl Engine {
             self.state = next;
             self.broadcast();
         }
+        protocol::ack(id, Some(self.view()))
+    }
+
+    /// Saves the new run sheet, then moves to its first slide (another run sheet) or stays on
+    /// the current one (an edit of this one, clamped to its end), and tells every screen.
+    fn set_run_sheet(&mut self, id: &str, run_sheet: protocol::RunSheet) -> Ack {
+        let same = self.run_sheet.as_ref().is_some_and(|s| s.run_sheet.id == run_sheet.id);
+        let rev = self.run_sheet.as_ref().map_or(1, |s| s.rev + 1);
+        let saved = crate::runsheet::Saved { version: 1, rev, run_sheet };
+        if let Err(e) = crate::runsheet::save(self.store.dir(), &saved) {
+            crate::log("engine", format!("runsheet.json save failed: {e}"));
+            return protocol::nack(id, ErrorCode::Unavailable, "could not save the run sheet; try again");
+        }
+        crate::log("engine", format!("run sheet {} rev {rev}", saved.run_sheet.id));
+        let mut next = self.state.clone();
+        next.run_sheet_id = Some(saved.run_sheet.id.clone());
+        self.run_sheet = Some(saved);
+        next.slide_index = if same { next.slide_index.min(self.slide_count() - 1) } else { 0 };
+        if next != self.state {
+            next.saved_at = crate::now_ms();
+            // Safe even if this save fails or the engine dies first: the snapshot still names the
+            // old run sheet, so a restart starts the new one on its first slide (an edit of the
+            // same one is clamped the same way), which is what screens are shown now.
+            if let Err(e) = self.store.save(&next) {
+                crate::log("engine", format!("snapshot save failed: {e}"));
+            }
+            self.state = next;
+        }
+        self.broadcast();
         protocol::ack(id, Some(self.view()))
     }
 
@@ -727,11 +791,11 @@ fn read_commands(stream: TcpStream, engine: &Mutex<Engine>, outbox: &Outbox) -> 
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let n = (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf)?;
+        let n = (&mut reader).take(MAX_MESSAGE as u64 + 1).read_until(b'\n', &mut buf)?;
         if n == 0 {
             return Ok(());
         }
-        let ack = if n > MAX_LINE && buf.last() != Some(&b'\n') {
+        let ack = if n > MAX_MESSAGE && buf.last() != Some(&b'\n') {
             discard_line(&mut reader)?;
             protocol::nack("", ErrorCode::BadMessage, "message too long")
         } else {
@@ -855,8 +919,8 @@ fn ws_session<S: OverTcp>(
         Err(no)
     };
     let config = tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(MAX_LINE))
-        .max_frame_size(Some(MAX_LINE));
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
     let Ok(mut ws) = tungstenite::accept_hdr_with_config(stream, check_origin, Some(config)) else {
         return Ok(());
     };
@@ -933,6 +997,46 @@ mod tests {
     fn send(e: &mut Engine, command: Value) -> Value {
         let msg = json!({ "v": 1, "id": "t", "ts": 1, "command": command }).to_string();
         serde_json::to_value(e.handle_line(&msg)).unwrap()
+    }
+
+    #[test]
+    fn a_run_sheet_drives_the_slides_and_survives_a_restart() {
+        let (mut e, dir) = engine("runsheet", 100);
+        let sheet = json!({ "id": "sun", "title": "Sunday", "items": [
+            { "id": "s1", "kind": "song", "title": "Amazing Grace",
+              "slides": [{ "lines": ["Amazing grace"] }, { "lines": ["I once was lost"] }] },
+            { "id": "c1", "kind": "countdown", "title": "Countdown",
+              "slides": [{ "lines": ["Starts in"], "countdownTo": 1_760_000_000_000u64 }] },
+        ] });
+        let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        assert_eq!(
+            (r["state"]["slideCount"].clone(), r["state"]["runSheetRev"].clone(), r["state"]["slide"].clone()),
+            (json!(3), json!(1), json!({ "lines": ["Amazing grace"] }))
+        );
+        for _ in 0..5 {
+            send(&mut e, json!({ "type": "slide.next" }));
+        }
+        assert_eq!(e.view().slide_index, 2, "clamped to the run sheet's last slide");
+        let r = send(&mut e, json!({ "type": "slide.prev" }));
+        assert_eq!(r["state"]["slide"]["lines"], json!(["I once was lost"]));
+
+        drop(e);
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let mut e = Engine::new(store, snap, 100);
+        let r = send(&mut e, json!({ "type": "runsheet.get" }));
+        assert_eq!((r["runSheet"].clone(), r["state"]["slideIndex"].clone()), (sheet, json!(1)));
+
+        // A crash after a new run sheet was saved but before the snapshot: it starts at the top.
+        drop(e);
+        let other: protocol::RunSheet = serde_json::from_value(json!({ "id": "wed", "title": "", "items": [
+            { "id": "t", "kind": "text", "title": "", "slides": [{ "lines": ["a"] }, { "lines": ["b"] }] },
+        ] }))
+        .unwrap();
+        crate::runsheet::save(&dir, &crate::runsheet::Saved { version: 1, rev: 2, run_sheet: other }).unwrap();
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        assert_eq!(Engine::new(store, snap, 100).view().slide_index, 0);
     }
 
     #[test]
@@ -1224,11 +1328,16 @@ mod tests {
         std::thread::spawn(move || serve(listener, engine));
         let mut s = TcpStream::connect(addr).unwrap();
         s.write_all(b"{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"slide.next\"}}\n\n").unwrap();
-        s.write_all(&vec![b'x'; MAX_LINE + 10]).unwrap();
+        s.write_all(&vec![b'x'; MAX_MESSAGE + 10]).unwrap();
         s.write_all(b"\n{\"v\":1,\"id\":\"b\",\"ts\":1,\"command\":{\"type\":\"state.get\"}}\n").unwrap();
+        // A line the size of a real run sheet (well past the old 16 KiB cap) is read whole.
+        let pad = "p".repeat(64 * 1024);
+        let big =
+            format!("{{\"v\":1,\"id\":\"c\",\"ts\":1,\"pad\":\"{pad}\",\"command\":{{\"type\":\"state.get\"}}}}\n");
+        s.write_all(big.as_bytes()).unwrap();
         let mut r = BufReader::new(s);
         let mut lines = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut l = String::new();
             r.read_line(&mut l).unwrap();
             lines.push(serde_json::from_str::<Value>(&l).unwrap());
@@ -1236,6 +1345,7 @@ mod tests {
         assert_eq!(lines[0]["state"]["slideIndex"], json!(1));
         assert_eq!(lines[1]["message"], json!("message too long"));
         assert_eq!((lines[2]["id"].clone(), lines[2]["state"]["slideIndex"].clone()), (json!("b"), json!(1)));
+        assert_eq!((lines[3]["id"].clone(), lines[3]["ok"].clone()), (json!("c"), json!(true)));
     }
 
     type Ws = tungstenite::WebSocket<TcpStream>;
@@ -1371,8 +1481,20 @@ mod tests {
     fn an_oversized_websocket_message_is_refused() {
         let (_, ws_addr) = serve_both("ws-big", &[]);
         let mut ws = ws_connect(ws_addr, None).unwrap();
-        ws_send(&mut ws, &"x".repeat(MAX_LINE + 10));
-        assert_eq!(ws_next(&mut ws)["message"], "message too long");
+        // The engine refuses from the frame header, so it may cut the connection while the
+        // client is still writing; either way nothing this big gets through.
+        let _ = ws.send(tungstenite::Message::text("x".repeat(MAX_MESSAGE + 10)));
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) => {
+                assert_eq!(serde_json::from_str::<Value>(&t).unwrap()["message"], "message too long")
+            }
+            Ok(other) => panic!("expected the refusal, got {other:?}"),
+            Err(_) => {} // cut off mid-write
+        }
+        // A message under the limit, such as a run sheet, still works on a new connection.
+        let mut ws = ws_connect(ws_addr, None).unwrap();
+        ws_send(&mut ws, &"x".repeat(64 * 1024));
+        assert_eq!(ws_next(&mut ws)["message"], "invalid JSON");
     }
 
     /// Pairs `key` the way a phone does: the church computer opens pairing and approves the

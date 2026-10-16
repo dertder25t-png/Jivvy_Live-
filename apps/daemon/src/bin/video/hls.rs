@@ -77,7 +77,7 @@ fn spool_lock(name: &str) -> Arc<Mutex<()>> {
 
 /// The engine's "wanted" flag: None until the engine has said (right after a restart).
 fn wanted_known(feed: &Feed) -> Option<bool> {
-    feed.live.lock().unwrap().map(|s| s.stream_wanted)
+    feed.live.lock().unwrap().as_ref().map(|s| s.stream_wanted)
 }
 
 /// One HLS destination, for as long as it is configured.

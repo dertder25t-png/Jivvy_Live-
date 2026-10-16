@@ -59,7 +59,7 @@ fn apply(model: &mut Model, update: Update) -> Option<LiveState> {
         Update::Connected => model.connected = true,
         Update::Disconnected => model.connected = false,
         Update::State(s) => {
-            model.shown = Some(s);
+            model.shown = Some(s.clone());
             return Some(s);
         }
     }
@@ -153,8 +153,8 @@ mod ui {
         }
     }
 
-    fn render(w: &OutputWindow, state: LiveState) {
-        let json = serde_json::to_string(&state).unwrap_or_default();
+    fn render(w: &OutputWindow, state: &LiveState) {
+        let json = serde_json::to_string(state).unwrap_or_default();
         if let Err(e) = w.webview.evaluate_script(&format!("window.jivvy && jivvy.render({json})")) {
             log("outputs", format!("output {}: render failed: {e}", w.placement.id));
         }
@@ -275,12 +275,12 @@ mod ui {
                 }
                 Event::UserEvent(UserEvent::Update(u)) => {
                     if let Some(state) = apply(&mut model, u) {
-                        windows.values().for_each(|w| render(w, state));
+                        windows.values().for_each(|w| render(w, &state));
                     }
                     write_status(&mut model);
                 }
                 Event::UserEvent(UserEvent::Ready(id)) => {
-                    if let (Some(w), Some(state)) = (windows.get(&id), model.shown) {
+                    if let (Some(w), Some(state)) = (windows.get(&id), model.shown.as_ref()) {
                         render(w, state);
                     }
                 }

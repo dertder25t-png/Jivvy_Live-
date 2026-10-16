@@ -79,7 +79,17 @@ export type Command =
   /** Church computer only. */
   | { type: "device.list" }
   /** Church computer only. Removing a device ends its open connections at once. */
-  | { type: "device.remove"; deviceId: string };
+  | { type: "device.remove"; deviceId: string }
+  /**
+   * Added in v1 without a version bump. Replaces the run sheet the screens show; saved on the
+   * church computer before the ack, so it survives a crash or restart. A run sheet with another
+   * `id` starts again on its first slide; the same `id` (an edit) stays on the current slide.
+   * The ack carries the new state (`slideCount`, `runSheetRev`). The whole message must fit in
+   * MAX_MESSAGE_BYTES (check with `messageBytes` before sending). Older daemons answer unknown_command.
+   */
+  | { type: "runsheet.set"; runSheet: RunSheet }
+  /** Added in v1 without a version bump. The ack carries `runSheet` (left out when none is set). */
+  | { type: "runsheet.get" };
 
 export type CommandType = Command["type"];
 
@@ -172,6 +182,81 @@ function deviceName(x: unknown): string | null {
 
 const isId = (x: unknown): x is string => typeof x === "string" && ID.test(x);
 
+// ---- Run sheets ----
+
+/** Most items in a run sheet. */
+export const MAX_RUNSHEET_ITEMS = 200;
+/** Most slides in a whole run sheet. */
+export const MAX_RUNSHEET_SLIDES = 2000;
+/** Most lines on one slide. */
+export const MAX_SLIDE_LINES = 16;
+/** Longest line on a slide, and longest title, in characters. */
+export const MAX_SLIDE_LINE = 200;
+export const MAX_TITLE = 200;
+/** An item's kind: "song", "scripture", "countdown", "text" today; newer UIs may add others. */
+const KIND = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** A string of at most `max` characters with no control characters (tabs included), or null. */
+function plainText(x: unknown, max: number): string | null {
+  if (typeof x !== "string") return null;
+  const chars = [...x];
+  if (chars.length > max || chars.some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)) return null;
+  return x;
+}
+
+function parseSlide(x: unknown): Slide | null {
+  if (!isObj(x) || !Array.isArray(x.lines) || x.lines.length > MAX_SLIDE_LINES) return null;
+  const lines: string[] = [];
+  for (const l of x.lines) {
+    const line = plainText(l, MAX_SLIDE_LINE);
+    if (line === null) return null;
+    lines.push(line);
+  }
+  if (x.countdownTo === undefined) return { lines };
+  const to = x.countdownTo;
+  if (typeof to !== "number" || !Number.isInteger(to) || to < 0) return null;
+  return { lines, countdownTo: to };
+}
+
+/** A valid run sheet with unknown fields dropped, or null. */
+export function parseRunSheet(x: unknown): RunSheet | null {
+  if (!isObj(x) || !isId(x.id) || !Array.isArray(x.items) || x.items.length > MAX_RUNSHEET_ITEMS) return null;
+  const title = plainText(x.title, MAX_TITLE);
+  if (title === null) return null;
+  const items: RunSheetItem[] = [];
+  let total = 0;
+  for (const it of x.items) {
+    if (!isObj(it) || !isId(it.id) || typeof it.kind !== "string" || !KIND.test(it.kind) || !Array.isArray(it.slides)) return null;
+    const itemTitle = plainText(it.title, MAX_TITLE);
+    if (itemTitle === null) return null;
+    total += it.slides.length;
+    if (total > MAX_RUNSHEET_SLIDES) return null;
+    const slides: Slide[] = [];
+    for (const sl of it.slides) {
+      const slide = parseSlide(sl);
+      if (!slide) return null;
+      slides.push(slide);
+    }
+    items.push({ id: it.id, kind: it.kind, title: itemTitle, slides });
+  }
+  return { id: x.id, title, items };
+}
+
+/**
+ * Largest message the daemon takes over WebSocket, in UTF-8 bytes. A run sheet within the limits
+ * above can be bigger than this (the limits allow ~6 MB of text); a real service is a few tens of
+ * KB. UIs check with `messageBytes` and say so plainly rather than send one that gets refused.
+ */
+export const MAX_MESSAGE_BYTES = 1024 * 1024;
+
+/** The size of an envelope as sent, in UTF-8 bytes. */
+export const messageBytes = (envelope: Envelope): number => new TextEncoder().encode(JSON.stringify(envelope)).length;
+
+/** Every slide of the run sheet in order: what `slideIndex` counts. */
+export function runSheetSlides(sheet: RunSheet): { item: RunSheetItem; itemIndex: number; slide: Slide }[] {
+  return sheet.items.flatMap((item, itemIndex) => item.slides.map((slide) => ({ item, itemIndex, slide })));
+}
+
 type CommandResult = { ok: true; command: Command } | { ok: false; code: ErrorCode; message: string };
 
 function parseCommand(raw: unknown): CommandResult {
@@ -190,7 +275,14 @@ function parseCommand(raw: unknown): CommandResult {
     case "pair.close":
     case "device.list":
     case "stream.preflight":
+    case "runsheet.get":
       return { ok: true, command: { type: raw.type } };
+    case "runsheet.set": {
+      const runSheet = parseRunSheet(raw.runSheet);
+      if (!runSheet)
+        return { ok: false, code: "bad_arguments", message: `runsheet.set needs a runSheet: { id, title, items: up to ${MAX_RUNSHEET_ITEMS} of { id, kind, title, slides } }, up to ${MAX_RUNSHEET_SLIDES} slides of up to ${MAX_SLIDE_LINES} lines` };
+      return { ok: true, command: { type: "runsheet.set", runSheet } };
+    }
     case "pair.request": {
       const name = deviceName(raw.name);
       if (typeof raw.publicKey !== "string" || !PUBLIC_KEY.test(raw.publicKey) || !name)
@@ -307,6 +399,40 @@ export interface StateSnapshot {
   recordingLowDisk?: boolean;
   /** Added in v1: each platform's state and quality while streaming; left out when there's nothing to show. */
   streamDestinations?: StreamDestination[];
+  /** Added in v1: the run sheet on the daemon. These four are left out when none is set. */
+  runSheetId?: string;
+  /** Goes up by one every time a run sheet is set, so screens know to fetch it again. */
+  runSheetRev?: number;
+  /** How many slides the run sheet has (`slideIndex` is below it). */
+  slideCount?: number;
+  /** The slide at `slideIndex`, for screens that just show it. */
+  slide?: Slide;
+}
+
+/** One slide as the screens show it. */
+export interface Slide {
+  /** Lines of text, top to bottom; none for a blank slide. */
+  lines: string[];
+  /** A countdown slide: counts down to this time (ms since epoch) under its lines. */
+  countdownTo?: number;
+}
+
+/**
+ * One item in the service: a song, a scripture reading, a countdown, an announcement. The UI
+ * turns each into slides; the daemon only shows slides, so new kinds need no daemon change.
+ */
+export interface RunSheetItem {
+  id: string;
+  /** "song", "scripture", "countdown" or "text"; screens show unknown kinds as text. */
+  kind: string;
+  title: string;
+  slides: Slide[];
+}
+
+export interface RunSheet {
+  id: string;
+  title: string;
+  items: RunSheetItem[];
 }
 
 /** A device waiting for approval, as the church computer sees it. */
@@ -384,6 +510,8 @@ export interface AckExtras {
   devices?: DeviceInfo[];
   /** stream.preflight: `measuring`; the result follows as a `preflight` event. */
   preflight?: Preflight;
+  /** runsheet.get: the run sheet, if one is set. */
+  runSheet?: RunSheet;
 }
 
 export type Ack =

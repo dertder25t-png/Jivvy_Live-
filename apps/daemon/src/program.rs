@@ -255,11 +255,15 @@ impl AudioFifo {
     }
 }
 
-/// Text on the stream for the engine's state: nothing when black. Shows "Slide N" until
-/// run sheets reach the engine, like the output windows.
-pub fn lines_for(state: Option<LiveState>) -> Vec<String> {
+/// Text on the stream for the engine's state: nothing when black; the run sheet's slide, or
+/// "Slide N" when no run sheet is set, like the output windows. A countdown's clock is only
+/// on the output windows: the lyric layer is drawn once per slide, not every second.
+pub fn lines_for(state: Option<&LiveState>) -> Vec<String> {
     match state {
-        Some(s) if !s.black => vec![format!("Slide {}", s.slide_index + 1)],
+        Some(s) if !s.black => match &s.slide {
+            Some(slide) => slide.lines.clone(),
+            None => vec![format!("Slide {}", s.slide_index + 1)],
+        },
         _ => vec![],
     }
 }
@@ -392,12 +396,24 @@ mod tests {
     #[test]
     fn stream_text_follows_the_slide_and_black() {
         assert_eq!(
-            lines_for(Some(LiveState { slide_index: 2, black: false, stream_wanted: false, recording_wanted: false })),
+            lines_for(Some(&LiveState {
+                slide_index: 2,
+                black: false,
+                stream_wanted: false,
+                recording_wanted: false,
+                slide: None
+            })),
             ["Slide 3"]
         );
         assert!(
-            lines_for(Some(LiveState { slide_index: 2, black: true, stream_wanted: false, recording_wanted: false }))
-                .is_empty()
+            lines_for(Some(&LiveState {
+                slide_index: 2,
+                black: true,
+                stream_wanted: false,
+                recording_wanted: false,
+                slide: None
+            }))
+            .is_empty()
         );
         assert!(lines_for(None).is_empty());
     }

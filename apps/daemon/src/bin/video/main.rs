@@ -481,7 +481,7 @@ impl Video {
         if self.inputs[0].pipeline.is_none() {
             *self.feed.frame.lock().unwrap() = None; // slate right away, not after the stale timeout
         }
-        let wanted = self.feed.live.lock().unwrap().is_some_and(|s| s.stream_wanted);
+        let wanted = self.feed.live.lock().unwrap().as_ref().is_some_and(|s| s.stream_wanted);
         let mut stream = self.streamer.status(wanted);
         stream.encodes = self.tiers.status();
         // Tell the engine on every change and once a second (it treats silence as trouble).

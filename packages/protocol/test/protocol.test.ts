@@ -40,6 +40,11 @@ describe("parseEnvelope", () => {
       { type: "output.black", on: true }, { type: "stream.start" }, { type: "stream.stop" }, { type: "state.get" }, { type: "state.subscribe" },
       { type: "media.levels", peakDb: [-6, -7.5], rmsDb: [-18, -20] }, { type: "stream.report", status: "live" },
       { type: "recording.start" }, { type: "recording.stop" }, { type: "recording.report", status: "waiting", lowDisk: true },
+      { type: "runsheet.get" },
+      { type: "runsheet.set", runSheet: { id: "sun", title: "Sunday", items: [
+        { id: "s1", kind: "song", title: "Amazing Grace", slides: [{ lines: ["Amazing grace"] }, { lines: [] }] },
+        { id: "c1", kind: "countdown", title: "Countdown", slides: [{ lines: ["Starts in"], countdownTo: 1_760_000_000_000 }] },
+      ] } },
     ] satisfies Command[]) {
       const r = parseEnvelope(JSON.stringify(makeEnvelope(command)));
       expect(r.ok && r.envelope.command).toEqual(command);

@@ -25,6 +25,10 @@ pub struct Snapshot {
     /// set of files. Missing in files saved by an older daemon, which means off.
     #[serde(default)]
     pub recording_wanted: bool,
+    /// The run sheet `slide_index` counts in. On start, a different run sheet on disk (a crash
+    /// between saving a new run sheet and this file) starts on its first slide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_sheet_id: Option<String>,
     pub saved_at: u64,
 }
 
@@ -36,6 +40,7 @@ impl Default for Snapshot {
             black: false,
             stream_wanted: false,
             recording_wanted: false,
+            run_sheet_id: None,
             saved_at: 0,
         }
     }

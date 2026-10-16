@@ -13,6 +13,7 @@ import {
   type DaemonEvent,
   type DocInfo,
   type Levels,
+  type Preflight,
   type RunSheet,
   type StateSnapshot,
 } from "@jivvy/protocol";
@@ -36,6 +37,8 @@ export interface Handlers {
   levels?(l: Levels): void;
   /** A document in the church computer's library was saved or deleted, here or elsewhere. */
   docChanged?(doc: DocInfo, deleted: boolean): void;
+  /** A pre-flight result, when the church computer's test finishes (whoever asked for it). */
+  preflight?(p: Preflight): void;
 }
 
 /**
@@ -187,6 +190,7 @@ export class DaemonConnection {
     }
     else if (e.event === "levels") this.h.levels?.(e.levels);
     else if (e.event === "doc.changed") this.h.docChanged?.(e.doc, e.deleted === true);
+    else if (e.event === "preflight") this.h.preflight?.(e.preflight);
     // Other events (alerts, ...) come with the screens that show them.
   }
 

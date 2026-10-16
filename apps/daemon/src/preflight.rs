@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::bandwidth::{self, Tier};
-use crate::protocol::{Preflight, PreflightDestination, preflight_summary};
+use crate::protocol::{Preflight, PreflightCheck, PreflightDestination, preflight_summary};
 use crate::{hardware, media, stream};
 
 pub const DEFAULT_URL: &str = "https://live.jivvy.org/api/upload-test";
@@ -134,8 +134,177 @@ pub fn plan(dir: &Path, kbps: f64) -> Vec<PreflightDestination> {
         .collect()
 }
 
+fn check(id: &str, level: &str, label: &str, message: impl Into<String>, fix: Option<&str>) -> PreflightCheck {
+    PreflightCheck {
+        id: id.into(),
+        level: level.into(),
+        label: label.into(),
+        message: message.into(),
+        fix: fix.map(Into::into),
+    }
+}
+
+/// A status file another process writes (`media-status.json`, `outputs-status.json`).
+fn status_file(dir: &Path, name: &str) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()
+}
+
+/// The church computer's other checks, from the settings and the status files its processes
+/// write. Reads files only: nothing here needs the internet, and no stream key is ever shown.
+pub fn checks(dir: &Path) -> Vec<PreflightCheck> {
+    let mut out = Vec::new();
+
+    // Disk space where recordings go.
+    let rec = crate::recording::load_config(dir).unwrap_or_default();
+    let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    out.push(match crate::recording::free_space(&rec.folder(dir)) {
+        Some(free) if free < rec.warn_free_bytes() => check(
+            "disk",
+            "bad",
+            "Disk space",
+            format!("Only {:.1} GB free where recordings go.", gb(free)),
+            Some("Delete or move old recordings, or choose a recording folder on a bigger disk."),
+        ),
+        Some(free) => check("disk", "ok", "Disk space", format!("{:.0} GB free for recordings.", gb(free)), None),
+        None => check(
+            "disk",
+            "warn",
+            "Disk space",
+            "Couldn't read the free space where recordings go.",
+            Some("Check that the recording folder's disk is connected."),
+        ),
+    });
+
+    // Streaming settings (never the keys).
+    out.push(match stream::load_config(dir) {
+        Err(e) => check(
+            "stream",
+            "bad",
+            "Streaming settings",
+            format!("The streaming settings can't be used: {e}."),
+            Some("Set up the streaming platforms again in the settings."),
+        ),
+        Ok(c) => {
+            let on: Vec<&stream::Destination> = c.destinations.iter().filter(|d| d.enabled).collect();
+            let broken: Vec<String> = on.iter().filter_map(|d| stream::validate(d).err()).collect();
+            if !broken.is_empty() {
+                check(
+                    "stream",
+                    "bad",
+                    "Streaming settings",
+                    broken.join("; "),
+                    Some("Paste the server address and stream key again from the platform's live dashboard."),
+                )
+            } else if on.is_empty() {
+                check(
+                    "stream",
+                    "warn",
+                    "Streaming settings",
+                    "No streaming platforms are set up.",
+                    Some("Add YouTube or Facebook in the streaming settings, if this service streams."),
+                )
+            } else {
+                let names: Vec<&str> =
+                    on.iter().map(|d| if d.name.is_empty() { &d.id } else { &d.name }).map(String::as_str).collect();
+                check("stream", "ok", "Streaming settings", format!("Set up: {}.", names.join(", ")), None)
+            }
+        }
+    });
+
+    // The hardware check: what video this computer can encode.
+    out.push(match hardware::load(dir) {
+        None => check(
+            "encoder",
+            "warn",
+            "Video check",
+            "This computer's video check hasn't run yet.",
+            Some("Start Jivvy Live with the camera on once; it tests what this computer can stream."),
+        ),
+        Some(r) if r.chosen.is_none() => check(
+            "encoder",
+            "bad",
+            "Video check",
+            r.reason,
+            Some("Close other programs and run the video check again, or use a more powerful computer."),
+        ),
+        Some(r) => check("encoder", "ok", "Video check", r.reason, None),
+    });
+
+    // The screens (fullscreen output windows).
+    out.push(match status_file(dir, crate::outputs::STATUS_FILE) {
+        None => check(
+            "screens",
+            "warn",
+            "Screens",
+            "The screen windows aren't running.",
+            Some("Restart Jivvy Live on the church computer."),
+        ),
+        Some(s) => {
+            let problems: Vec<&str> =
+                s["problems"].as_array().into_iter().flatten().filter_map(|p| p["message"].as_str()).collect();
+            let shown = s["outputs"].as_array().map_or(0, Vec::len);
+            if !problems.is_empty() {
+                check(
+                    "screens",
+                    "warn",
+                    "Screens",
+                    problems.join(" "),
+                    Some("Check the screen cables and the display settings."),
+                )
+            } else if s["connected"] != true {
+                check(
+                    "screens",
+                    "warn",
+                    "Screens",
+                    "The screens aren't following the slides.",
+                    Some("Restart Jivvy Live on the church computer."),
+                )
+            } else {
+                let what = if shown == 1 { "1 screen".to_string() } else { format!("{shown} screens") };
+                check("screens", "ok", "Screens", format!("{what} showing the slides."), None)
+            }
+        }
+    });
+
+    // Camera and microphone.
+    let media = status_file(dir, media::STATUS_FILE);
+    for (id, label) in [("camera", "Camera"), ("microphone", "Microphone")] {
+        let Some(m) = &media else {
+            out.push(check(
+                id,
+                "warn",
+                label,
+                "The camera and microphone aren't running.",
+                Some("Restart Jivvy Live on the church computer."),
+            ));
+            continue;
+        };
+        let input = &m[id];
+        out.push(match input["state"].as_str().unwrap_or("") {
+            "running" => check(id, "ok", label, "Working.", None),
+            "off" => check(id, "ok", label, "Turned off in the settings.", None),
+            "starting" => {
+                check(id, "warn", label, "Still starting.", Some("Wait a few seconds and run the check again."))
+            }
+            _ => {
+                let detail = input["detail"].as_str().filter(|d| !d.is_empty()).unwrap_or("It isn't working.");
+                check(id, "bad", label, detail, Some("Check that it is plugged in and not in use by another program."))
+            }
+        });
+    }
+    out
+}
+
 /// Runs the whole check: measure (or fall back to the last speed measured), then plan.
 pub fn run(dir: &Path, url: &str, cancel: Arc<AtomicBool>) -> Preflight {
+    let mut p = run_upload(dir, url, cancel.clone());
+    if !cancel.load(Ordering::Relaxed) {
+        p.checks = checks(dir);
+    }
+    p
+}
+
+fn run_upload(dir: &Path, url: &str, cancel: Arc<AtomicBool>) -> Preflight {
     let (m, measured, message) = match measure(url, cancel.clone()) {
         Ok(kbps) => {
             let m = Measurement { kbps, measured_at: crate::now_ms() };
@@ -167,6 +336,7 @@ pub fn run(dir: &Path, url: &str, cancel: Arc<AtomicBool>) -> Preflight {
         summary: preflight_summary(&destinations),
         destinations,
         message,
+        checks: Vec::new(),
     }
 }
 
@@ -179,6 +349,7 @@ fn failed(message: &str) -> Preflight {
         destinations: Vec::new(),
         summary: String::new(),
         message: Some(message.into()),
+        checks: Vec::new(),
     }
 }
 
@@ -289,6 +460,22 @@ pub(crate) mod tests {
         );
         std::fs::write(dir.join("stream.json"), advanced).unwrap();
         assert_eq!(preflight_summary(&plan(&dir, 1_300.0)), "YouTube 360p + Facebook audio only");
+    }
+
+    #[test]
+    fn the_checks_say_what_is_set_up_and_what_to_fix() {
+        let dir = temp("checks");
+        std::fs::write(dir.join("stream.json"), TWO).unwrap();
+        let p = run(&dir, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)));
+        let by = |id: &str| p.checks.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("no {id} check: {p:?}"));
+        assert_eq!(by("stream").level, "ok");
+        assert_eq!(by("stream").message, "Set up: YouTube, Facebook.");
+        assert_ne!(by("disk").level, "warn", "the temp folder's disk has a free space");
+        // Nothing has run here yet: amber, each with a fix.
+        for id in ["encoder", "screens", "camera", "microphone"] {
+            assert_eq!(by(id).level, "warn", "{id}");
+            assert!(by(id).fix.is_some(), "{id}");
+        }
     }
 
     #[test]

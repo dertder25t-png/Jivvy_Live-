@@ -1,0 +1,24 @@
+{
+  "about": "A pre-flight result with the church computer's checks (Preflight.checks, added in v1). The Rust daemon must serialize exactly this; the web app's pre-flight screen reads it. Add fields; never rename or remove.",
+  "event": {
+    "v": 1,
+    "event": "preflight",
+    "preflight": {
+      "status": "done",
+      "uploadKbps": 12000,
+      "measured": false,
+      "measuredAt": 1760000000000,
+      "destinations": [
+        { "id": "youtube", "name": "YouTube", "quality": "1080p" },
+        { "id": "facebook", "name": "Facebook", "quality": "720p" }
+      ],
+      "summary": "YouTube 1080p + Facebook 720p",
+      "message": "Couldn't test the upload just now (no internet?); this is the last speed measured.",
+      "checks": [
+        { "id": "disk", "level": "bad", "label": "Disk space", "message": "Only 4.2 GB free where recordings go.", "fix": "Delete or move old recordings, or choose a recording folder on a bigger disk." },
+        { "id": "stream", "level": "ok", "label": "Streaming settings", "message": "Set up: YouTube, Facebook." },
+        { "id": "camera", "level": "warn", "label": "Camera", "message": "Still starting.", "fix": "Wait a few seconds and run the check again." }
+      ]
+    }
+  }
+}

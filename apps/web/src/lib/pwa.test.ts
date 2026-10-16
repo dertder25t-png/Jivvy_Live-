@@ -24,6 +24,12 @@ describe("service worker scope", () => {
     expect(ok("/pdfjs/wasm/openjpeg.wasm")).toBe(true);
   });
 
+  it("serves the shell only to page navigations", () => {
+    expect(ok("/operate", "navigate")).toBe(true);
+    expect(ok("/.well-known/jivvy", "navigate")).toBe(false);
+    expect(ok("/x.png", "navigate")).toBe(false);
+  });
+
   it("leaves the daemon and everything else alone", () => {
     expect(isCacheable({ method: "GET" }, new URL("ws://192.168.1.20:47801/"), origin, precached)).toBe(false);
     expect(isCacheable({ method: "GET" }, new URL("https://192.168.1.20:47801/.well-known/jivvy"), origin, precached)).toBe(false);

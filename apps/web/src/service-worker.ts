@@ -3,7 +3,7 @@
 /// <reference lib="esnext" />
 /// <reference lib="webworker" />
 import { build, files, version } from "$service-worker";
-import { isCacheable, precacheList, SHELL } from "$lib/pwa";
+import { isCacheable, PDFJS_LIST, precacheList, SHELL } from "$lib/pwa";
 
 declare const self: ServiceWorkerGlobalScope;
 
@@ -12,7 +12,16 @@ const urls = precacheList(build, files);
 const known = new Set(urls);
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(urls)).then(() => self.skipWaiting()));
+  event.waitUntil(
+    (async () => {
+      const c = await caches.open(CACHE);
+      await c.addAll(urls);
+      // The pdf.js files are copied in after the build, so $service-worker doesn't list them.
+      const list: string[] = await (await fetch(PDFJS_LIST)).json();
+      await c.addAll(list);
+      await self.skipWaiting();
+    })(),
+  );
 });
 
 self.addEventListener("activate", (event) => {

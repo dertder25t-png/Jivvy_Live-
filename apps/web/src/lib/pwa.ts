@@ -11,11 +11,20 @@ export const LAZY_PREFIXES = ["/pdfjs/"];
 /** The one page every route is served from (static SPA fallback). */
 export const SHELL = "/";
 
+/** Pages are extensionless paths, like the daemon's web.rs; its /.well-known answers are never the app. */
+export function isPagePath(pathname: string): boolean {
+  if (pathname.startsWith("/.well-known/")) return false;
+  return !(pathname.split("/").pop() ?? "").includes(".");
+}
+
+/** Where the build lists the pdf.js files, so the worker can store them with the app. */
+export const PDFJS_LIST = "/pdfjs/files.json";
+
 /** True when the worker should answer this request from its cache. Everything else is left alone. */
 export function isCacheable(request: { method: string; mode?: string }, url: URL, origin: string, precached: ReadonlySet<string>): boolean {
   if (request.method !== "GET") return false;
   if (url.origin !== origin) return false;
-  if (request.mode === "navigate") return true;
+  if (request.mode === "navigate") return isPagePath(url.pathname);
   if (precached.has(url.pathname)) return true;
   return LAZY_PREFIXES.some((p) => url.pathname.startsWith(p));
 }

@@ -716,9 +716,21 @@ impl Engine {
         let cancel = Arc::new(AtomicBool::new(false));
         self.preflight_cancel = Some(cancel.clone());
         let (dir, url) = (self.store.dir().to_path_buf(), self.upload_test_url.clone());
+        // The video process reports about once a second: fresh reports mean its status file is current.
+        let now = Instant::now();
+        let video_alive =
+            self.stream_report.as_ref().is_some_and(|r| now.saturating_duration_since(r.1) < STREAM_REPORT_STALE)
+                || self
+                    .recording_report
+                    .as_ref()
+                    .is_some_and(|r| now.saturating_duration_since(r.2) < RECORDING_REPORT_STALE);
+        let live = crate::preflight::Live {
+            video_installed: video_alive || crate::preflight::Live::video_installed_here(),
+            video_alive,
+        };
         crate::log("engine", "pre-flight: testing the upload");
         std::thread::spawn(move || {
-            let result = crate::preflight::run(&dir, &url, cancel);
+            let result = crate::preflight::run(&dir, &url, cancel, live);
             let Some(engine) = handle.upgrade() else { return };
             let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
             e.preflight_cancel = None;
@@ -2297,6 +2309,7 @@ mod tests {
         drop(e);
         let heard = wait_event(&screen, "preflight");
         assert_eq!(heard["preflight"]["status"], "failed");
+        assert_eq!(heard["preflight"]["stopped"], true);
         assert!(heard["preflight"]["message"].as_str().unwrap().contains("the stream started"));
         let mut e = shared.lock().unwrap();
         assert_eq!(send(&mut e, json!({ "type": "stream.preflight" }))["code"], "unavailable");

@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { runSheetSlides, type Levels, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
+  import { runSheetSlides, type DocInfo, type Levels, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
   import { onDestroy, onMount } from "svelte";
   import { DaemonConnection, type Status } from "$lib/daemon";
   import { addImage, upload } from "$lib/media";
   import { addPdf } from "$lib/pdf";
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
+  import { getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
@@ -118,6 +119,7 @@
         levels = l;
         levelsAt = Date.now();
       },
+      docChanged: (d) => docChanged(d),
     });
     conn.connect();
   }
@@ -229,6 +231,7 @@
   );
   async function openHymns() {
     hymnsOpen = !hymnsOpen;
+    if (hymnsOpen) void refreshSaved();
     if (hymns) return;
     try {
       const lib = await import("@jivvy/songs/hymns");
@@ -245,6 +248,167 @@
     hymnsOpen = false;
     hymnSearch = "";
   }
+
+  // ---- The church computer's library: saved songs and plans ----
+
+  /** Songs saved on the church computer (shown with the hymns), while the picker is open. */
+  let savedSongs = $state<DocInfo[]>([]);
+  const savedMatches = $derived(savedSongs.filter((s) => s.title.toLowerCase().includes(hymnSearch.trim().toLowerCase())));
+  async function refreshSaved() {
+    if (!conn || !ready) return void (savedSongs = []);
+    try {
+      savedSongs = await listDocs(conn, "song");
+    } catch {
+      savedSongs = []; // an older church computer without a library: hymns only
+    }
+  }
+  async function addSaved(info: DocInfo) {
+    if (!conn) return;
+    try {
+      const doc = await getDoc(conn, "song", info.id);
+      const song = songFromDoc(doc);
+      const libraryDaemon = conn.daemonId ?? undefined;
+      draft.items.push({ ...newItem("song"), title: doc.title, song, libraryId: doc.id, libraryRev: doc.rev, libraryDaemon });
+      hymnsOpen = false;
+      hymnSearch = "";
+    } catch (e) {
+      sendError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  /** What happened to each song's last save to the library, by item id. */
+  let songNotes = $state<Record<string, string>>({});
+  /** Songs with a save on its way: a second one would be based on the same revision and be refused. */
+  let songSaving = $state<Record<string, boolean>>({});
+  async function saveSong(item: DraftItem) {
+    if (!conn || !item.song || songSaving[item.id]) return;
+    songSaving[item.id] = true;
+    try {
+      await saveSongNow(conn, item);
+    } finally {
+      songSaving[item.id] = false;
+    }
+  }
+  async function saveSongNow(conn: DaemonConnection, item: DraftItem) {
+    if (!item.song) return;
+    const id = item.libraryId ?? newSongId(item.title);
+    const title = item.title.trim() || "Untitled song";
+    const body = { ...item.song, title } as unknown as Record<string, unknown>;
+    // A revision from another church computer means nothing here: this one gets it as new.
+    const here = conn.daemonId ?? undefined;
+    const baseRev = item.libraryDaemon === here ? (item.libraryRev ?? 0) : 0;
+    const result = await saveDoc(conn, { kind: "song", id, title, body }, baseRev);
+    if (result.ok) {
+      item.libraryId = id;
+      item.libraryRev = result.rev;
+      item.libraryDaemon = here;
+      songNotes[item.id] = "Saved to the church computer's library.";
+    } else {
+      songNotes[item.id] = result.conflict
+        ? "Someone changed this song on another device since you added it. Add it again from the library to get their version."
+        : result.message;
+    }
+  }
+
+  /**
+   * Plans: this run sheet is kept on the church computer as you edit. The revision each save
+   * was from, by church computer and plan id: another church computer has its own copies.
+   */
+  const PLAN_REVS_KEY = "jivvy.planRevs.v2";
+  const planKey = (id: string) => `${conn?.daemonId ?? "?"}/${id}`;
+  let planRevs = $state<Record<string, number>>(stored(PLAN_REVS_KEY, {}));
+  $effect(() => store(PLAN_REVS_KEY, planRevs));
+  let planNote = $state("");
+  /** A plan changed elsewhere stops saving here until it is opened again, so neither edit is lost. */
+  let planHeld = $state("");
+  let planTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const items = JSON.stringify(draft.items); // re-run on every edit
+    const { id, title } = draft;
+    if (!ready || !conn || planHeld === planKey(id)) return;
+    clearTimeout(planTimer);
+    planTimer = setTimeout(() => queuePlanSave({ id, title, items }), 1500);
+    return () => clearTimeout(planTimer);
+  });
+  /**
+   * One plan save at a time: a second one sent before the first is acknowledged would be based
+   * on the same revision and be refused as if another device had changed the plan. Edits made
+   * meanwhile wait, and only the newest of them is sent next: the newest for each plan, so
+   * switching to another plan never drops the last edits of the one before.
+   */
+  const planPending = new Map<string, { title: string; items: string }>();
+  /** Before this browser moves to another plan: the current one's last edit goes now, not after the wait. */
+  function saveCurrentPlanNow() {
+    clearTimeout(planTimer);
+    if (ready && conn && planHeld !== planKey(draft.id))
+      queuePlanSave({ id: draft.id, title: draft.title, items: JSON.stringify(draft.items) });
+  }
+  let planSaving = false;
+  function queuePlanSave(plan: { id: string; title: string; items: string }) {
+    planPending.delete(plan.id); // re-added last: plans save in the order they were edited
+    planPending.set(plan.id, { title: plan.title, items: plan.items });
+    if (!planSaving) void flushPlanSaves();
+  }
+  async function flushPlanSaves() {
+    planSaving = true;
+    try {
+      for (let next = planPending.entries().next(); !next.done; next = planPending.entries().next()) {
+        const [id, plan] = next.value;
+        planPending.delete(id);
+        await savePlan(id, plan.title, plan.items);
+      }
+    } finally {
+      planSaving = false;
+    }
+  }
+  async function savePlan(id: string, title: string, items: string) {
+    const key = planKey(id);
+    if (!conn || planHeld === key) return;
+    const body = { items: JSON.parse(items) as unknown };
+    const result = await saveDoc(conn, { kind: "plan", id, title: title.trim() || "Untitled plan", body }, planRevs[key] ?? 0);
+    if (result.ok) {
+      planRevs[key] = result.rev;
+      planNote = "Saved on the church computer.";
+    } else if (result.conflict) {
+      planHeld = key;
+      planNote = "This plan was changed on another device. Open it again from Plans to continue; your changes stay in this browser.";
+    } else {
+      planNote = result.message;
+    }
+  }
+  let plansOpen = $state(false);
+  let plans = $state<DocInfo[]>([]);
+  async function openPlans() {
+    plansOpen = !plansOpen;
+    if (!plansOpen || !conn) return;
+    try {
+      plans = await listDocs(conn, "plan");
+    } catch (e) {
+      plans = [];
+      planNote = e instanceof Error ? e.message : String(e);
+    }
+  }
+  async function openPlan(info: DocInfo) {
+    if (!conn) return;
+    try {
+      const doc = await getDoc(conn, "plan", info.id);
+      const plan = planFromDoc(doc);
+      if (!plan) return void (planNote = "That plan was saved by a newer version of Jivvy Live.");
+      if (doc.id !== draft.id) saveCurrentPlanNow();
+      planRevs[planKey(doc.id)] = doc.rev;
+      if (planHeld === planKey(doc.id)) planHeld = "";
+      draft = plan;
+      plansOpen = false;
+      planNote = "";
+    } catch (e) {
+      planNote = e instanceof Error ? e.message : String(e);
+    }
+  }
+  /** Another device saved or deleted something: open lists follow it. */
+  function docChanged(doc: DocInfo) {
+    if (doc.kind === "song" && hymnsOpen) void refreshSaved();
+    if (doc.kind === "plan" && plansOpen && conn) void listDocs(conn, "plan").then((p) => (plans = p), () => {});
+  }
   function move(i: number, by: number) {
     const [item] = draft.items.splice(i, 1);
     if (item) draft.items.splice(i + by, 0, item);
@@ -255,6 +419,7 @@
   function startNew() {
     if (draft.items.length && !confirm("Start a new run sheet? This one stays on the screens until you send the new one."))
       return;
+    saveCurrentPlanNow();
     draft = { id: newId(), title: "Sunday service", items: [] };
   }
 
@@ -391,8 +556,26 @@
   <section class="plan" aria-label="Run sheet">
     <div class="plan-head">
       <input class="sheet-title" bind:value={draft.title} aria-label="Run sheet title" maxlength="200" />
+      <button class="quiet" onclick={openPlans} disabled={!ready} aria-expanded={plansOpen}>Plans</button>
       <button class="quiet" onclick={startNew}>New</button>
     </div>
+    {#if plansOpen}
+      <div class="hymns">
+        <ul>
+          {#each plans as p (p.id)}
+            <li>
+              <button class="hymn" onclick={() => openPlan(p)}>
+                <strong>{p.title || "Untitled plan"}</strong>
+                <span class="hint">saved {new Date(p.updatedAt).toLocaleString()}</span>
+              </button>
+            </li>
+          {:else}
+            <li class="hint">No plans on the church computer yet. This one is saved there as you edit.</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    {#if planNote}<p class="hint">{planNote}</p>{/if}
 
     {#each draft.items as item, i (item.id)}
       <article class="item">
@@ -456,6 +639,12 @@
           {/if}
         {:else if item.kind === "song" && item.song}
           <SongEditor bind:song={item.song} />
+          <div class="row library">
+            <button class="quiet" onclick={() => saveSong(item)} disabled={!ready || songSaving[item.id]}
+              >{item.libraryId ? "Save changes to the library" : "Save to the library"}</button
+            >
+            {#if songNotes[item.id]}<span class="hint">{songNotes[item.id]}</span>{/if}
+          </div>
         {:else if item.kind === "countdown"}
           <div class="row">
             <label>Text <input bind:value={item.text} maxlength="200" /></label>
@@ -491,12 +680,23 @@
       {#each KINDS as k (k.kind)}
         <button class="quiet" onclick={() => add(k.kind)}>+ {k.label}</button>
       {/each}
-      <button class="quiet" onclick={openHymns} aria-expanded={hymnsOpen}>+ Hymn</button>
+      <button class="quiet" onclick={openHymns} aria-expanded={hymnsOpen}>+ From the library</button>
     </div>
 
     {#if hymnsOpen}
       <div class="hymns">
-        <input bind:value={hymnSearch} placeholder="Search the hymn library" aria-label="Search hymns" />
+        <input bind:value={hymnSearch} placeholder="Search songs and hymns" aria-label="Search songs and hymns" />
+        {#if savedMatches.length}
+          <p class="group-label">Saved on the church computer</p>
+          <ul>
+            {#each savedMatches as s (s.id)}
+              <li>
+                <button class="hymn" onclick={() => addSaved(s)}><strong>{s.title}</strong></button>
+              </li>
+            {/each}
+          </ul>
+          <p class="group-label">Public-domain hymns</p>
+        {/if}
         {#if !hymns}
           <p class="hint">Loading…</p>
         {:else}
@@ -824,6 +1024,18 @@
     border-radius: 8px;
     padding: 10px 12px;
     margin-bottom: 16px;
+  }
+  .group-label {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 10px 0 0;
+  }
+  .row.library {
+    align-items: center;
+    margin-top: 6px;
   }
   .hymns input {
     width: 100%;

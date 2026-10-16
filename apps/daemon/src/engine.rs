@@ -99,6 +99,10 @@ fn device_may(command: &Command) -> bool {
             | Command::RunSheetGet
             | Command::MediaPut { .. }
             | Command::MediaHas { .. }
+            | Command::DocList { .. }
+            | Command::DocGet { .. }
+            | Command::DocPut { .. }
+            | Command::DocDelete { .. }
     )
 }
 
@@ -128,6 +132,9 @@ pub struct Engine {
     protected: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
+    /// Songs, plans, themes and settings (`library.sqlite3`); None if it couldn't be opened,
+    /// which never stops a service: the doc commands answer `unavailable`.
+    library: Option<crate::library::Library>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -178,6 +185,9 @@ impl Engine {
             crate::log("engine", format!("can't save the daemon id ({e}); using a temporary one"));
             devices::random_id(16)
         });
+        let library = crate::library::Library::open(store.dir())
+            .map_err(|e| crate::log("engine", format!("the library can't be opened: {e:?}")))
+            .ok();
         let mut engine = Engine {
             state,
             store,
@@ -187,6 +197,7 @@ impl Engine {
             pruning: None,
             protected: Default::default(),
             shown_since: None,
+            library,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -387,6 +398,12 @@ impl Engine {
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
             Command::MediaPut { id: media, offset, data, last } => {
                 return self.media_put(id, &media, offset, &data, last);
+            }
+            doc @ (Command::DocList { .. }
+            | Command::DocGet { .. }
+            | Command::DocPut { .. }
+            | Command::DocDelete { .. }) => {
+                return self.doc(id, doc);
             }
             Command::MediaHas { ids } => {
                 // A device skips sending what is here, so it has to stay until the run sheet.
@@ -843,6 +860,64 @@ impl Engine {
         protocol::ack_with(id, Some(self.view()), AckExtras { device_id: Some(device_id), ..Default::default() })
     }
 
+    /// The library's commands. Saves are on disk before the ack; every device subscribed hears
+    /// `doc.changed`, so its lists follow edits made elsewhere.
+    fn doc(&mut self, id: &str, command: Command) -> Ack {
+        use crate::library::Error;
+        let Some(lib) = self.library.as_mut() else {
+            return protocol::nack(
+                id,
+                ErrorCode::Unavailable,
+                "the church computer's library can't be opened; see its log",
+            );
+        };
+        let failed = |e: Error| match e {
+            Error::Conflict { current } => protocol::nack(
+                id,
+                ErrorCode::Conflict,
+                format!("changed on another device (now revision {current}); load it again before saving"),
+            ),
+            Error::Db(e) => {
+                crate::log("engine", format!("library: {e}"));
+                protocol::nack(id, ErrorCode::Unavailable, "the library couldn't save that; try again")
+            }
+        };
+        let changed = match command {
+            Command::DocList { kind } => {
+                return match lib.list(&kind) {
+                    Ok(docs) => protocol::ack_with(id, None, AckExtras { docs: Some(docs), ..Default::default() }),
+                    Err(e) => failed(e),
+                };
+            }
+            Command::DocGet { kind, id: doc_id } => {
+                return match lib.get(&kind, &doc_id) {
+                    Ok(Some(doc)) => protocol::ack_with(id, None, AckExtras { doc: Some(doc), ..Default::default() }),
+                    Ok(None) => protocol::nack(id, ErrorCode::BadArguments, format!("there is no {kind} {doc_id}")),
+                    Err(e) => failed(e),
+                };
+            }
+            Command::DocPut { kind, id: doc_id, title, body, base_rev } => {
+                match lib.put(&kind, &doc_id, &title, &body, base_rev, crate::now_ms()) {
+                    Ok(saved) => (saved, false),
+                    Err(e) => return failed(e),
+                }
+            }
+            Command::DocDelete { kind, id: doc_id, base_rev } => {
+                match lib.delete(&kind, &doc_id, base_rev, crate::now_ms()) {
+                    Ok(Some(gone)) => (gone, true),
+                    Ok(None) => return protocol::ack(id, None),
+                    Err(e) => return failed(e),
+                }
+            }
+            _ => unreachable!("only doc commands come here"),
+        };
+        let (saved, deleted) = changed;
+        if let Ok(line) = serde_json::to_vec(&protocol::doc_changed_event(&saved, deleted)) {
+            self.send_to_subscribers(line);
+        }
+        protocol::ack_with(id, None, AckExtras { saved: Some(saved), ..Default::default() })
+    }
+
     /// Sends the current state to every subscriber without ever blocking: a subscriber
     /// whose queue is full is disconnected (it reconnects and resubscribes), and one whose
     /// connection is gone is dropped.
@@ -1209,6 +1284,30 @@ mod tests {
     fn send(e: &mut Engine, command: Value) -> Value {
         let msg = json!({ "v": 1, "id": "t", "ts": 1, "command": command }).to_string();
         serde_json::to_value(e.handle_line(&msg)).unwrap()
+    }
+
+    #[test]
+    fn the_library_keeps_songs_across_a_restart_and_every_screen_hears_of_changes() {
+        let (mut e, dir) = engine("library", 10);
+        let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
+        let subscribe = r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.subscribe"}}"#;
+        e.handle_line_from(subscribe, Some(&Outbox::new(tx, None)));
+        while rx.try_recv().is_ok() {}
+
+        let song =
+            json!({ "sections": [{ "id": "v1", "label": "Verse 1", "text": "Amazing grace" }], "arrangement": ["v1"] });
+        let put = json!({ "type": "doc.put", "kind": "song", "id": "grace", "title": "Amazing Grace", "body": song, "baseRev": 0 });
+        assert_eq!(send(&mut e, put.clone())["saved"]["rev"], 1);
+        let ev: Value = serde_json::from_slice(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!((ev["event"].clone(), ev["doc"]["id"].clone()), (json!("doc.changed"), json!("grace")));
+        // Saving again from the same old copy (revision 0) would lose the first save: refused.
+        assert_eq!(send(&mut e, put)["code"], "conflict");
+
+        // A restart (a new engine on the same data) still has it.
+        drop(e);
+        let mut e = Engine::new(Store::new(&dir).unwrap(), Snapshot::default(), 10);
+        assert_eq!(send(&mut e, json!({ "type": "doc.list", "kind": "song" }))["docs"][0]["title"], "Amazing Grace");
+        assert_eq!(send(&mut e, json!({ "type": "doc.get", "kind": "song", "id": "grace" }))["doc"]["body"], song);
     }
 
     #[test]

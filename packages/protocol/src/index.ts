@@ -99,7 +99,25 @@ export type Command =
    */
   | { type: "media.put"; id: string; offset: number; data: string; last: boolean }
   /** Added in v1 without a version bump. Which of these images the church computer lacks (`missing` on the ack). */
-  | { type: "media.has"; ids: string[] };
+  | { type: "media.has"; ids: string[] }
+  // ---- The church computer's library (added in v1 without a version bump) ----
+  // Songs, plans, themes and settings, kept in a database on the church computer: the master
+  // copy during a service, and the only copy without Plus. Each is a document of a `kind`
+  // ("song", "plan", "theme", "setting"; newer UIs may add others) with an `id`, a `title` and
+  // a `body` the UI shapes; the daemon keeps it as given. Every save bumps `rev`.
+  /** The documents of a kind, without their bodies (`docs` on the ack), newest first. */
+  | { type: "doc.list"; kind: string }
+  /** One document with its body (`doc` on the ack); `bad_arguments` if there is none. */
+  | { type: "doc.get"; kind: string; id: string }
+  /**
+   * Saves a document (`saved` on the ack; subscribers get `doc.changed`). With `baseRev`, only
+   * if the saved copy is still that revision (0: only if it doesn't exist yet); otherwise
+   * `conflict`, so an edit made on another device is never silently overwritten.
+   * The body must be a JSON object of at most MAX_DOC_BYTES.
+   */
+  | { type: "doc.put"; kind: string; id: string; title: string; body: Record<string, unknown>; baseRev?: number }
+  /** Removes a document (with `baseRev`, only that revision); deleting one that's gone is fine. */
+  | { type: "doc.delete"; kind: string; id: string; baseRev?: number };
 
 export type CommandType = Command["type"];
 
@@ -124,7 +142,9 @@ export type ErrorCode =
    * Added in v1: this connection may not do that. A device that isn't paired and proven, a
    * command only the church computer may send, or pairing that isn't open.
    */
-  | "unauthorized";
+  | "unauthorized"
+  /** Added in v1: doc.put / doc.delete with a `baseRev` that is no longer the saved revision. */
+  | "conflict";
 
 export type ParseResult =
   | { ok: true; envelope: Envelope }
@@ -294,7 +314,22 @@ export function parseRunSheet(x: unknown): RunSheet | null {
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
 
 /** The size of an envelope as sent, in UTF-8 bytes. */
-export const messageBytes = (envelope: Envelope): number => new TextEncoder().encode(JSON.stringify(envelope)).length;
+export const messageBytes = (envelope: Envelope): number => jsonBytes(envelope);
+const jsonBytes = (x: unknown): number => new TextEncoder().encode(JSON.stringify(x)).length;
+
+// ---- The library ----
+
+/** Largest document body (as JSON, in UTF-8 bytes): a long song or a full plan with room to spare. */
+export const MAX_DOC_BYTES = 512 * 1024;
+/** A document kind: "song", "plan", "theme", "setting"; newer UIs may add others. */
+const DOC_KIND = /^[a-z][a-z0-9-]{0,31}$/;
+const isDocKind = (x: unknown): x is string => typeof x === "string" && DOC_KIND.test(x);
+const DOC_KIND_HELP = "doc commands need a kind: 1-32 of a-z 0-9 -, starting with a letter";
+/** An optional baseRev: undefined when left out, null when it isn't a whole number from 0. */
+function parseBaseRev(x: unknown): number | undefined | null {
+  if (x === undefined) return undefined;
+  return typeof x === "number" && Number.isSafeInteger(x) && x >= 0 ? x : null;
+}
 
 /** Every slide of the run sheet in order: what `slideIndex` counts. */
 export function runSheetSlides(sheet: RunSheet): { item: RunSheetItem; itemIndex: number; slide: Slide }[] {
@@ -332,6 +367,31 @@ function parseCommand(raw: unknown): CommandResult {
       if (!Array.isArray(raw.ids) || raw.ids.length > MAX_RUNSHEET_SLIDES || !raw.ids.every(isMediaId))
         return { ok: false, code: "bad_arguments", message: `media.has needs ids: up to ${MAX_RUNSHEET_SLIDES} SHA-256 ids` };
       return { ok: true, command: { type: "media.has", ids: raw.ids as string[] } };
+    case "doc.list":
+      if (!isDocKind(raw.kind)) return { ok: false, code: "bad_arguments", message: DOC_KIND_HELP };
+      return { ok: true, command: { type: "doc.list", kind: raw.kind } };
+    case "doc.get":
+    case "doc.delete": {
+      const type = raw.type;
+      if (!isDocKind(raw.kind) || !isId(raw.id))
+        return { ok: false, code: "bad_arguments", message: `${type} needs kind and id (1-64 of A-Z a-z 0-9 _ -)` };
+      if (type === "doc.get") return { ok: true, command: { type, kind: raw.kind, id: raw.id } };
+      const baseRev = parseBaseRev(raw.baseRev);
+      if (baseRev === null) return { ok: false, code: "bad_arguments", message: "baseRev must be a whole number from 0" };
+      return { ok: true, command: { type, kind: raw.kind, id: raw.id, ...(baseRev === undefined ? {} : { baseRev }) } };
+    }
+    case "doc.put": {
+      const title = plainText(raw.title, MAX_TITLE);
+      const baseRev = parseBaseRev(raw.baseRev);
+      if (!isDocKind(raw.kind) || !isId(raw.id) || title === null || !isObj(raw.body) || baseRev === null)
+        return { ok: false, code: "bad_arguments", message: `doc.put needs kind, id, title (up to ${MAX_TITLE} characters), a body object and an optional baseRev` };
+      if (jsonBytes(raw.body) > MAX_DOC_BYTES)
+        return { ok: false, code: "bad_arguments", message: `a document's body can be at most ${MAX_DOC_BYTES / 1024} KB` };
+      return {
+        ok: true,
+        command: { type: "doc.put", kind: raw.kind, id: raw.id, title, body: raw.body, ...(baseRev === undefined ? {} : { baseRev }) },
+      };
+    }
     case "runsheet.set": {
       const runSheet = parseRunSheet(raw.runSheet);
       if (!runSheet)
@@ -588,6 +648,27 @@ export interface AckExtras {
   media?: { id: string; received: number; complete: boolean };
   /** media.has: the ids the church computer doesn't have yet. */
   missing?: string[];
+  /** doc.list */
+  docs?: DocInfo[];
+  /** doc.get */
+  doc?: Doc;
+  /** doc.put, doc.delete: the document as saved (a delete is a revision too, so revisions never repeat). */
+  saved?: DocInfo;
+}
+
+/** A document in the church computer's library, without its body. */
+export interface DocInfo {
+  kind: string;
+  id: string;
+  title: string;
+  /** Goes up by one on every save. */
+  rev: number;
+  /** When it was last saved, ms since epoch. */
+  updatedAt: number;
+}
+
+export interface Doc extends DocInfo {
+  body: Record<string, unknown>;
 }
 
 export type Ack =
@@ -615,7 +696,9 @@ export type DaemonEvent =
   /** Something the tech lead should know about, in plain words (e.g. a platform lowered or paused). */
   | { v: number; event: "alert"; alert: Alert }
   /** To the device that asked to pair, once the church computer answers. */
-  | { v: number; event: "pair.result"; approved: boolean; deviceId?: string; daemonId?: string };
+  | { v: number; event: "pair.result"; approved: boolean; deviceId?: string; daemonId?: string }
+  /** Added in v1: a document in the library was saved or deleted, by any device. */
+  | { v: number; event: "doc.changed"; doc: DocInfo; deleted?: boolean };
 
 /**
  * `stream.lowered`: a platform gets a lower quality because the upload is slow.

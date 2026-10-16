@@ -16,6 +16,7 @@ Church live-production software. Source of truth: `docs/BUILD_PLAN.md`. Brand: `
 - `apps/web` — app.jivvy.org (SvelteKit static SPA; `npm run dev:web`, port 5173): the run sheet screen, talking to the daemon over WebSocket
 - `apps/daemon` — church-computer app (Rust): `jivvy-watchdog` supervises `jivvy-engine`, `jivvy-outputs` (fullscreen output windows) and `jivvy-video` (camera/audio, `--features video`); chaos tests in `tests/chaos.rs`
 - `packages/protocol` — versioned command protocol (TypeScript, zero runtime deps)
+- `packages/songs` — song format (sections and arrangement), paste-to-sections parser, public-domain hymn library
 - `packages/sim-daemon` — in-memory fake daemon for the Stage 2 demo; frozen during Stage 1A, catches up with the real daemon before the demo
 
 ## Commands

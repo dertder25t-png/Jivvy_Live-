@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@jivvy/protocol": "*",
+    "@jivvy/songs": "*",
     "pdfjs-dist": "6.3.289"
   },
   "devDependencies": {

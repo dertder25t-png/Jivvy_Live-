@@ -42,11 +42,12 @@
   let textPercent = 9;
   function applyTheme(t) {
     const ok = t && t.v === 1 && FONTS[t.font] && HEX.test(t.text) && t.background && HEX.test(t.background.color) &&
-      typeof t.size === "number" && t.size >= 2 && t.size <= 20;
+      typeof t.size === "number" && t.size >= 2 && t.size <= 20 && typeof t.bold === "boolean" &&
+      typeof t.shadow === "boolean" && (t.background.kind === "color" || t.background.kind === "image");
     slide.style.fontFamily = ok ? FONTS[t.font] : "";
     slide.style.fontWeight = ok ? (t.bold ? "700" : "400") : "";
     slide.style.color = ok ? t.text : "";
-    slide.style.textShadow = ok ? (t.shadow ? "0 0 .25em #000, 0 .05em .1em #000" : "none") : "";
+    slide.style.textShadow = ok ? (t.shadow ? "0 0 .25em #000, 0 .05em .1em #000" : "") : "";
     textPercent = ok ? t.size : 9;
     return ok ? t.background.color : "#000";
   }
@@ -90,8 +91,8 @@
     render(state) {
       ident.classList.add("hidden");
       const background = applyTheme(state.theme);
-      // Black is black, whatever the theme.
-      stage.style.background = state.black ? "#000" : background;
+      // Black is black, whatever the theme; picture slides keep their black bars.
+      stage.style.background = state.black || (state.slide && state.slide.image) ? "#000" : background;
       slide.replaceChildren();
       // The run sheet's slide; with no run sheet set, the slide number.
       const lines = state.slide ? state.slide.lines : ["Slide " + (state.slideIndex + 1)];

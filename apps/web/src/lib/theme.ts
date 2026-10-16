@@ -19,8 +19,7 @@
  * lyric layer (the stream's) ignores `background`: it draws only the text over the video.
  *
  * Which theme is in use is a "setting" document, id "active-theme": { "v": 1, "themeId": "..." }.
- * Add fields, never rename or
- * remove, and keep reading v 1: the native lyric layer (apps/daemon/src/lyrics.rs) will read
+ * Add fields, never rename or remove, and keep reading v 1: the native lyric layer (apps/daemon/src/lyrics.rs) will read
  * these same bodies. The three font names are a fixed list; each renderer picks its own face.
  */
 import type { Doc } from "@jivvy/protocol";

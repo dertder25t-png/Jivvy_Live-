@@ -240,6 +240,7 @@ mod tests {
         let r = engine.lock().unwrap().handle_line(r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#);
         let r = serde_json::to_value(r).unwrap();
         assert_eq!(r["state"]["black"], serde_json::json!(true));
+        let _ = std::fs::remove_dir_all(&dir); // only reached when the test passed
     }
 
     #[test]

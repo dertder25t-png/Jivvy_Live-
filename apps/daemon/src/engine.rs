@@ -1011,15 +1011,25 @@ const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Who may open the WebSocket command channel. Programs (no `Origin` header) always may.
 /// Browsers send their page's origin, and only listed origins are accepted, so a web page
-/// open on a booth computer can't drive the service.
+/// open on a booth computer can't drive the service. Pages this daemon served itself (the
+/// same scheme, host and port) are its own app and may.
 #[derive(Debug, Clone, Default)]
 pub struct WsAccess {
     pub origins: Vec<String>,
+    /// The built web app (`apps/web/build`), served on the same port; None serves no pages.
+    pub web_dir: Option<std::path::PathBuf>,
 }
 
 impl WsAccess {
     pub fn allows(&self, origin: Option<&str>) -> bool {
         origin.is_none_or(|o| self.origins.iter().any(|a| a.eq_ignore_ascii_case(o)))
+    }
+
+    /// Also lets in a page from this very address: `host` is the request's Host header.
+    fn allows_from(&self, origin: Option<&str>, host: Option<&str>, secure: bool) -> bool {
+        let scheme = if secure { "https" } else { "http" };
+        let own = matches!((origin, host), (Some(o), Some(h)) if o.eq_ignore_ascii_case(&format!("{scheme}://{h}")));
+        own || self.allows(origin)
     }
 }
 
@@ -1048,12 +1058,12 @@ fn serve_ws_connection(
     let shared = Arc::new(stream.try_clone()?);
     let mut session = Session::device();
     let result = match tls {
-        None => ws_session(stream, &shared, engine, access, &mut session),
+        None => ws_session(stream, &shared, engine, access, &mut session, false),
         // No good certificate yet: refuse rather than serve in plain text.
         Some(tls) => match tls.config() {
             Some(config) => {
                 let conn = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
-                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access, &mut session)
+                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access, &mut session, true)
             }
             None => Ok(()),
         },
@@ -1080,6 +1090,12 @@ impl OverTcp for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
     }
 }
 
+impl<S: OverTcp> OverTcp for crate::web::Replay<S> {
+    fn tcp(&self) -> &TcpStream {
+        self.inner.tcp()
+    }
+}
+
 /// One WebSocket connection over `stream` (a plain socket, or TLS over it); `socket` is a
 /// clone of that socket, for the outbox to cut a stuck connection.
 fn ws_session<S: OverTcp>(
@@ -1088,14 +1104,25 @@ fn ws_session<S: OverTcp>(
     engine: &Mutex<Engine>,
     access: &WsAccess,
     session: &mut Session,
+    secure: bool,
 ) -> std::io::Result<()> {
     use tungstenite::{Error, Message, handshake::server::ErrorResponse, http::StatusCode};
+
+    // A plain request gets a file of the web app; one asking to upgrade is the channel.
+    let mut stream = stream;
+    let Some(raw) = crate::web::read_head(&mut stream)? else { return Ok(()) };
+    let Some(head) = crate::web::parse(&raw) else { return Ok(()) };
+    if !head.upgrade {
+        return crate::web::respond(&mut stream, access.web_dir.as_deref(), &head);
+    }
+    let stream = crate::web::Replay { head: std::io::Cursor::new(raw), inner: stream };
 
     // The error type is tungstenite's handshake `Callback` contract, so it can't be boxed.
     #[allow(clippy::result_large_err)]
     let check_origin = |req: &tungstenite::handshake::server::Request, resp| {
         let origin = req.headers().get("origin").map(|o| o.to_str().unwrap_or("?"));
-        if access.allows(origin) {
+        let host = req.headers().get("host").and_then(|h| h.to_str().ok());
+        if access.allows_from(origin, host, secure) {
             return Ok(resp);
         }
         crate::log("engine", format!("refused a WebSocket from origin {}", origin.unwrap_or("")));
@@ -1663,7 +1690,7 @@ mod tests {
         let tcp = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
         let ws = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
         let addrs = (tcp.local_addr().unwrap(), ws.local_addr().unwrap());
-        let access = Arc::new(WsAccess { origins: origins.iter().map(|o| o.to_string()).collect() });
+        let access = Arc::new(WsAccess { origins: origins.iter().map(|o| o.to_string()).collect(), web_dir: None });
         let e2 = engine.clone();
         std::thread::spawn(move || serve(tcp, e2));
         std::thread::spawn(move || serve_ws(ws, engine, access, None));
@@ -1764,6 +1791,32 @@ mod tests {
             Err(tungstenite::Error::Http(r)) => assert_eq!(r.status(), 403),
             other => panic!("an unlisted origin is refused, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn the_web_app_is_served_on_the_channel_port_and_its_pages_may_connect() {
+        let web = std::env::temp_dir().join(format!("jivvy-webapp-{}-{}", std::process::id(), crate::now_ms()));
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("index.html"), "<!doctype html><title>Jivvy Live</title>").unwrap();
+        let (e, _) = engine("web-app", 10);
+        let listener = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let access = Arc::new(WsAccess { origins: vec![], web_dir: Some(web.clone()) });
+        std::thread::spawn(move || serve_ws(listener, Arc::new(Mutex::new(e)), access, None));
+
+        // A browser asks for the page...
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(format!("GET /operate HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes()).unwrap();
+        let mut page = String::new();
+        s.read_to_string(&mut page).unwrap();
+        assert!(page.starts_with("HTTP/1.1 200") && page.ends_with("<title>Jivvy Live</title>"), "{page}");
+
+        // ...and that page, from this very address, may open the channel; another site may not.
+        let mut ws = ws_connect(addr, Some(&format!("http://{addr}"))).unwrap();
+        ws_send(&mut ws, r#"{"v":1,"id":"s","ts":1,"command":{"type":"state.get"}}"#);
+        assert_eq!(ws_next(&mut ws)["id"], "s");
+        assert!(ws_connect(addr, Some("http://evil.example")).is_err());
+        let _ = std::fs::remove_dir_all(&web);
     }
 
     #[test]

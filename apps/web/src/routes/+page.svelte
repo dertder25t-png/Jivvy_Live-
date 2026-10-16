@@ -121,10 +121,28 @@
     });
     conn.connect();
   }
-  // Back on the church computer used last time, straight away.
+  // Back on the church computer used last time, straight away. A page the church computer
+  // served itself (no internet needed) connects to the address it came from.
   onMount(() => {
-    if (stored<string | null>(ADDRESS_KEY, null)) connect();
+    if (stored<string | null>(ADDRESS_KEY, null)) return connect();
+    void servedByDaemon().then((own) => {
+      if (!own || stored<string | null>(ADDRESS_KEY, null)) return;
+      address = own;
+      connect();
+    });
   });
+
+  /** This page's own address as a channel, if a church computer served it; else null. */
+  async function servedByDaemon(): Promise<string | null> {
+    try {
+      const res = await fetch("/.well-known/jivvy", { cache: "no-store" });
+      const info = res.ok ? ((await res.json()) as { service?: string }) : null;
+      if (info?.service !== "jivvy-live") return null;
+      return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
+    } catch {
+      return null; // app.jivvy.org answers with the app's own page, which isn't JSON
+    }
+  }
   onDestroy(() => conn?.close());
 
   /** One send at a time: a second one mid-upload would restart the same images and race the first. */

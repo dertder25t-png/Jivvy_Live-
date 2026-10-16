@@ -15,10 +15,22 @@
       "summary": "YouTube 1080p + Facebook 720p",
       "message": "Couldn't test the upload just now (no internet?); this is the last speed measured.",
       "checks": [
-        { "id": "disk", "level": "bad", "label": "Disk space", "message": "Only 4.2 GB free where recordings go.", "fix": "Delete or move old recordings, or choose a recording folder on a bigger disk." },
+        { "id": "disk", "level": "bad", "label": "Disk space", "message": "Only 1.5 GB free where recordings go: not enough to record the service.", "fix": "Delete or move old recordings, or choose a recording folder on a bigger disk." },
         { "id": "stream", "level": "ok", "label": "Streaming settings", "message": "Set up: YouTube, Facebook." },
         { "id": "camera", "level": "warn", "label": "Camera", "message": "Still starting.", "fix": "Wait a few seconds and run the check again." }
       ]
+    }
+  },
+  "stoppedAbout": "The stream started during the test (Preflight.stopped, added in v1): no checks, nothing wrong.",
+  "stopped": {
+    "v": 1,
+    "event": "preflight",
+    "preflight": {
+      "status": "failed",
+      "destinations": [],
+      "summary": "",
+      "message": "Stopped: the stream started, and the test would take its bandwidth.",
+      "stopped": true
     }
   }
 }

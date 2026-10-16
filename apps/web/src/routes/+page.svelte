@@ -114,6 +114,7 @@
     store(ADDRESS_KEY, address);
     live = null;
     onScreens = null;
+    preflight = null;
     conn = new DaemonConnection(address.trim(), {
       status: (s) => (status = s),
       state: (s) => (live = s),

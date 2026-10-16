@@ -27,6 +27,10 @@
   $effect(() => {
     if (result && result.status !== "measuring") running = false;
   });
+  // Disconnected: no result is coming on this connection.
+  $effect(() => {
+    if (!ready) running = false;
+  });
 
   const isStreaming = $derived(streaming(live));
   const list = $derived(result && result.status !== "measuring" ? rows(result) : []);
@@ -64,7 +68,7 @@
 
   {#if list.length && result}
     <div class="summary" data-level={level}>
-      <strong>{headline(list)}</strong>
+      <strong>{headline(list, result)}</strong>
       {#if result.summary && result.destinations.length}
         <span class="stream">{result.summary}{#if result.uploadKbps} · {mbps(result.uploadKbps)} up{/if}</span>
       {/if}

@@ -617,6 +617,11 @@ export interface Preflight {
    * by older daemons (fixtures/preflight-event.json).
    */
   checks?: PreflightCheck[];
+  /**
+   * Added in v1: the stream started during the test, which stopped it (`failed`, no checks).
+   * Nothing is wrong; run it again after the stream. Older daemons leave it out.
+   */
+  stopped?: true;
 }
 
 /** `ok` green, `warn` amber (worth a look), `bad` red (fix before the service). */

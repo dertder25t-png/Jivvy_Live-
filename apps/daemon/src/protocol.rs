@@ -708,6 +708,9 @@ pub struct Preflight {
     /// screens, camera and microphone). Left out while measuring and when the test was stopped.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<PreflightCheck>,
+    /// Added in v1: `Some(true)` when the stream starting stopped the test; left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<bool>,
 }
 
 /// One pre-flight check (same shape as the TypeScript `PreflightCheck`).
@@ -1114,7 +1117,11 @@ mod tests {
             summary: p["summary"].as_str().unwrap().into(),
             message: p["message"].as_str().map(Into::into),
             checks: serde_json::from_value(p["checks"].clone()).unwrap(),
+            stopped: None,
         };
+        // Stopped by the stream starting: exactly what the daemon sends then.
+        let stopped = serde_json::to_value(preflight_event(&crate::preflight::stopped())).unwrap();
+        assert_eq!(stopped, doc["stopped"]);
         let mut sent = serde_json::to_value(preflight_event(&preflight)).unwrap();
         let mut expect = doc["event"].clone();
         // A number either way: 12000.0 here, 12000 in the fixture.

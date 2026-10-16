@@ -144,36 +144,94 @@ fn check(id: &str, level: &str, label: &str, message: impl Into<String>, fix: Op
     }
 }
 
-/// A status file another process writes (`media-status.json`, `outputs-status.json`).
-fn status_file(dir: &Path, name: &str) -> Option<serde_json::Value> {
-    serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()
+/// What the engine knows right now, so a status file left behind by a process that has since
+/// stopped is never taken for the truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Live {
+    /// `jivvy-video` is installed (builds with the `video` feature).
+    pub video_installed: bool,
+    /// Its reports are arriving (the engine's own freshness of the stream and recording reports).
+    pub video_alive: bool,
 }
 
-/// The church computer's other checks, from the settings and the status files its processes
-/// write. Reads files only: nothing here needs the internet, and no stream key is ever shown.
-pub fn checks(dir: &Path) -> Vec<PreflightCheck> {
+impl Live {
+    /// Whether `jivvy-video` sits next to the running program, as the watchdog looks for it.
+    pub fn video_installed_here() -> bool {
+        let name = format!("jivvy-video{}", std::env::consts::EXE_SUFFIX);
+        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(name))).is_some_and(|p| p.exists())
+    }
+}
+
+/// Below this much free space recording the service is at risk (red); the warn level is amber.
+pub const DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// `outputs-status.json` is rewritten at least this often while `jivvy-outputs` runs
+/// (`outputs::STATUS_REFRESH`); older than this, it was left behind.
+pub const OUTPUTS_STATUS_STALE: Duration = Duration::from_secs(15);
+
+/// A status file another process writes (`media-status.json`, `outputs-status.json`), with its age.
+fn status_file(dir: &Path, name: &str) -> Option<(serde_json::Value, Duration)> {
+    let path = dir.join(name);
+    let age = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?.elapsed().unwrap_or_default();
+    Some((serde_json::from_slice(&std::fs::read(path).ok()?).ok()?, age))
+}
+
+const RESTART: Option<&str> = Some("Restart Jivvy Live on the church computer.");
+
+/// The church computer's other checks, from the settings, the status files its processes write
+/// and what the engine knows live. Nothing here needs the internet, and no stream key is shown.
+pub fn checks(dir: &Path, live: Live) -> Vec<PreflightCheck> {
     let mut out = Vec::new();
 
-    // Disk space where recordings go.
-    let rec = crate::recording::load_config(dir).unwrap_or_default();
+    // The camera and microphone status file counts only while the video process reports.
+    let media = if live.video_alive { status_file(dir, media::STATUS_FILE).map(|(m, _)| m) } else { None };
+
+    // Disk space where recordings go: amber below the warn level, red below the floor. With
+    // unreadable settings, the recorder's own folder (it keeps the last good settings), else say so.
+    let (folder, warn_below) = match crate::recording::load_config(dir) {
+        Ok(rec) => (Some(rec.folder(dir)), rec.warn_free_bytes()),
+        Err(e) => {
+            let current = media.as_ref().and_then(|m| m["recording"]["folder"].as_str()).filter(|f| !f.is_empty());
+            if current.is_none() {
+                out.push(check(
+                    "disk",
+                    "warn",
+                    "Disk space",
+                    format!("The recording settings can't be read ({e}), so the free space wasn't checked."),
+                    Some("Set the recording folder again in the settings."),
+                ));
+            }
+            (current.map(std::path::PathBuf::from), crate::recording::WARN_FREE_BYTES)
+        }
+    };
+    let floor = DISK_FLOOR_BYTES.min(warn_below);
     let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    out.push(match crate::recording::free_space(&rec.folder(dir)) {
-        Some(free) if free < rec.warn_free_bytes() => check(
-            "disk",
-            "bad",
-            "Disk space",
-            format!("Only {:.1} GB free where recordings go.", gb(free)),
-            Some("Delete or move old recordings, or choose a recording folder on a bigger disk."),
-        ),
-        Some(free) => check("disk", "ok", "Disk space", format!("{:.0} GB free for recordings.", gb(free)), None),
-        None => check(
-            "disk",
-            "warn",
-            "Disk space",
-            "Couldn't read the free space where recordings go.",
-            Some("Check that the recording folder's disk is connected."),
-        ),
-    });
+    let space_fix = Some("Delete or move old recordings, or choose a recording folder on a bigger disk.");
+    if let Some(folder) = folder {
+        out.push(match crate::recording::free_space(&folder) {
+            Some(free) if free < floor => check(
+                "disk",
+                "bad",
+                "Disk space",
+                format!("Only {:.1} GB free where recordings go: not enough to record the service.", gb(free)),
+                space_fix,
+            ),
+            Some(free) if free < warn_below => check(
+                "disk",
+                "warn",
+                "Disk space",
+                format!("{:.1} GB free where recordings go: enough for a short service only.", gb(free)),
+                space_fix,
+            ),
+            Some(free) => check("disk", "ok", "Disk space", format!("{:.0} GB free for recordings.", gb(free)), None),
+            None => check(
+                "disk",
+                "warn",
+                "Disk space",
+                "Couldn't read the free space where recordings go.",
+                Some("Check that the recording folder's disk is connected."),
+            ),
+        })
+    }
 
     // Streaming settings (never the keys).
     out.push(match stream::load_config(dir) {
@@ -211,8 +269,10 @@ pub fn checks(dir: &Path) -> Vec<PreflightCheck> {
         }
     });
 
-    // The hardware check: what video this computer can encode.
+    // The hardware check: what video this computer can encode. Only with video installed.
+    let not_here = "Not part of this setup: camera and streaming aren't installed on this computer.";
     out.push(match hardware::load(dir) {
+        _ if !live.video_installed => check("encoder", "ok", "Video check", not_here, None),
         None => check(
             "encoder",
             "warn",
@@ -232,33 +292,21 @@ pub fn checks(dir: &Path) -> Vec<PreflightCheck> {
 
     // The screens (fullscreen output windows).
     out.push(match status_file(dir, crate::outputs::STATUS_FILE) {
-        None => check(
-            "screens",
-            "warn",
-            "Screens",
-            "The screen windows aren't running.",
-            Some("Restart Jivvy Live on the church computer."),
-        ),
-        Some(s) => {
+        None => check("screens", "warn", "Screens", "The screen windows aren't running.", RESTART),
+        Some((_, age)) if age > OUTPUTS_STATUS_STALE => {
+            check("screens", "warn", "Screens", "The screen windows stopped answering.", RESTART)
+        }
+        Some((s, _)) => {
             let problems: Vec<&str> =
                 s["problems"].as_array().into_iter().flatten().filter_map(|p| p["message"].as_str()).collect();
             let shown = s["outputs"].as_array().map_or(0, Vec::len);
+            let cables = Some("Check the screen cables and the display settings.");
             if !problems.is_empty() {
-                check(
-                    "screens",
-                    "warn",
-                    "Screens",
-                    problems.join(" "),
-                    Some("Check the screen cables and the display settings."),
-                )
+                check("screens", "warn", "Screens", problems.join(" "), cables)
             } else if s["connected"] != true {
-                check(
-                    "screens",
-                    "warn",
-                    "Screens",
-                    "The screens aren't following the slides.",
-                    Some("Restart Jivvy Live on the church computer."),
-                )
+                check("screens", "warn", "Screens", "The screens aren't following the slides.", RESTART)
+            } else if shown == 0 {
+                check("screens", "warn", "Screens", "No screen is showing the slides.", cables)
             } else {
                 let what = if shown == 1 { "1 screen".to_string() } else { format!("{shown} screens") };
                 check("screens", "ok", "Screens", format!("{what} showing the slides."), None)
@@ -267,22 +315,19 @@ pub fn checks(dir: &Path) -> Vec<PreflightCheck> {
     });
 
     // Camera and microphone.
-    let media = status_file(dir, media::STATUS_FILE);
     for (id, label) in [("camera", "Camera"), ("microphone", "Microphone")] {
+        if !live.video_installed {
+            out.push(check(id, "ok", label, not_here, None));
+            continue;
+        }
         let Some(m) = &media else {
-            out.push(check(
-                id,
-                "warn",
-                label,
-                "The camera and microphone aren't running.",
-                Some("Restart Jivvy Live on the church computer."),
-            ));
+            out.push(check(id, "warn", label, "The camera and microphone aren't running.", RESTART));
             continue;
         };
         let input = &m[id];
         out.push(match input["state"].as_str().unwrap_or("") {
             "running" => check(id, "ok", label, "Working.", None),
-            "off" => check(id, "ok", label, "Turned off in the settings.", None),
+            "off" => check(id, "ok", label, "Not part of this setup: turned off in the settings.", None),
             "starting" => {
                 check(id, "warn", label, "Still starting.", Some("Wait a few seconds and run the check again."))
             }
@@ -296,10 +341,10 @@ pub fn checks(dir: &Path) -> Vec<PreflightCheck> {
 }
 
 /// Runs the whole check: measure (or fall back to the last speed measured), then plan.
-pub fn run(dir: &Path, url: &str, cancel: Arc<AtomicBool>) -> Preflight {
+pub fn run(dir: &Path, url: &str, cancel: Arc<AtomicBool>, live: Live) -> Preflight {
     let mut p = run_upload(dir, url, cancel.clone());
-    if !cancel.load(Ordering::Relaxed) {
-        p.checks = checks(dir);
+    if p.stopped.is_none() {
+        p.checks = checks(dir, live);
     }
     p
 }
@@ -313,7 +358,7 @@ fn run_upload(dir: &Path, url: &str, cancel: Arc<AtomicBool>) -> Preflight {
         }
         Err(e) if cancel.load(Ordering::Relaxed) => {
             crate::log("engine", format!("upload test stopped: {e}"));
-            return failed("Stopped: the stream started, and the test would take its bandwidth.");
+            return stopped();
         }
         Err(e) => {
             crate::log("engine", format!("upload test failed: {e}"));
@@ -337,6 +382,7 @@ fn run_upload(dir: &Path, url: &str, cancel: Arc<AtomicBool>) -> Preflight {
         destinations,
         message,
         checks: Vec::new(),
+        stopped: None,
     }
 }
 
@@ -350,7 +396,13 @@ fn failed(message: &str) -> Preflight {
         summary: String::new(),
         message: Some(message.into()),
         checks: Vec::new(),
+        stopped: None,
     }
+}
+
+/// The answer when the stream starting stopped the test: nothing is wrong.
+pub fn stopped() -> Preflight {
+    Preflight { stopped: Some(true), ..failed("Stopped: the stream started, and the test would take its bandwidth.") }
 }
 
 /// The answer while the test runs.
@@ -466,35 +518,61 @@ pub(crate) mod tests {
     fn the_checks_say_what_is_set_up_and_what_to_fix() {
         let dir = temp("checks");
         std::fs::write(dir.join("stream.json"), TWO).unwrap();
-        let p = run(&dir, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)));
+        let p = run(&dir, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)), Live::default());
         let by = |id: &str| p.checks.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("no {id} check: {p:?}"));
         assert_eq!(by("stream").level, "ok");
         assert_eq!(by("stream").message, "Set up: YouTube, Facebook.");
         assert_ne!(by("disk").level, "warn", "the temp folder's disk has a free space");
-        // Nothing has run here yet: amber, each with a fix.
-        for id in ["encoder", "screens", "camera", "microphone"] {
-            assert_eq!(by(id).level, "warn", "{id}");
-            assert!(by(id).fix.is_some(), "{id}");
+        // No screen windows have run here: amber, with a fix.
+        assert_eq!((by("screens").level.as_str(), by("screens").fix.is_some()), ("warn", true));
+        // Video isn't installed: not part of this setup, nothing to fix.
+        for id in ["encoder", "camera", "microphone"] {
+            assert_eq!((by(id).level.as_str(), by(id).fix.as_deref()), ("ok", None), "{id}");
+            assert!(by(id).message.starts_with("Not part of this setup"), "{id}");
         }
+
+        let level = |live: Live, id: &str| checks(&dir, live).into_iter().find(|c| c.id == id).unwrap().level;
+        // A camera status file only counts while the video process is reporting.
+        std::fs::write(dir.join(media::STATUS_FILE), r#"{"camera":{"state":"running"},"microphone":{"state":"off"}}"#)
+            .unwrap();
+        let alive = Live { video_installed: true, video_alive: true };
+        assert_eq!((level(alive, "camera"), level(alive, "microphone")), ("ok".into(), "ok".into()));
+        assert_eq!(level(Live { video_alive: false, ..alive }, "camera"), "warn", "left behind by a stopped process");
+        // Screens: none showing isn't green; one is.
+        let outputs = |shown: &str| {
+            let body = format!(r#"{{"connected":true,"outputs":[{shown}],"problems":[]}}"#);
+            std::fs::write(dir.join(crate::outputs::STATUS_FILE), body).unwrap();
+        };
+        outputs("");
+        assert_eq!(level(alive, "screens"), "warn");
+        outputs(r#"{"id":"main"}"#);
+        assert_eq!(level(alive, "screens"), "ok");
+        // Disk: amber below the warn level, red only below the floor.
+        std::fs::write(dir.join("recording.json"), r#"{"version":1,"warnFreeGb":1000000}"#).unwrap();
+        assert_eq!(level(alive, "disk"), "warn", "the temp disk has more than 2 GB but less than a petabyte");
+        // Unreadable recording settings: said plainly, never a silent check of the default folder.
+        std::fs::write(dir.join("recording.json"), "{").unwrap();
+        let disk = checks(&dir, alive).into_iter().find(|c| c.id == "disk").unwrap();
+        assert!(disk.level == "warn" && disk.message.contains("can't be read"), "{disk:?}");
     }
 
     #[test]
     fn a_test_that_works_is_saved_and_used_when_the_next_one_cant_run() {
         let dir = temp("fallback");
         std::fs::write(dir.join("stream.json"), TWO).unwrap();
-        let p = run(&dir, &fake_endpoint(20_000), Arc::new(AtomicBool::new(false)));
+        let p = run(&dir, &fake_endpoint(20_000), Arc::new(AtomicBool::new(false)), Live::default());
         assert_eq!((p.status, p.measured), ("done", Some(true)), "{p:?}");
         let saved = load_saved(&dir).expect("saved");
 
         // The endpoint is gone (no internet): the last speed, said plainly.
-        let p = run(&dir, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)));
+        let p = run(&dir, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)), Live::default());
         assert_eq!((p.status, p.measured, p.measured_at), ("done", Some(false), Some(saved.measured_at)));
         assert!(p.message.unwrap().contains("last speed measured"));
         assert!(!p.summary.is_empty());
 
         // Nothing measured ever: it fails, in words.
         let fresh = temp("never");
-        let p = run(&fresh, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)));
+        let p = run(&fresh, "http://127.0.0.1:9/api/upload-test", Arc::new(AtomicBool::new(false)), Live::default());
         assert_eq!(p.status, "failed");
         assert_eq!(p.message.as_deref(), Some("Couldn't test the upload: check the internet connection."));
     }
@@ -509,8 +587,9 @@ pub(crate) mod tests {
             stop.store(true, Ordering::Relaxed);
         });
         let started = Instant::now();
-        let p = run(&dir, &fake_endpoint(2_000), cancel);
+        let p = run(&dir, &fake_endpoint(2_000), cancel, Live::default());
         assert_eq!(p.status, "failed");
+        assert_eq!(p.stopped, Some(true));
         assert!(p.message.unwrap().contains("the stream started"));
         assert!(started.elapsed() < Duration::from_secs(3), "stopped promptly: {:?}", started.elapsed());
         assert!(load_saved(&dir).is_none(), "a stopped test isn't a measurement");

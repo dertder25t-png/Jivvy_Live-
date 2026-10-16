@@ -23,6 +23,8 @@ const OFFLINE_FIX = "Check the internet connection, then run the check again. Th
 
 function uploadRow(p: Preflight): Row {
   const label = "Internet upload";
+  if (p.stopped)
+    return { id: "upload", level: "warn", label, message: "Not checked: the stream started during the test. Run it again after the stream." };
   if (p.status === "failed" || p.uploadKbps === undefined)
     return { id: "upload", level: "warn", label, message: p.message || "Couldn't test the upload.", fix: OFFLINE_FIX };
   if (p.measured) return { id: "upload", level: "ok", label, message: `${mbps(p.uploadKbps)} up, measured just now.` };
@@ -62,7 +64,8 @@ export function rows(p: Preflight): Row[] {
 export const overall = (list: Row[]): PreflightLevel =>
   list.some((r) => r.level === "bad") ? "bad" : list.some((r) => r.level === "warn") ? "warn" : "ok";
 
-export const headline = (list: Row[]): string => {
+export const headline = (list: Row[], p?: Preflight): string => {
+  if (p?.stopped) return "Stopped: the stream started. Nothing is wrong; run it again after the stream.";
   const red = list.filter((r) => r.level === "bad").length;
   const amber = list.filter((r) => r.level === "warn").length;
   if (red) return `${red} to fix before the service${amber ? `, ${amber} worth a look` : ""}.`;

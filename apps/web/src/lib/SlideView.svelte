@@ -8,6 +8,20 @@
    * then its lines. Fills the screen box it is placed in, which must be positioned.
    */
   let { slide, theme }: { slide: Slide; theme: Theme } = $props();
+
+  let text = $state<HTMLElement>();
+  // A big size or many lines is shrunk until everything fits, never cut off (as the output windows do).
+  $effect(() => {
+    void [slide, theme];
+    const el = text;
+    if (!el) return;
+    el.style.fontSize = "";
+    let size = parseFloat(getComputedStyle(el).fontSize);
+    while ((el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth) && size > 1) {
+      size *= 0.92;
+      el.style.fontSize = `${size}px`;
+    }
+  });
 </script>
 
 <div class="themed" style={themeStyle(theme)}>
@@ -16,7 +30,7 @@
   {:else if theme.background.kind === "image"}
     <Thumb id={theme.background.image} fill />
   {/if}
-  <div class="text">
+  <div class="text" bind:this={text}>
     {#each slide.lines as line, i (i)}<div class="line">{line}</div>{/each}
     {#if slide.countdownTo}<div class="note">Countdown</div>{/if}
   </div>

@@ -28,6 +28,8 @@ describe("themes", () => {
     const doc = { kind: "theme", id: "n", title: "", rev: 1, updatedAt: 1 };
     expect(themeFromDoc({ ...doc, body: { ...themeBody(theme), v: 2 } })).toBeNull();
     expect(themeFromDoc({ ...doc, body: { ...themeBody(theme), text: "red" } })).toBeNull();
+    expect(themeFromDoc({ ...doc, body: { ...themeBody(theme), bold: "yes" } })).toBeNull();
+    expect(themeFromDoc({ ...doc, body: { ...themeBody(theme), shadow: 1 } })).toBeNull();
     // The theme in use is a setting every device reads.
     await saveDoc(conn, { kind: "setting", id: ACTIVE_THEME_ID, title: "Active theme", body: activeBody("mine") });
     expect(activeFromDoc(await getDoc(conn, "setting", ACTIVE_THEME_ID))).toBe("mine");

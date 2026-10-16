@@ -84,7 +84,8 @@ export function themeFromDoc(doc: Doc): Theme | null {
   if (bg.kind === "color") background = { kind: "color", color: bg.color };
   else if (bg.kind === "image" && typeof bg.image === "string" && bg.image) background = { kind: "image", image: bg.image, color: bg.color };
   else return null;
-  return { v: 1, font: b.font as Font, bold: b.bold === true, size: b.size, text: b.text, shadow: b.shadow === true, background };
+  if (typeof b.bold !== "boolean" || typeof b.shadow !== "boolean") return null;
+  return { v: 1, font: b.font as Font, bold: b.bold, size: b.size, text: b.text, shadow: b.shadow, background };
 }
 
 /** The theme as a document body, to save. */

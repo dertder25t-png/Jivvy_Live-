@@ -2,7 +2,9 @@
   import { runSheetSlides, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
   import { onDestroy, onMount } from "svelte";
   import { DaemonConnection, type Status } from "$lib/daemon";
-  import { build, newId, newItem, type Draft, type ItemKind } from "$lib/runsheet";
+  import { addImage, upload } from "$lib/media";
+  import { build, imagesIn, newId, newItem, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
+  import Thumb from "$lib/Thumb.svelte";
 
   const DRAFT_KEY = "jivvy.draft";
   const ADDRESS_KEY = "jivvy.address";
@@ -11,6 +13,7 @@
     { kind: "scripture", label: "Scripture" },
     { kind: "countdown", label: "Countdown" },
     { kind: "loop", label: "Pre-service loop" },
+    { kind: "image", label: "Images" },
     { kind: "text", label: "Text" },
   ];
 
@@ -38,6 +41,7 @@
   let live = $state<StateSnapshot | null>(null);
   let onScreens = $state<RunSheet | null>(null);
   let sendError = $state("");
+  let sending = $state("");
   let conn: DaemonConnection | null = null;
 
   $effect(() => store(DRAFT_KEY, draft));
@@ -71,14 +75,42 @@
   });
   onDestroy(() => conn?.close());
 
+  /** One send at a time: a second one mid-upload would restart the same images and race the first. */
+  let inFlight = $state(false);
   async function send() {
-    if (!conn) return;
+    if (!conn || inFlight) return;
+    inFlight = true;
     sendError = "";
-    // Built now, not the copy kept for the editor: a countdown whose time has passed while
-    // the page was open counts down to the next one, not to a moment already gone.
-    builtAt = new Date();
-    const ack = await conn.send({ type: "runsheet.set", runSheet: build(draft, builtAt) });
-    if (!ack.ok) sendError = ack.message;
+    try {
+      // Built now, not the copy kept for the editor: a countdown whose time has passed while
+      // the page was open counts down to the next one, not to a moment already gone.
+      builtAt = new Date();
+      const sheet = build(draft, builtAt);
+      // Images first: the church computer refuses a run sheet showing one it doesn't have.
+      const failed = await upload(conn, imagesIn(sheet), (done, total) => {
+        sending = total ? `Sending images ${done} of ${total}…` : "";
+      });
+      if (failed) return void (sendError = failed);
+      const ack = await conn.send({ type: "runsheet.set", runSheet: sheet });
+      if (!ack.ok) sendError = ack.message;
+    } finally {
+      sending = "";
+      inFlight = false;
+    }
+  }
+
+  let adding = $state("");
+  async function addImages(item: DraftItem, files: FileList | null) {
+    sendError = "";
+    for (const [n, file] of [...(files ?? [])].entries()) {
+      adding = `Adding ${n + 1} of ${files?.length}…`;
+      try {
+        item.images = [...(item.images ?? []), await addImage(file)];
+      } catch (e) {
+        sendError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    adding = "";
   }
 
   const go = (type: "slide.next" | "slide.prev") => conn?.send({ type });
@@ -187,7 +219,34 @@
           >
           <button class="icon" onclick={() => remove(i)} aria-label="Remove">✕</button>
         </div>
-        {#if item.kind === "countdown"}
+        {#if item.kind === "image"}
+          <div class="thumbs">
+            {#each item.images ?? [] as image, n (n)}
+              <div class="thumb">
+                <Thumb id={image} />
+                <button
+                  class="icon remove"
+                  aria-label="Remove image"
+                  onclick={() => (item.images = item.images?.filter((_, k) => k !== n))}>✕</button
+                >
+              </div>
+            {/each}
+          </div>
+          <label class="pick">
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              onchange={(e) => {
+                const input = e.currentTarget;
+                void addImages(item, input.files).then(() => (input.value = ""));
+              }}
+            />
+            + Add pictures
+          </label>
+          {#if adding}<span class="hint">{adding}</span>{/if}
+          <p class="hint">Each picture is one slide, shown filling the screen.</p>
+        {:else if item.kind === "countdown"}
           <div class="row">
             <label>Text <input bind:value={item.text} maxlength="200" /></label>
             <label>Counts down to <input type="time" bind:value={item.at} /></label>
@@ -225,9 +284,10 @@
     </div>
 
     <div class="send">
-      <button class="primary" onclick={send} disabled={!ready}>Send to screens</button>
+      <button class="primary" onclick={send} disabled={!ready || inFlight}>Send to screens</button>
       <span class="hint">
         {#if !ready}Connect to send.
+        {:else if sending}{sending}
         {:else if sendError}{sendError}
         {:else if unsent}Changes not on the screens yet.
         {:else}On the screens.{/if}
@@ -240,7 +300,8 @@
       {#if live?.black}
         <span class="note">Screens are black</span>
       {:else if live?.slide}
-        {#each live.slide.lines as line, i (i)}<div>{line}</div>{/each}
+        {#if live.slide.image}<Thumb id={live.slide.image} fill />{/if}
+        {#each live.slide.lines as line, i (i)}<div class="over">{line}</div>{/each}
         {#if live.slide.countdownTo}<div class="note">Countdown</div>{/if}
       {:else if live}
         <span class="note">Slide {live.slideIndex + 1}</span>
@@ -268,7 +329,7 @@
           {/if}
           <li>
             <button class="slide" class:current={i === current} onclick={() => goto(i)} disabled={!ready}>
-              {s.slide.lines.join(" / ") || "(blank)"}
+              {s.slide.lines.join(" / ") || (s.slide.image ? "(picture)" : "(blank)")}
             </button>
           </li>
         {/each}
@@ -491,6 +552,46 @@
     padding: 12px 0;
     background: var(--paper);
   }
+  .thumbs {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .thumb {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .thumb .remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: rgba(16, 34, 79, 0.75);
+    color: #fff;
+    border-radius: 4px;
+  }
+  .pick {
+    display: inline-block;
+    border: 1px dashed var(--line);
+    border-radius: 6px;
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  .pick input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+  }
+  .pick:focus-within {
+    outline: 2px solid var(--blue);
+  }
+  .over {
+    position: relative;
+    text-shadow: 0 0 0.25em #000;
+  }
   .screen {
     aspect-ratio: 16 / 9;
     background: #000;
@@ -506,6 +607,8 @@
     line-height: 1.25;
     padding: 0 6%;
     border: 3px solid var(--navy);
+    position: relative;
+    overflow: hidden;
   }
   .screen.black {
     border-color: var(--orange);

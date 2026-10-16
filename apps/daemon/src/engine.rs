@@ -97,6 +97,8 @@ fn device_may(command: &Command) -> bool {
             | Command::StreamPreflight
             | Command::RunSheetSet { .. }
             | Command::RunSheetGet
+            | Command::MediaPut { .. }
+            | Command::MediaHas { .. }
     )
 }
 
@@ -116,6 +118,14 @@ pub struct Engine {
     slide_count: u64,
     /// The run sheet and its revision, saved in `runsheet.json`.
     run_sheet: Option<crate::runsheet::Saved>,
+    /// Images arriving in pieces.
+    uploads: crate::images::Uploads,
+    /// The latest clean-up of unused images, running on its own thread.
+    pruning: Option<std::thread::JoinHandle<()>>,
+    /// Images no clean-up may delete: what the run sheet shows, plus every image a device has
+    /// sent, asked about or named since. Each clean-up checks it just before each delete, so
+    /// an older one still running can never remove an image a newer run sheet shows.
+    protected: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
     subscribers: Vec<Outbox>,
@@ -168,11 +178,14 @@ impl Engine {
             crate::log("engine", format!("can't save the daemon id ({e}); using a temporary one"));
             devices::random_id(16)
         });
-        Engine {
+        let mut engine = Engine {
             state,
             store,
             slide_count: slide_count.max(1),
             run_sheet,
+            uploads: Default::default(),
+            pruning: None,
+            protected: Default::default(),
             shown_since: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
@@ -189,7 +202,10 @@ impl Engine {
             stream_destinations: Vec::new(),
             recording_report: None,
             last_sent: None,
-        }
+        };
+        // Left from before a crash: images no run sheet shows, pieces of uploads that stopped.
+        engine.prune_images();
+        engine
     }
 
     pub fn state(&self) -> &Snapshot {
@@ -369,6 +385,15 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
+            Command::MediaPut { id: media, offset, data, last } => {
+                return self.media_put(id, &media, offset, &data, last);
+            }
+            Command::MediaHas { ids } => {
+                // A device skips sending what is here, so it has to stay until the run sheet.
+                self.protect(ids.iter().cloned());
+                let missing = ids.into_iter().filter(|m| !crate::images::has(self.store.dir(), m)).collect();
+                return protocol::ack_with(id, None, AckExtras { missing: Some(missing), ..Default::default() });
+            }
             Command::SlideNext => {
                 let target = self.next_slide();
                 next.slide_index = target.min(self.slide_count() - 1);
@@ -529,7 +554,55 @@ impl Engine {
 
     /// Saves the new run sheet, then moves to its first slide (another run sheet) or stays on
     /// the current one (an edit of this one, clamped to its end), and tells every screen.
+    /// One piece of an image from a device (see `images::put`).
+    fn media_put(&mut self, id: &str, media: &str, offset: u64, data: &str, last: bool) -> Ack {
+        use base64::Engine as _;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+            return protocol::nack(id, ErrorCode::BadArguments, "media.put data isn't base64");
+        };
+        if bytes.len() > protocol::MEDIA_CHUNK_BYTES {
+            return protocol::nack(id, ErrorCode::BadArguments, "media.put piece too big");
+        }
+        self.protect([media.to_string()]);
+        match crate::images::put(&mut self.uploads, self.store.dir(), media, offset, &bytes, last) {
+            Ok(progress) => {
+                if progress.complete && last {
+                    crate::log("engine", format!("image {} received ({} bytes)", &media[..12], progress.received));
+                }
+                protocol::ack_with(id, None, AckExtras { media: Some(progress), ..Default::default() })
+            }
+            Err(crate::images::PutError::Offset(have)) => {
+                protocol::nack(id, ErrorCode::BadArguments, format!("send this image from offset {have}"))
+            }
+            Err(crate::images::PutError::TooBig) => protocol::nack(
+                id,
+                ErrorCode::BadArguments,
+                format!("images can be at most {} MB", protocol::MAX_MEDIA_BYTES / (1024 * 1024)),
+            ),
+            Err(crate::images::PutError::Corrupt(why)) => protocol::nack(id, ErrorCode::BadArguments, why),
+            Err(crate::images::PutError::Full) => protocol::nack(
+                id,
+                ErrorCode::Unavailable,
+                "the church computer's picture storage is full (2 GB); send a run sheet without old pictures first",
+            ),
+            Err(crate::images::PutError::Io(e)) => {
+                crate::log("engine", format!("image save failed: {e}"));
+                protocol::nack(id, ErrorCode::Unavailable, "could not save the image; try again")
+            }
+        }
+    }
+
     fn set_run_sheet(&mut self, id: &str, run_sheet: protocol::RunSheet) -> Ack {
+        // Protected before the check, so no clean-up still running removes one after it.
+        self.protect(run_sheet.slides().filter_map(|s| s.image.clone()));
+        // Every image must already be here: a slide never shows something the screens can't load.
+        if let Some(image) =
+            run_sheet.slides().filter_map(|s| s.image.as_deref()).find(|i| !crate::images::has(self.store.dir(), i))
+        {
+            let message =
+                format!("the church computer doesn't have image {} yet; send it with media.put first", &image[..12]);
+            return protocol::nack(id, ErrorCode::BadArguments, message);
+        }
         let same = self.run_sheet.as_ref().is_some_and(|s| s.run_sheet.id == run_sheet.id);
         let rev = self.run_sheet.as_ref().map_or(1, |s| s.rev + 1);
         let saved = crate::runsheet::Saved { version: 1, rev, run_sheet };
@@ -557,7 +630,39 @@ impl Engine {
             self.state = next;
         }
         self.broadcast();
+        self.prune_images();
         protocol::ack(id, Some(self.view()))
+    }
+
+    /// Keeps only the images the run sheet shows (and uploads arriving now), so the folder
+    /// never grows week after week.
+    /// Runs on its own thread: deleting many files must never hold the engine's lock (the
+    /// heartbeat waits on it).
+    fn prune_images(&mut self) {
+        let keep: std::collections::HashSet<String> =
+            self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.clone()).collect();
+        let (dir, arriving) = (self.store.dir().to_path_buf(), self.uploads.ids());
+        // From now on only these are protected, plus whatever devices send or name next.
+        *self.protected.lock().unwrap_or_else(|p| p.into_inner()) = keep.union(&arriving).cloned().collect();
+        let protected = self.protected.clone();
+        self.pruning = Some(std::thread::spawn(move || {
+            let removed = crate::images::prune(&dir, &protected, &arriving);
+            if removed > 0 {
+                crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
+            }
+        }));
+    }
+
+    fn protect(&self, ids: impl IntoIterator<Item = String>) {
+        self.protected.lock().unwrap_or_else(|p| p.into_inner()).extend(ids);
+    }
+
+    /// Tests: waits for the latest clean-up to finish.
+    #[cfg(test)]
+    fn wait_for_pruning(&mut self) {
+        if let Some(t) = self.pruning.take() {
+            t.join().unwrap();
+        }
     }
 
     /// A connection ended: its pairing request and proof go with it.
@@ -1199,6 +1304,45 @@ mod tests {
         e.tick_at(t0);
         e.tick_at(t0 + Duration::from_secs(5));
         assert_eq!(e.view().slide_index, 1, "the new run sheet's loop runs");
+    }
+
+    #[test]
+    fn an_image_sent_in_pieces_can_be_shown_on_a_slide() {
+        use base64::Engine as _;
+        let (mut e, dir) = engine("image", 100);
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend(std::iter::repeat_n(7u8, 300_000));
+        let id: String =
+            ring::digest::digest(&ring::digest::SHA256, &png).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let sheet = json!({ "id": "img", "title": "", "items": [
+            { "id": "i", "kind": "image", "title": "", "slides": [{ "lines": [], "image": id }] },
+        ] });
+        let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        assert_eq!(r["code"], "bad_arguments", "refused until the image is here");
+        assert_eq!(send(&mut e, json!({ "type": "media.has", "ids": [id] }))["missing"], json!([id]));
+
+        let (a, b) = png.split_at(200_000);
+        let r = send(&mut e, json!({ "type": "media.put", "id": id, "offset": 0, "data": b64(a), "last": false }));
+        assert_eq!(r["media"], json!({ "id": id, "received": 200_000, "complete": false }));
+        let r = send(&mut e, json!({ "type": "media.put", "id": id, "offset": 200_000, "data": b64(b), "last": true }));
+        assert_eq!(r["media"]["complete"], true);
+        assert_eq!(std::fs::read(crate::images::path(&dir, &id)).unwrap(), png);
+        assert_eq!(send(&mut e, json!({ "type": "media.has", "ids": [id] }))["missing"], json!([]));
+
+        let r = send(&mut e, json!({ "type": "runsheet.set", "runSheet": sheet }));
+        assert_eq!(r["state"]["slide"], json!({ "lines": [], "image": id }));
+        // A clean-up started for an earlier run sheet (which didn't show it) and still running
+        // checks what is protected now, so it leaves the image this run sheet shows.
+        e.wait_for_pruning();
+        assert_eq!(crate::images::prune(&dir, &e.protected, &Default::default()), 0);
+        assert!(crate::images::has(&dir, &id));
+
+        // The next run sheet doesn't show it: the church computer doesn't keep it.
+        let next = json!({ "id": "next", "title": "", "items": [] });
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": next }));
+        e.wait_for_pruning();
+        assert!(!crate::images::has(&dir, &id));
     }
 
     #[test]

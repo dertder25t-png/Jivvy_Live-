@@ -160,10 +160,30 @@ mod ui {
         }
     }
 
+    /// Where the page loads slide images from: the `media` custom protocol, which wry names
+    /// differently per platform.
+    #[cfg(windows)]
+    const MEDIA_BASE: &str = "http://media.localhost/";
+    #[cfg(not(windows))]
+    const MEDIA_BASE: &str = "media://localhost/";
+
+    /// Serves `<MEDIA_BASE><id>` from the images on this computer, and nothing else.
+    fn media_response(data_dir: &std::path::Path, path: &str) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
+        match jivvy_daemon::images::serve(data_dir, path) {
+            Some((kind, bytes)) => wry::http::Response::builder()
+                .header("Content-Type", kind)
+                .header("Cache-Control", "max-age=31536000, immutable")
+                .body(bytes.into()),
+            None => wry::http::Response::builder().status(404).body(Vec::new().into()),
+        }
+        .unwrap_or_else(|_| wry::http::Response::new(Vec::new().into()))
+    }
+
     fn open(
         target: &EventLoopWindowTarget<UserEvent>,
         p: &Placement,
         proxy: &EventLoopProxy<UserEvent>,
+        data_dir: &std::path::Path,
     ) -> Result<OutputWindow, String> {
         let monitor = target
             .available_monitors()
@@ -190,7 +210,14 @@ mod ui {
         let (id, proxy) = (p.id.clone(), proxy.clone());
         let webview = WebViewBuilder::new()
             .with_background_color((0, 0, 0, 255))
-            .with_initialization_script(format!("window.__jivvyCanvas = {canvas};"))
+            .with_initialization_script(format!(
+                "window.__jivvyCanvas = {canvas}; window.__jivvyMedia = {};",
+                serde_json::json!(MEDIA_BASE)
+            ))
+            .with_custom_protocol("media".into(), {
+                let data_dir = data_dir.to_path_buf();
+                move |_, req| media_response(&data_dir, req.uri().path())
+            })
             .with_html(OUTPUT_HTML)
             .with_ipc_handler(move |req| {
                 if req.body() == "ready" {
@@ -221,11 +248,12 @@ mod ui {
             }
             keep
         });
+        let data_dir = model.dir().to_path_buf();
         for p in model.placements.clone() {
             if windows.contains_key(&p.id) {
                 continue;
             }
-            match open(target, &p, proxy) {
+            match open(target, &p, proxy, &data_dir) {
                 Ok(w) => {
                     log(
                         "outputs",

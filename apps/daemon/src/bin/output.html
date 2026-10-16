@@ -11,6 +11,9 @@
   #slide { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; align-items: center; justify-content: center;
            padding: 0 6%; color: #fff; font-family: "Segoe UI", system-ui, sans-serif; font-weight: 700; text-align: center;
            line-height: 1.2; overflow-wrap: anywhere; }
+  /* An image slide fills the canvas, letterboxed; any text sits over it with a shadow. */
+  #image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #image:not(.hidden) ~ #slide { text-shadow: 0 0 .25em #000, 0 .05em .1em #000; }
   #clock { font-variant-numeric: tabular-nums; margin-top: .3em; font-size: 1.6em; }
   #ident { position: absolute; left: 4%; bottom: 4%; color: rgba(244, 241, 234, .55);
            font-family: Consolas, ui-monospace, monospace; letter-spacing: .08em; }
@@ -19,12 +22,13 @@
 </style>
 </head>
 <body>
-<div id="stage"><div id="slide" class="hidden"></div><div id="ident"></div></div>
+<div id="stage"><img id="image" class="hidden" alt=""><div id="slide" class="hidden"></div><div id="ident"></div></div>
 <script>
   "use strict";
   const stage = document.getElementById("stage");
   const slide = document.getElementById("slide");
   const ident = document.getElementById("ident");
+  const image = document.getElementById("image");
   const canvas = window.__jivvyCanvas || { w: 1920, h: 1080, label: "" };
 
   // The slide's text at 9% of the canvas height, smaller if that's what it takes for every
@@ -81,6 +85,15 @@
         slide.append(clock);
         tick();
       }
+      // Images come from this computer (see media_response in outputs.rs), never the network.
+      const img = !state.black && state.slide && state.slide.image;
+      if (img) {
+        const src = (window.__jivvyMedia || "") + img;
+        if (image.getAttribute("src") !== src) image.setAttribute("src", src);
+      } else {
+        image.removeAttribute("src");
+      }
+      image.classList.toggle("hidden", !img);
       slide.classList.toggle("hidden", state.black);
       fitText();
     },

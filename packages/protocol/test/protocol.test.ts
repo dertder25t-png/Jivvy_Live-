@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type StreamDestination } from "../src/index";
+import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type StreamDestination, type StateSnapshot } from "../src/index";
 import fixtures from "../fixtures/parse-cases.json";
 import alertFixtures from "../fixtures/stream-alerts.json";
 import preflightFixtures from "../fixtures/preflight-summary.json";
+import stateTheme from "../fixtures/state-theme.json";
 
 type Case = { name: string; input: string; expect: { ok: boolean; command?: unknown; code?: string; id?: string } };
 const cases = fixtures.cases as Case[];
@@ -87,5 +88,14 @@ describe("dispatch", () => {
     expect(await dispatch(daemon, "oops")).toMatchObject({ ok: false, code: "bad_message" });
     const boom: DaemonLike = { handle: () => { throw new Error("x"); } };
     expect(await dispatch(boom, makeEnvelope({ type: "slide.next" }, { id: "y" }))).toMatchObject({ ok: false, id: "y" });
+  });
+});
+
+describe("state with a theme (the same fixture is read by the Rust daemon)", () => {
+  it("carries the theme body as given, and a state without one is still a state", () => {
+    const withTheme = stateTheme.state as unknown as StateSnapshot;
+    expect(withTheme.theme?.font).toBe("serif");
+    const plain: StateSnapshot = { slideIndex: 0, black: false, stream: "off" };
+    expect(plain.theme).toBeUndefined();
   });
 });

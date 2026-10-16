@@ -279,6 +279,7 @@ mod tests {
             stream_wanted: false,
             recording_wanted: false,
             slide: None,
+            theme: None,
         });
         m.write_status().unwrap();
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(STATUS_FILE)).unwrap()).unwrap();

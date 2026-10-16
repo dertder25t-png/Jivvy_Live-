@@ -135,6 +135,9 @@ pub struct Engine {
     /// Songs, plans, themes and settings (`library.sqlite3`); None if it couldn't be opened,
     /// which never stops a service: the doc commands answer `unavailable`.
     library: Option<crate::library::Library>,
+    /// The body of the active theme (the "active-theme" setting names it), read from the library
+    /// whenever a theme or setting is saved; screens get it in the state.
+    theme: Option<serde_json::Value>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -198,6 +201,7 @@ impl Engine {
             protected: Default::default(),
             shown_since: None,
             library,
+            theme: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -214,6 +218,7 @@ impl Engine {
             recording_report: None,
             last_sent: None,
         };
+        engine.refresh_theme();
         // Left from before a crash: images no run sheet shows, pieces of uploads that stopped.
         engine.prune_images();
         engine
@@ -274,6 +279,24 @@ impl Engine {
                 .run_sheet
                 .as_ref()
                 .map(|s| s.run_sheet.slides().nth(self.state.slide_index as usize).cloned().unwrap_or_default()),
+            theme: self.theme.clone(),
+        }
+    }
+
+    /// Reads the active theme from the library: the "active-theme" setting names a "theme"
+    /// document, whose body is sent to the screens as it is. None if either is missing or the
+    /// theme isn't valid; a library read that fails keeps the theme already in use.
+    fn refresh_theme(&mut self) {
+        let Some(lib) = self.library.as_ref() else { return };
+        let read = || -> Result<Option<serde_json::Value>, crate::library::Error> {
+            let Some(active) = lib.get("setting", "active-theme")? else { return Ok(None) };
+            let Some(id) = active.body.get("themeId").and_then(|v| v.as_str()) else { return Ok(None) };
+            let Some(doc) = lib.get("theme", id)? else { return Ok(None) };
+            Ok(valid_theme(&doc.body).then_some(serde_json::Value::Object(doc.body)))
+        };
+        match read() {
+            Ok(found) => self.theme = found,
+            Err(e) => crate::log("engine", format!("library: can't read the theme, keeping the last one: {e:?}")),
         }
     }
 
@@ -912,6 +935,13 @@ impl Engine {
             _ => unreachable!("only doc commands come here"),
         };
         let (saved, deleted) = changed;
+        if saved.kind == "theme" || saved.kind == "setting" {
+            let before = self.theme.clone();
+            self.refresh_theme();
+            if self.theme != before {
+                self.broadcast();
+            }
+        }
         if let Ok(line) = serde_json::to_vec(&protocol::doc_changed_event(&saved, deleted)) {
             self.send_to_subscribers(line);
         }
@@ -950,6 +980,31 @@ impl Engine {
 }
 
 /// One event to one connection, if it can receive events; never blocks.
+/// The same checks as `themeFromDoc` (apps/web/src/lib/theme.ts), and a small size cap: a theme
+/// that fails them is not sent to the screens, which then draw as they always did.
+fn valid_theme(b: &serde_json::Map<String, serde_json::Value>) -> bool {
+    use serde_json::Value;
+    let color = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|c| c.is_ascii_hexdigit()))
+    };
+    let Some(Value::Object(bg)) = b.get("background") else { return false };
+    let background = match bg.get("kind").and_then(Value::as_str) {
+        Some("color") => true,
+        Some("image") => bg.get("image").and_then(Value::as_str).is_some_and(|s| !s.is_empty()),
+        _ => false,
+    };
+    b.get("v") == Some(&Value::from(1))
+        && serde_json::to_string(b).is_ok_and(|s| s.len() <= 4096)
+        && b.get("font").and_then(Value::as_str).is_some_and(|f| ["sans", "serif", "mono"].contains(&f))
+        && b.get("size").and_then(Value::as_f64).is_some_and(|n| (2.0..=20.0).contains(&n))
+        && b.get("bold").is_some_and(Value::is_boolean)
+        && b.get("shadow").is_some_and(Value::is_boolean)
+        && color(b.get("text"))
+        && color(bg.get("color"))
+        && background
+}
+
 fn send_event(outbox: Option<&Outbox>, event: &impl serde::Serialize) {
     if let (Some(o), Ok(mut line)) = (outbox, serde_json::to_vec(event)) {
         line.push(b'\n');
@@ -1284,6 +1339,26 @@ mod tests {
     fn send(e: &mut Engine, command: Value) -> Value {
         let msg = json!({ "v": 1, "id": "t", "ts": 1, "command": command }).to_string();
         serde_json::to_value(e.handle_line(&msg)).unwrap()
+    }
+
+    #[test]
+    fn the_state_carries_the_active_theme_once_the_setting_and_theme_are_saved() {
+        let (mut e, _dir) = engine("theme", 10);
+        assert_eq!(e.view().theme, None);
+        let theme = json!({ "v": 1, "font": "serif", "bold": false, "size": 7, "text": "#10224F", "shadow": false,
+            "background": { "kind": "color", "color": "#F4F1EA" } });
+        send(&mut e, json!({ "type": "doc.put", "kind": "theme", "id": "paper", "title": "Paper", "body": theme }));
+        send(
+            &mut e,
+            json!({ "type": "doc.put", "kind": "setting", "id": "active-theme", "title": "Active theme",
+                "body": { "v": 1, "themeId": "paper" } }),
+        );
+        assert_eq!(e.view().theme, Some(theme.clone()));
+        // A theme that fails the checks (a color that isn't #RRGGBB) is not sent.
+        let bad = json!({ "v": 1, "font": "serif", "bold": false, "size": 7, "text": "red", "shadow": false,
+            "background": { "kind": "color", "color": "#F4F1EA" } });
+        send(&mut e, json!({ "type": "doc.put", "kind": "theme", "id": "paper", "title": "Paper", "body": bad }));
+        assert_eq!(e.view().theme, None);
     }
 
     #[test]

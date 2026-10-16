@@ -32,11 +32,12 @@ path = "src/bin/video/main.rs"
 required-features = ["video"]
 
 [features]
-# The HTTP client is for YouTube's HLS segment upload.
-video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:ureq"]
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
 ab_glyph = "0.2"
+# Device keys: base64url on the wire, P-256 signatures checked with ring (already used by rustls).
+base64 = "0.22"
 fs4 = "1.1.0"
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
@@ -44,12 +45,21 @@ gstreamer-video = { version = "0.25", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tao = "0.37"
-# The command channel over WebSocket (same envelopes as the TCP one); TLS comes with the certificate.
+# TLS for the WebSocket channel (wss) with the church's certificate; ring, already used by ureq.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+# The library (songs, plans, themes, settings): SQLite compiled in, nothing to install.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# The command channel over WebSocket (same envelopes as the TCP one).
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
-ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
+# HTTP: YouTube's HLS segment upload, and the pre-flight upload test.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 wry = "0.57"
 
 [dev-dependencies]
+# Test certificates for the wss tests.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 socket2 = "0.6"
 
 # The chaos tests put themselves in a job object so a killed test run can't leave daemons behind.

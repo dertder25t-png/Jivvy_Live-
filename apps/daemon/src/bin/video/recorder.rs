@@ -64,7 +64,7 @@ impl Recorder {
 /// restart). Until then nothing is started and nothing is closed, so a restarted process
 /// carries on in the set it was recording.
 fn wanted(feed: &Feed) -> Option<bool> {
-    feed.live.lock().unwrap().map(|s| s.recording_wanted)
+    feed.live.lock().unwrap().as_ref().map(|s| s.recording_wanted)
 }
 
 /// `recording.json`, re-read once a second, and the disk it points at.

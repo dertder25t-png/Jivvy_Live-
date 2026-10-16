@@ -25,6 +25,14 @@ pub struct Snapshot {
     /// set of files. Missing in files saved by an older daemon, which means off.
     #[serde(default)]
     pub recording_wanted: bool,
+    /// The run sheet `slide_index` counts in. On start, a different run sheet on disk (a crash
+    /// between saving a new run sheet and this file) starts on its first slide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_sheet_id: Option<String>,
+    /// Next was pressed on a pre-service loop at the end of the run sheet: it stays on this
+    /// slide, even across a restart, until the slide changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_stopped: bool,
     pub saved_at: u64,
 }
 
@@ -36,6 +44,8 @@ impl Default for Snapshot {
             black: false,
             stream_wanted: false,
             recording_wanted: false,
+            run_sheet_id: None,
+            loop_stopped: false,
             saved_at: 0,
         }
     }
@@ -54,6 +64,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// The data folder the snapshot lives in.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     pub fn new(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;

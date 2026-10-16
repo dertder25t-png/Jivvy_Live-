@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// The part of the engine's state a screen needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveState {
     pub slide_index: u64,
@@ -21,9 +21,12 @@ pub struct LiveState {
     /// The operator asked for the recording to be on. Older engines don't send it.
     #[serde(default)]
     pub recording_wanted: bool,
+    /// The run sheet's slide on screen; engines without a run sheet (or older ones) leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide: Option<crate::protocol::Slide>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {
     Connected,
     Disconnected,
@@ -99,9 +102,10 @@ impl LevelsSender {
         self.command(serde_json::json!({ "type": "media.levels", "peakDb": peak_db, "rmsDb": rms_db }));
     }
 
-    /// Queues a stream status report ("off", "live" or "reconnecting").
-    pub fn report_stream(&self, status: &str) {
-        self.command(serde_json::json!({ "type": "stream.report", "status": status }));
+    /// Queues a stream status report ("off", "live" or "reconnecting") with each platform's
+    /// state and quality, which the engine turns into alerts when one is lowered or paused.
+    pub fn report_stream(&self, status: &str, destinations: &[crate::protocol::StreamDestination]) {
+        self.command(serde_json::json!({ "type": "stream.report", "status": status, "destinations": destinations }));
     }
 
     /// Queues a recording report: its status ("off", "recording" or "waiting") and whether
@@ -178,7 +182,10 @@ mod tests {
     #[test]
     fn reads_state_from_acks_and_events_and_ignores_the_rest() {
         let s = state_in(r#"{"v":1,"event":"state","state":{"slideIndex":4,"black":true,"stream":"off"}}"#);
-        assert_eq!(s, Some(LiveState { slide_index: 4, black: true, stream_wanted: false, recording_wanted: false }));
+        assert_eq!(
+            s,
+            Some(LiveState { slide_index: 4, black: true, stream_wanted: false, recording_wanted: false, slide: None })
+        );
         assert!(state_in(r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":0,"black":false}}"#).is_some());
         assert_eq!(state_in(r#"{"v":1,"event":"something.new"}"#), None);
         assert_eq!(state_in("garbage"), None);
@@ -249,12 +256,24 @@ mod tests {
         assert_eq!(next(), Update::Connected);
         assert_eq!(
             next(),
-            Update::State(LiveState { slide_index: 0, black: false, stream_wanted: false, recording_wanted: false })
+            Update::State(LiveState {
+                slide_index: 0,
+                black: false,
+                stream_wanted: false,
+                recording_wanted: false,
+                slide: None
+            })
         );
         engine.lock().unwrap().handle_line(r#"{"v":1,"id":"r","ts":1,"command":{"type":"slide.goto","index":7}}"#);
         assert_eq!(
             next(),
-            Update::State(LiveState { slide_index: 7, black: false, stream_wanted: false, recording_wanted: false })
+            Update::State(LiveState {
+                slide_index: 7,
+                black: false,
+                stream_wanted: false,
+                recording_wanted: false,
+                slide: None
+            })
         );
     }
 }

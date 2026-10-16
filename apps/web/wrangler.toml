@@ -1,0 +1,4 @@
+# app.jivvy.org on Cloudflare Pages: static files only, no Functions yet.
+name = "jivvy-app"
+pages_build_output_dir = "build"
+compatibility_date = "2026-10-01"

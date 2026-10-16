@@ -196,6 +196,11 @@ pub struct Model {
 }
 
 impl Model {
+    /// The data directory (images for slides live under it).
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Model {
             dir: dir.into(),
@@ -230,7 +235,7 @@ impl Model {
             monitors: self.monitors.clone(),
             outputs: self.placements.clone(),
             problems: self.problems.clone(),
-            shown: self.shown,
+            shown: self.shown.clone(),
         }
     }
 
@@ -268,7 +273,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         m.write_status().unwrap();
         assert_eq!(std::fs::metadata(dir.join(STATUS_FILE)).unwrap().modified().unwrap(), written);
-        m.shown = Some(LiveState { slide_index: 2, black: false, stream_wanted: false, recording_wanted: false });
+        m.shown = Some(LiveState {
+            slide_index: 2,
+            black: false,
+            stream_wanted: false,
+            recording_wanted: false,
+            slide: None,
+        });
         m.write_status().unwrap();
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(STATUS_FILE)).unwrap()).unwrap();
         assert_eq!(status["shown"]["slideIndex"], 2);

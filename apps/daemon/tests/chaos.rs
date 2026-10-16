@@ -603,6 +603,72 @@ fn jivvy_ctl_drives_a_running_daemon_in_one_line() {
     assert!(err.contains("unknown command"), "{err}");
 }
 
+/// A stand-in for the pre-flight upload-test endpoint: reads a chunked upload, answers how
+/// many bytes arrived, as live.jivvy.org/api/upload-test does.
+fn upload_test_endpoint() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut out = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let mut line = String::new();
+                while r.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    line.clear();
+                }
+                let mut total = 0usize;
+                loop {
+                    let mut size = String::new();
+                    if r.read_line(&mut size).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+                    let mut chunk = vec![0u8; n + 2];
+                    if std::io::Read::read_exact(&mut r, &mut chunk).is_err() {
+                        return;
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                let body = format!(r#"{{"ok":true,"bytes":{total}}}"#);
+                let _ = write!(out, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/api/upload-test")
+}
+
+#[test]
+fn preflight_from_jivvy_ctl_says_what_each_platform_will_get() {
+    let dir = test_dir("preflight");
+    std::fs::write(
+        dir.join("stream.json"),
+        r#"{"version":1,"destinations":[{"id":"youtube","name":"YouTube","url":"rtmps://h:443/live2","key":"k"},
+            {"id":"facebook","name":"Facebook","url":"rtmps://f:443/rtmp/","key":"k"}]}"#,
+    )
+    .unwrap();
+    let url = upload_test_endpoint();
+    let d = start_with(dir, 10, false, &["--no-video", "--upload-test-url", &url]);
+    d.next_engine_pid(Duration::from_secs(10));
+    let (code, out, err) = ctl(&["--connect", d.addr.as_str(), "preflight"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let result: Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    let p = &result["preflight"];
+    assert_eq!((p["status"].clone(), p["measured"].clone()), (json!("done"), json!(true)), "{out}");
+    // Loopback is fast: everyone at full quality.
+    assert_eq!(p["summary"], "YouTube 1080p + Facebook 1080p", "{p}");
+    assert!(d.data_dir.join("upload-speed.json").exists(), "the speed is kept for next time");
+
+    // Never while streaming.
+    d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+    let (code, out, _) = ctl(&["--connect", d.addr.as_str(), "preflight"]);
+    assert_eq!(code, 1);
+    assert!(out.contains("unavailable"), "{out}");
+}
+
 /// True if every field in `expected` is in `actual` with the same value (objects compared
 /// the same way, recursively): how the shared scenarios match an ack.
 fn contains(actual: &Value, expected: &Value) -> bool {
@@ -614,17 +680,103 @@ fn contains(actual: &Value, expected: &Value) -> bool {
 
 #[test]
 fn shared_scenarios_behave_the_same_on_the_real_daemon() {
-    run_shared_scenarios(false);
+    run_shared_scenarios(Channel::Tcp);
 }
 
 #[test]
 fn shared_scenarios_behave_the_same_over_the_websocket_channel() {
-    run_shared_scenarios(true);
+    run_shared_scenarios(Channel::Ws);
+}
+
+/// The same over `wss://`: the restarted engine serves the same certificate from its files.
+#[test]
+fn shared_scenarios_behave_the_same_over_the_secure_websocket_channel() {
+    run_shared_scenarios(Channel::Wss);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Channel {
+    Tcp,
+    Ws,
+    Wss,
+}
+
+const CHURCH: &str = "church.d.jivvy.org";
+
+/// A certificate for `CHURCH` written to `dir` (cert.pem, key.pem), and the CA PEM that signed it.
+fn test_certificate(dir: &Path) -> String {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::new(vec![CHURCH.to_string()]).unwrap().signed_by(&key, &ca, &ca_key).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("cert.pem"), cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), key.serialize_pem()).unwrap();
+    ca.pem()
+}
+
+/// A WebSocket client's stream: plain, or TLS trusting only the test CA.
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Conn {
+    fn open(addr: &str, ca_pem: Option<&str>) -> std::io::Result<Conn> {
+        let stream = TcpStream::connect(addr)?;
+        let Some(ca_pem) = ca_pem else { return Ok(Conn::Plain(stream)) };
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ca_pem.as_bytes()).map_err(std::io::Error::other)?).unwrap();
+        let config =
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), ServerName::try_from(CHURCH).unwrap())
+            .map_err(std::io::Error::other)?;
+        Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(conn, stream))))
+    }
+
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Conn::Plain(s) => s,
+            Conn::Tls(s) => s.get_ref(),
+        }
+    }
+}
+
+impl std::io::Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            Conn::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            Conn::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            Conn::Tls(s) => s.flush(),
+        }
+    }
 }
 
 /// Sends one command over the WebSocket channel, reconnecting until the engine answers or
 /// time runs out (as `Daemon::send` does over TCP).
-fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
+fn send_ws(addr: &str, ca_pem: Option<&str>, device: Option<&DeviceKey>, command: Value, within: Duration) -> Value {
     use tungstenite::client::IntoClientRequest;
     let deadline = Instant::now() + within;
     let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
@@ -632,13 +784,21 @@ fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
         // Err((taken, error)): once sent, the command is never sent again, as in `Daemon::send`.
         let attempt = (|| -> Result<Value, (bool, String)> {
             let not_taken = |e: &dyn std::fmt::Display| (false, e.to_string());
-            let stream = TcpStream::connect(addr).map_err(|e| not_taken(&e))?;
-            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| not_taken(&e))?;
-            let req = format!("ws://{addr}/").into_client_request().map_err(|e| not_taken(&e))?;
+            let stream = Conn::open(addr, ca_pem).map_err(|e| not_taken(&e))?;
+            stream.tcp().set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| not_taken(&e))?;
+            let url = if ca_pem.is_some() { format!("wss://{CHURCH}/") } else { format!("ws://{addr}/") };
+            let req = url.into_client_request().map_err(|e| not_taken(&e))?;
             let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| not_taken(&e))?;
+            if let Some(device) = device {
+                // A paired device proves its key on every connection, a restarted engine's too.
+                let proof = device.prove(&mut ws).map_err(|e| not_taken(&e))?;
+                if proof["ok"] != true {
+                    return Err((true, format!("a paired device was refused: {proof}")));
+                }
+            }
             ws.send(tungstenite::Message::text(msg.clone())).map_err(|e| not_taken(&e))?;
             let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-            ws.get_ref().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
+            ws.get_ref().tcp().set_read_timeout(Some(left)).map_err(|e| (true, e.to_string()))?;
             loop {
                 match ws.read() {
                     Ok(tungstenite::Message::Text(t)) => {
@@ -661,6 +821,86 @@ fn send_ws(addr: &str, command: Value, within: Duration) -> Value {
     }
 }
 
+/// A device key like the web app's (P-256), for pairing over the network channel.
+struct DeviceKey(ring::signature::EcdsaKeyPair);
+
+impl DeviceKey {
+    fn new() -> DeviceKey {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        DeviceKey(EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap())
+    }
+
+    fn public(&self) -> String {
+        use base64::Engine as _;
+        use ring::signature::KeyPair;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0.public_key().as_ref())
+    }
+
+    fn sign(&self, message: &str) -> String {
+        use base64::Engine as _;
+        let sig = self.0.sign(&ring::rand::SystemRandom::new(), message.as_bytes()).unwrap();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.as_ref())
+    }
+
+    /// auth.hello, then auth.prove with the signed challenge; returns the prove ack.
+    fn prove(&self, ws: &mut tungstenite::WebSocket<Conn>) -> Result<Value, String> {
+        let hello = ws_command(ws, json!({ "type": "auth.hello", "publicKey": self.public() }))?;
+        let (Some(daemon), Some(challenge)) = (hello["daemonId"].as_str(), hello["challenge"].as_str()) else {
+            return Err(format!("no challenge: {hello}"));
+        };
+        let message = format!("jivvy-live auth v1\n{daemon}\n{challenge}");
+        ws_command(ws, json!({ "type": "auth.prove", "signature": self.sign(&message) }))
+    }
+}
+
+/// Sends one command and returns the next message that isn't an event.
+fn ws_command(ws: &mut tungstenite::WebSocket<Conn>, command: Value) -> Result<Value, String> {
+    let msg = json!({ "v": 1, "id": "chaos", "ts": 1, "command": command }).to_string();
+    ws.send(tungstenite::Message::text(msg)).map_err(|e| e.to_string())?;
+    loop {
+        match ws.read().map_err(|e| e.to_string())? {
+            tungstenite::Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+                if v.get("event").is_none() {
+                    return Ok(v);
+                }
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Pairs a new device over the network channel, approved over the local one as the church
+/// computer would.
+fn pair_device(d: &Daemon, addr: &str, ca_pem: Option<&str>) -> DeviceKey {
+    use tungstenite::client::IntoClientRequest;
+    let key = DeviceKey::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ws = loop {
+        let attempt = (|| -> Result<_, String> {
+            let stream = Conn::open(addr, ca_pem).map_err(|e| e.to_string())?;
+            stream.tcp().set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+            let url = if ca_pem.is_some() { format!("wss://{CHURCH}/") } else { format!("ws://{addr}/") };
+            let req = url.into_client_request().map_err(|e| e.to_string())?;
+            tungstenite::client(req, stream).map(|(ws, _)| ws).map_err(|e| e.to_string())
+        })();
+        match attempt {
+            Ok(ws) => break ws,
+            Err(e) if Instant::now() >= deadline => panic!("WebSocket channel never came up: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    assert_eq!(d.send(json!({ "type": "pair.open" }), Duration::from_secs(10))["ok"], true);
+    let req = ws_command(&mut ws, json!({ "type": "pair.request", "publicKey": key.public(), "name": "Chaos phone" }))
+        .unwrap();
+    let request_id = req["request"]["requestId"].clone();
+    let approved = d.send(json!({ "type": "pair.approve", "requestId": request_id }), Duration::from_secs(10));
+    assert_eq!(approved["ok"], true, "{approved}");
+    key
+}
+
 fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
@@ -668,7 +908,7 @@ fn is_timeout(e: &std::io::Error) -> bool {
 /// Runs `packages/protocol/fixtures/scenarios.json` against the real daemon, over its TCP
 /// channel or its WebSocket channel. Also run against the simulated daemon
 /// (packages/sim-daemon/test/scenarios.test.ts).
-fn run_shared_scenarios(over_ws: bool) {
+fn run_shared_scenarios(channel: Channel) {
     const SCENARIOS: &str = include_str!("../../../packages/protocol/fixtures/scenarios.json");
     let shared: Value = serde_json::from_str(SCENARIOS).unwrap();
     let scenarios = shared["scenarios"].as_array().unwrap();
@@ -679,18 +919,44 @@ fn run_shared_scenarios(over_ws: bool) {
             scope.spawn(move || {
                 let name = scenario["name"].as_str().unwrap();
                 let slides = scenario["slides"].as_u64().unwrap();
+                // churchComputer runs on the local channel only; unpaired on the network channel only.
+                let connection = scenario["connection"].as_str();
+                let runs_here = match connection {
+                    None => true,
+                    Some("churchComputer") => channel == Channel::Tcp,
+                    Some("unpaired") => channel != Channel::Tcp,
+                    Some(other) => panic!("{name}: unknown connection {other}"),
+                };
+                if !runs_here {
+                    return;
+                }
                 let ws = format!("127.0.0.1:{}", free_port());
-                let d = if over_ws {
-                    start_with(
-                        test_dir(&format!("scenario-ws-{n}")),
-                        slides,
-                        false,
-                        &["--no-video", "--listen-ws", &ws],
-                    )
-                } else {
-                    start(&format!("scenario-{n}"), slides)
+                let (d, ca) = match channel {
+                    Channel::Tcp => (start(&format!("scenario-{n}"), slides), None),
+                    Channel::Ws => {
+                        let args = ["--no-video", "--listen-ws", &ws];
+                        (start_with(test_dir(&format!("scenario-ws-{n}")), slides, false, &args), None)
+                    }
+                    Channel::Wss => {
+                        let dir = test_dir(&format!("scenario-wss-{n}"));
+                        let ca = test_certificate(&dir.join("tls"));
+                        let (cert, key) = (dir.join("tls/cert.pem"), dir.join("tls/key.pem"));
+                        let args = [
+                            "--no-video",
+                            "--listen-ws",
+                            &ws,
+                            "--ws-cert",
+                            cert.to_str().unwrap(),
+                            "--ws-key",
+                            key.to_str().unwrap(),
+                        ];
+                        (start_with(dir, slides, false, &args), Some(ca))
+                    }
                 };
                 let mut engine = d.next_engine_pid(Duration::from_secs(10));
+                // Over WebSocket, a trusted connection is a device paired for real.
+                let device =
+                    (channel != Channel::Tcp && connection.is_none()).then(|| pair_device(&d, &ws, ca.as_deref()));
                 for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
                     if step["crash"] == true {
                         kill_hard(engine);
@@ -698,8 +964,8 @@ fn run_shared_scenarios(over_ws: bool) {
                         continue;
                     }
                     // Waits for a restarted engine to answer, like any client reconnecting.
-                    let ack = if over_ws {
-                        send_ws(&ws, step["send"].clone(), RESTORE_TARGET)
+                    let ack = if channel != Channel::Tcp {
+                        send_ws(&ws, ca.as_deref(), device.as_ref(), step["send"].clone(), RESTORE_TARGET)
                     } else {
                         d.send(step["send"].clone(), RESTORE_TARGET)
                     };
@@ -837,6 +1103,40 @@ mod video {
                 }
             }
             panic!("no matching levels event in {within:?}");
+        }
+
+        /// Listens to the engine like a screen does, from now on, keeping every alert.
+        fn watch_alerts(&self) -> AlertWatch {
+            let alerts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (addr, keep) = (self.addr.clone(), alerts.clone());
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let up = ready.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let Ok(mut s) = TcpStream::connect(&addr) else {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    };
+                    let _ =
+                        s.write_all(b"{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"state.subscribe\"}}\n");
+                    for line in BufReader::new(s).lines() {
+                        let Ok(line) = line else { break };
+                        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                        if v["id"] == "a" {
+                            up.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if v["event"] == "alert" {
+                            keep.lock().unwrap().push(v["alert"].clone());
+                        }
+                    }
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "couldn't subscribe to the engine");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            AlertWatch(alerts)
         }
 
         fn media_status(&self, within: Duration, what: &str, ok: impl Fn(&Value) -> bool) -> Value {
@@ -1811,6 +2111,37 @@ mod video {
         }
     }
 
+    /// Every alert the engine sent a subscribed screen since `watch_alerts`.
+    struct AlertWatch(std::sync::Arc<std::sync::Mutex<Vec<Value>>>);
+
+    impl AlertWatch {
+        fn all(&self) -> Vec<Value> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// Waits for an alert of `kind` about `destination`.
+        fn wait(&self, kind: &str, destination: &str, within: Duration) -> Value {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(a) = self.all().into_iter().find(|a| a["kind"] == kind && a["destinationId"] == destination)
+                {
+                    return a;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no {kind} alert for {destination} in {within:?}; got {:?}",
+                    self.all()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    /// The engine's view of each platform, as every screen gets it.
+    fn engine_destinations(d: &Daemon) -> Value {
+        d.send(json!({ "type": "state.get" }), Duration::from_secs(5))["state"]["streamDestinations"].clone()
+    }
+
     /// A shared upload limit for throttling proxies: kbps, 0 for unlimited.
     #[derive(Default)]
     struct Uplink {
@@ -1889,6 +2220,11 @@ mod video {
     /// squeezes the usual test pattern to almost nothing), at 720p and 3 Mbps so x264 keeps
     /// up on a CI runner. Lower qualities: 480p and 360p.
     fn start_bandwidth(name: &str, destinations: &str) -> Daemon {
+        start_bandwidth_mode(name, destinations, "auto")
+    }
+
+    /// `start_bandwidth` with the bandwidth manager in `mode` ("auto" or "advanced").
+    fn start_bandwidth_mode(name: &str, destinations: &str, mode: &str) -> Daemon {
         let dir = test_dir(name);
         std::fs::write(
             dir.join("media.json"),
@@ -1896,7 +2232,8 @@ mod video {
                 "program":{"width":1280,"height":720,"bitrateKbps":3000}}"#,
         )
         .unwrap();
-        std::fs::write(dir.join("stream.json"), format!(r#"{{"version":1,"destinations":[{destinations}]}}"#)).unwrap();
+        let config = format!(r#"{{"version":1,"bandwidth":{{"mode":"{mode}"}},"destinations":[{destinations}]}}"#);
+        std::fs::write(dir.join("stream.json"), config).unwrap();
         let video = env!("CARGO_BIN_EXE_jivvy-video");
         let d = start_with_env(dir, 10, false, &["--video", video], &[("JIVVY_TEST_PATTERN", "snow")]);
         d.video_starts.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1912,11 +2249,25 @@ mod video {
     }
 
     /// What the program really sends (kbps).
+    /// What the program really sends once settled (kbps): the median of five readings a
+    /// second apart. One reading at start-up can catch the encoder's first burst (a CI
+    /// runner once read 15 Mbps from a 3 Mbps program).
     fn program_kbps(d: &Daemon) -> f64 {
-        let s = d.media_status(Duration::from_secs(20), "program running", |s| {
-            program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0 && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
-        });
-        program(&s)["kbps"].as_f64().unwrap()
+        let mut readings: Vec<f64> = (0..5)
+            .map(|i| {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let s = d.media_status(Duration::from_secs(20), "program running", |s| {
+                    program(s)["outFps"].as_f64().unwrap_or(0.0) > 25.0
+                        && program(s)["kbps"].as_f64().unwrap_or(0.0) > 0.0
+                });
+                program(&s)["kbps"].as_f64().unwrap()
+            })
+            .collect();
+        readings.sort_by(f64::total_cmp);
+        println!("program kbps readings {readings:?}");
+        readings[2]
     }
 
     #[test]
@@ -1925,6 +2276,7 @@ mod video {
         let server = MediaMtx::start(&dir);
         let uplink = std::sync::Arc::new(Uplink::default());
         let d = start_bandwidth("bw-slow", &rtmp_destination("local", throttled(uplink.clone(), server.rtmp)));
+        let alerts = d.watch_alerts();
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
         wait_stream_state(&d, "live", Duration::from_secs(20));
         d.media_status(Duration::from_secs(5), "live at full quality", |s| {
@@ -1941,6 +2293,11 @@ mod video {
             dest["quality"] == "360p" && dest["state"] == "live"
         });
         println!("live at 360p {:?} after the upload dropped to {limit:.0} kbps", slowed.elapsed());
+        // The tech lead hears about it, and every screen shows the platform's quality.
+        let lowered = alerts.wait("stream.lowered", "local", Duration::from_secs(5));
+        assert!(lowered["message"].as_str().unwrap().contains("the internet upload is slow"), "{lowered}");
+        let shown = engine_destinations(&d);
+        assert_eq!(shown[0]["quality"], "360p", "{shown}");
         let dest = destination(&s, "local");
         assert!(dest["detail"].as_str().unwrap().contains("Lowered to 360p"), "{dest}");
         let upload = s["stream"]["uploadKbps"].as_f64().expect("an upload estimate");
@@ -1987,6 +2344,7 @@ mod video {
             rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp))
         );
         let d = start_bandwidth("bw-share", &destinations);
+        let alerts = d.watch_alerts();
         // 1.2 Mbps shared: 840 kbps to spend can't carry both even at 360p (~630 each).
         uplink.set(1200);
         d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
@@ -1997,9 +2355,89 @@ mod video {
         assert_eq!(yt_status["quality"], "360p", "{yt_status}");
         assert!(fb_status["detail"].as_str().unwrap().contains("Paused"), "{fb_status}");
         assert_eq!(stream_state(&d), "live", "screens: live, the paused platform aside");
+        // The tech lead hears which platform was paused, in plain words.
+        let paused = alerts.wait("stream.paused", "facebook", Duration::from_secs(5));
+        assert!(
+            paused["message"].as_str().unwrap().contains("is paused: the internet upload can't carry it"),
+            "{paused}"
+        );
+        assert!(
+            alerts.all().iter().all(|a| a["destinationId"] != "youtube" || a["kind"] != "stream.paused"),
+            "the main platform is never paused"
+        );
+        let shown = engine_destinations(&d);
+        let fb = shown.as_array().unwrap().iter().find(|x| x["id"] == "facebook").unwrap().clone();
+        assert_eq!((fb["state"].clone(), fb["quality"].clone()), (json!("paused"), json!("")), "{shown}");
         // YouTube keeps getting video, within the ingestion rules.
         yt.wait_segments(3, Duration::from_secs(20));
         yt.assert_no_violations();
+    }
+
+    /// A destination's JSON with Advanced-mode settings added.
+    fn with_settings(destination: String, settings: &str) -> String {
+        format!("{},{settings}}}", destination.trim_end_matches('}'))
+    }
+
+    #[test]
+    fn advanced_mode_caps_a_platform_and_keeps_it_live_on_audio_only_where_auto_would_pause_it() {
+        let dir = test_dir("bw-adv-mtx");
+        let server = MediaMtx::start(&dir);
+        let yt = FakeYouTube::start();
+        let uplink = std::sync::Arc::new(Uplink::default());
+        // Facebook ranked first; YouTube never above 480p, and audio only when short.
+        let destinations = format!(
+            "{},{}",
+            rtmp_destination("facebook", throttled(uplink.clone(), server.rtmp)),
+            with_settings(
+                hls_destination("youtube", throttled(uplink.clone(), yt.port)),
+                r#""maxQuality":"480p","whenShort":"audioOnly""#
+            )
+        );
+        let d = start_bandwidth_mode("bw-adv", &destinations, "advanced");
+        let alerts = d.watch_alerts();
+        d.send(json!({ "type": "stream.start" }), Duration::from_secs(5));
+
+        // Plenty of upload: Facebook at the full 720p, YouTube at its own top, 480p, which
+        // isn't "lowered".
+        let s = d.media_status(Duration::from_secs(30), "both live, YouTube at 480p", |s| {
+            let (fb, yt) = (destination(s, "facebook"), destination(s, "youtube"));
+            fb["state"] == "live" && fb["quality"] == "720p" && yt["state"] == "live" && yt["quality"] == "480p"
+        });
+        assert_eq!(destination(&s, "youtube")["detail"], "", "its own top quality isn't a step down");
+        assert!(s["stream"]["problems"].as_array().unwrap().is_empty(), "{}", s["stream"]["problems"]);
+
+        // 1.7 Mbps shared (about 1.19 to spend): Auto would pause YouTube (two 360p need 1.26).
+        // Advanced keeps it live on audio only (0.23) beside Facebook's 360p (0.63). The first
+        // estimate can come in under what audio only needs too; then YouTube pauses briefly and
+        // resumes on audio only once the manager probes back up. Either way, it ends there.
+        uplink.set(1700);
+        let slowed = Instant::now();
+        d.media_status(Duration::from_secs(90), "Facebook 360p, YouTube audio only, both live", |s| {
+            let (fb, yt) = (destination(s, "facebook"), destination(s, "youtube"));
+            fb["state"] == "live" && fb["quality"] == "360p" && yt["state"] == "live" && yt["quality"] == "audio"
+        });
+        println!("YouTube on audio only {:?} after the upload dropped", slowed.elapsed());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let told = loop {
+            let all = alerts.all();
+            let last = all.iter().rev().find(|a| a["destinationId"] == "youtube").cloned();
+            if let Some(a) = last.filter(|a| a["quality"] == "audio") {
+                break a;
+            }
+            assert!(Instant::now() < deadline, "no alert put YouTube on audio only: {all:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(told["message"].as_str().unwrap().contains("audio only"), "{told}");
+        let shown = engine_destinations(&d);
+        assert_eq!(shown.as_array().unwrap().iter().find(|x| x["id"] == "youtube").unwrap()["quality"], "audio");
+
+        // YouTube keeps getting segments, now small, within the ingestion rules.
+        let before = yt.segments().len();
+        yt.wait_segments(before + 3, Duration::from_secs(30));
+        let (name, bytes) = yt.segments().last().cloned().unwrap();
+        assert!(bytes < 150_000, "an audio-only segment is small: {name} is {bytes} bytes");
+        yt.assert_no_violations();
+        assert!(d.video_starts.try_recv().is_err(), "the video process never restarted");
     }
 
     #[test]

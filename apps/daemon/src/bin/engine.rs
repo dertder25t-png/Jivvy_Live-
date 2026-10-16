@@ -1,10 +1,13 @@
 //! `jivvy-engine`: the live engine process. Normally started by `jivvy-watchdog`.
 //!
 //! jivvy-engine [--data-dir DIR] [--listen ADDR] [--slides N] [--supervised]
-//!              [--listen-ws ADDR] [--ws-origin ORIGIN]...
+//!              [--listen-ws ADDR] [--ws-origin ORIGIN]... [--ws-cert PEM --ws-key PEM]
+//!              [--upload-test-url URL]
 //!
 //! `--listen-ws` also serves the protocol over WebSocket (off by default). Browsers may use
-//! it only from an origin given with `--ws-origin`; programs always may.
+//! it only from an origin given with `--ws-origin`; programs always may. With `--ws-cert` and
+//! `--ws-key` it is `wss://` only, with that certificate; replacing the files renews it
+//! without a restart.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -13,6 +16,7 @@ use std::time::Duration;
 
 use jivvy_daemon::engine::{self, Engine};
 use jivvy_daemon::snapshot::Store;
+use jivvy_daemon::tls::TlsFiles;
 use jivvy_daemon::{DEFAULT_LISTEN, HEARTBEAT_LINE, default_data_dir, log};
 
 fn main() {
@@ -23,24 +27,51 @@ fn main() {
     let mut supervised = false;
     let mut listen_ws: Option<String> = None;
     let mut ws_access = engine::WsAccess::default();
+    let (mut ws_cert, mut ws_key): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+    let mut upload_test_url: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
         match flag.as_str() {
             "--data-dir" => data_dir = PathBuf::from(val()),
-            "--listen" => listen = val(),
+            "--listen" => {
+                listen = val();
+                // Trusted, so for this computer only; devices use --listen-ws.
+                if !engine::is_loopback_only(&listen) {
+                    fail(&format!("--listen must be a loopback address such as 127.0.0.1:47800, not {listen}"));
+                }
+            }
             "--slides" => slides = val().parse().unwrap_or_else(|_| fail("--slides must be a number")),
             "--supervised" => supervised = true,
             "--listen-ws" => listen_ws = Some(val()),
             "--ws-origin" => ws_access.origins.push(val()),
+            // The built web app to serve on the WebSocket port (default: `web` beside this program).
+            "--web-dir" => ws_access.web_dir = Some(PathBuf::from(val())),
+            "--ws-cert" => ws_cert = Some(PathBuf::from(val())),
+            "--ws-key" => ws_key = Some(PathBuf::from(val())),
+            // Pre-flight's upload test (tests point it at a local stand-in).
+            "--upload-test-url" => upload_test_url = Some(val()),
             other => fail(&format!("unknown flag {other}")),
         }
     }
+
+    let ws_tls = match (ws_cert, ws_key) {
+        (Some(cert), Some(key)) => Some(Arc::new(TlsFiles::new(cert, key))),
+        (None, None) => None,
+        _ => fail("--ws-cert and --ws-key go together"),
+    };
 
     let store = Store::new(&data_dir).unwrap_or_else(|e| fail(&format!("data dir {}: {e}", data_dir.display())));
     let (snap, source) = store.load();
     log("engine", format!("resuming slide {} black={} from {source:?} snapshot", snap.slide_index, snap.black));
     let engine = Arc::new(Mutex::new(Engine::new(store, snap, slides)));
+    {
+        let mut e = engine.lock().unwrap();
+        e.set_handle(Arc::downgrade(&engine));
+        if let Some(url) = upload_test_url {
+            e.set_upload_test_url(url);
+        }
+    }
 
     if supervised {
         // The watchdog holds our stdin open; end-of-file means it is gone, so exit
@@ -55,16 +86,40 @@ fn main() {
         std::thread::spawn(move || heartbeat(&engine, &hang_file));
     }
 
+    // Without a certificate, pairing codes and proofs would cross the network in plain text:
+    // plain ws:// only on this computer. Refused, not fatal: a bad setting never stops a service.
+    let listen_ws = listen_ws.filter(|addr| {
+        let ok = ws_tls.is_some() || engine::is_loopback_only(addr);
+        if !ok {
+            log(
+                "engine",
+                format!("WebSocket channel {addr}: needs --ws-cert and --ws-key off this computer; not started"),
+            );
+        }
+        ok
+    });
+    if ws_access.web_dir.is_none() {
+        let beside = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("web")));
+        ws_access.web_dir = beside.filter(|d| d.join("index.html").is_file());
+    }
     if let Some(addr) = listen_ws {
+        match &ws_access.web_dir {
+            Some(dir) => log("engine", format!("serving the web app from {}", dir.display())),
+            None => log("engine", "no web app to serve (--web-dir); devices use app.jivvy.org"),
+        }
         let (engine, access) = (engine.clone(), Arc::new(ws_access));
+        if let Some(tls) = &ws_tls {
+            tls.config(); // logs now if the certificate can't be used, not at the first device
+        }
         // Its own thread, retrying: a WebSocket port that's busy never stops the engine or
         // its TCP channel.
         std::thread::spawn(move || {
             loop {
                 match engine::bind(&addr, Duration::from_secs(2)) {
                     Ok(l) => {
-                        log("engine", format!("WebSocket channel on {addr}"));
-                        engine::serve_ws(l, engine.clone(), access.clone());
+                        let scheme = if ws_tls.is_some() { "wss" } else { "ws" };
+                        log("engine", format!("WebSocket channel on {scheme}://{addr}"));
+                        engine::serve_ws(l, engine.clone(), access.clone(), ws_tls.clone());
                     }
                     Err(e) => log("engine", format!("WebSocket channel {addr}: {e}; retrying")),
                 }

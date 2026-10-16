@@ -11,18 +11,25 @@
 pub mod bandwidth;
 pub mod client;
 pub mod ctl;
+pub mod devices;
 pub mod engine;
 pub mod hardware;
 pub mod hls;
+pub mod images;
+pub mod library;
 pub mod lyrics;
 pub mod media;
 pub mod outputs;
+pub mod preflight;
 pub mod program;
 pub mod protocol;
 pub mod recording;
+pub mod runsheet;
 pub mod snapshot;
 pub mod stream;
+pub mod tls;
 pub mod watchdog;
+pub mod web;
 
 use std::path::{Path, PathBuf};
 

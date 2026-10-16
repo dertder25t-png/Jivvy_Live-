@@ -1,5 +1,7 @@
 import {
-  ack, nack, type Ack, type DaemonLike, type Envelope, type RecordingStatus, type StateSnapshot, type StreamStatus,
+  ack, alertEvent, authMessage, MAX_PENDING_PAIRINGS, nack, PAIRING_WINDOW_MS, preflightSummary, PROTOCOL_VERSION,
+  streamAlerts, type Ack, type Alert, type CommandType, type Preflight, type PreflightDestination, type DaemonEvent, type DaemonLike, type DeviceInfo, type Envelope,
+  type PairingStatus, type RecordingStatus, type StateSnapshot, type StreamDestination, type StreamStatus,
 } from "@jivvy/protocol";
 
 /**
@@ -34,6 +36,40 @@ export interface SimOptions {
   restartMs?: number;
   /** Timer hooks so tests can use fake time. */
   setTimer?: (fn: () => void, ms: number) => unknown;
+  /** Clock for the pairing window, ms. */
+  now?: () => number;
+  /**
+   * Streaming platforms, main platform first (stream.json's order). `whenShort` is Advanced
+   * mode's choice for a slow upload: lower (the default), audio only, or pause.
+   */
+  destinations?: Array<{ id: string; name: string; whenShort?: "lower" | "audioOnly" | "pause" }>;
+}
+
+/** How long the simulated upload test takes, ms (the real one sends for about 5 s). */
+export const PREFLIGHT_MS = 5000;
+/** Simulated upload speeds, kbps. */
+const UPLINK_KBPS = { ok: 20_000, slow: 1_500 } as const;
+
+/** The simulated program's quality, and what the main platform drops to on a slow upload. */
+const FULL = "1080p";
+const SLOW = "480p";
+
+/** What a paired device may do: run the service. Settings, pairing and reports are not theirs. */
+const DEVICE_COMMANDS: ReadonlySet<CommandType> = new Set<CommandType>([
+  "slide.next", "slide.prev", "slide.goto", "output.black", "stream.start", "stream.stop",
+  "recording.start", "recording.stop", "state.get", "state.subscribe", "stream.preflight",
+]);
+
+interface PairedDevice extends DeviceInfo {
+  publicKey: string;
+}
+
+interface PendingPairing {
+  requestId: string;
+  name: string;
+  publicKey: string;
+  code: string;
+  conn: DeviceConnection;
 }
 
 type Listener = (s: Readonly<DaemonState>) => void;
@@ -50,10 +86,117 @@ export class SimDaemon implements DaemonLike {
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private wantStream = false;
   private wantRecording = false;
+  private readonly now: () => number;
+  /** Stays the same through crashes, like the real daemon's. */
+  readonly daemonId = randomId();
+  /** Paired devices are saved like the snapshot: a crash keeps them. */
+  private devices: PairedDevice[] = [];
+  private pairingOpenUntil = 0;
+  private pending: PendingPairing[] = [];
+  private connections = new Set<DeviceConnection>();
+  private pairingListeners = new Set<(p: PairingStatus) => void>();
+  private alertListeners = new Set<(a: Alert) => void>();
+  private preflightListeners = new Set<(p: Preflight) => void>();
+  /** The last upload test that worked, for when the next one can't run. */
+  private lastMeasured?: { kbps: number; at: number };
+  private measuring = false;
+  /** The platforms as last shown, to tell what changed. */
+  private shownDestinations: StreamDestination[] = [];
 
   constructor(private readonly opts: SimOptions) {
     this.restartMs = opts.restartMs ?? 1500;
     this.setTimer = opts.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** A device on the network channel. It must pair (or prove its key) before anything else. */
+  connect(): DeviceConnection {
+    const c = new DeviceConnection(this);
+    this.connections.add(c);
+    c.onClose(() => {
+      this.connections.delete(c);
+      // Its pairing request goes with it, like the real daemon's.
+      const before = this.pending.length;
+      this.pending = this.pending.filter((r) => r.conn !== c);
+      if (this.pending.length !== before) this.pairingChanged();
+    });
+    return c;
+  }
+
+  /** Pre-flight results, as every subscriber gets them. */
+  onPreflight(fn: (p: Preflight) => void): () => void {
+    this.preflightListeners.add(fn);
+    return () => this.preflightListeners.delete(fn);
+  }
+
+  /** What each platform would get at `kbps`, like the bandwidth manager's choice. */
+  private preflightFor(kbps: number): PreflightDestination[] {
+    const slow = kbps < UPLINK_KBPS.ok;
+    return (this.opts.destinations ?? []).map(({ id, name, whenShort }, i) => {
+      if (!slow) return { id, name, quality: FULL };
+      if (whenShort === "audioOnly") return { id, name, quality: "audio" };
+      if (whenShort === "pause") return { id, name, quality: "" };
+      return { id, name, quality: i === 0 ? SLOW : "" };
+    });
+  }
+
+  private startPreflight(): Preflight {
+    const measuring: Preflight = { status: "measuring", destinations: [], summary: "Measuring the internet upload..." };
+    if (this.measuring) return measuring;
+    this.measuring = true;
+    this.setTimer(() => {
+      this.measuring = false;
+      let result: Preflight;
+      if (this.state.uplink !== "down") {
+        const kbps = UPLINK_KBPS[this.state.uplink];
+        this.lastMeasured = { kbps, at: this.now() };
+        const destinations = this.preflightFor(kbps);
+        result = { status: "done", uploadKbps: kbps, measured: true, measuredAt: this.now(), destinations, summary: preflightSummary(destinations) };
+      } else if (this.lastMeasured) {
+        const destinations = this.preflightFor(this.lastMeasured.kbps);
+        result = {
+          status: "done", uploadKbps: this.lastMeasured.kbps, measured: false, measuredAt: this.lastMeasured.at, destinations,
+          summary: preflightSummary(destinations),
+          message: "Couldn't test the upload just now (no internet?); this is the last speed measured.",
+        };
+      } else {
+        result = { status: "failed", destinations: [], summary: "", message: "Couldn't test the upload: check the internet connection." };
+      }
+      for (const l of this.preflightListeners) l(result);
+      for (const conn of this.connections) if (conn.deviceId) conn.emit({ v: PROTOCOL_VERSION, event: "preflight", preflight: result });
+    }, PREFLIGHT_MS);
+    return measuring;
+  }
+
+  /** Alerts (a platform lowered, paused or resumed), as every subscriber gets them. */
+  onAlert(fn: (a: Alert) => void): () => void {
+    this.alertListeners.add(fn);
+    return () => this.alertListeners.delete(fn);
+  }
+
+  /**
+   * Each platform while streaming. A slow upload works like the real bandwidth manager:
+   * the main platform gets a lower quality and the others are paused.
+   */
+  streamDestinations(): StreamDestination[] {
+    if (!this.wantStream || this.state.restarting) return [];
+    return (this.opts.destinations ?? []).map(({ id, name, whenShort }, i): StreamDestination => {
+      const d = { id, name };
+      switch (this.state.uplink) {
+        case "down": return { ...d, state: "reconnecting", quality: FULL };
+        case "ok": return { ...d, state: "live", quality: FULL };
+        case "slow":
+          if (whenShort === "audioOnly") return { ...d, state: "live", quality: "audio" };
+          if (whenShort === "pause") return { ...d, state: "paused", quality: "" };
+          return i === 0 ? { ...d, state: "live", quality: SLOW } : { ...d, state: "paused", quality: "" };
+      }
+    });
+  }
+
+  /** The church computer's view of pairing, whenever it changes. */
+  onPairing(fn: (p: PairingStatus) => void): () => void {
+    this.pairingListeners.add(fn);
+    return () => this.pairingListeners.delete(fn);
   }
 
   getState(): Readonly<DaemonState> {
@@ -65,10 +208,57 @@ export class SimDaemon implements DaemonLike {
     return () => this.listeners.delete(fn);
   }
 
+  /** A command from the church computer itself (the local channel), which is trusted. */
   handle(e: Envelope): Ack {
     if (this.state.restarting) return nack(e.id, "bad_message", "daemon is restarting");
     const c = e.command;
     switch (c.type) {
+      case "pair.open":
+        this.pairingOpenUntil = this.now() + PAIRING_WINDOW_MS;
+        this.setTimer(() => this.pairingChanged(), PAIRING_WINDOW_MS);
+        this.pairingChanged();
+        return this.pairingAck(e.id);
+      case "pair.close":
+        this.pairingOpenUntil = 0;
+        this.pairingChanged();
+        return this.pairingAck(e.id);
+      case "pair.approve":
+      case "pair.deny": {
+        const req = this.pairingOpen() ? this.pending.find((r) => r.requestId === c.requestId) : undefined;
+        if (!req) return nack(e.id, "bad_arguments", "no such pairing request");
+        this.pending = this.pending.filter((r) => r !== req);
+        if (c.type === "pair.approve") {
+          const existing = this.devices.find((d) => d.publicKey === req.publicKey);
+          const deviceId = existing?.deviceId ?? randomId();
+          this.devices = [
+            ...this.devices.filter((d) => d !== existing),
+            { deviceId, name: req.name, publicKey: req.publicKey, pairedAt: this.now() },
+          ];
+          req.conn.emit({ v: PROTOCOL_VERSION, event: "pair.result", approved: true, deviceId, daemonId: this.daemonId });
+        } else {
+          req.conn.emit({ v: PROTOCOL_VERSION, event: "pair.result", approved: false });
+        }
+        this.pairingChanged();
+        return this.pairingAck(e.id);
+      }
+      case "device.list":
+        return ack(e.id, undefined, { devices: this.deviceList() });
+      case "device.remove": {
+        const gone = this.devices.find((d) => d.deviceId === c.deviceId);
+        if (!gone) return nack(e.id, "bad_arguments", "no such device");
+        this.devices = this.devices.filter((d) => d !== gone);
+        for (const conn of [...this.connections]) if (conn.deviceId === gone.deviceId) conn.close();
+        return ack(e.id, undefined, { devices: this.deviceList() });
+      }
+      case "pair.request":
+      case "auth.hello":
+      case "auth.prove":
+        return nack(e.id, "bad_arguments", "the church computer doesn't need to pair");
+      case "stream.preflight":
+        // The test would take the stream's bandwidth.
+        if (this.wantStream) return nack(e.id, "unavailable", "the upload test can't run while streaming");
+        return ack(e.id, this.snapshotForUi(), { preflight: this.startPreflight() });
+
       case "slide.next": this.set({ slideIndex: Math.min(this.state.slideIndex + 1, this.opts.slideCount - 1) }); break;
       case "slide.prev": this.set({ slideIndex: Math.max(this.state.slideIndex - 1, 0) }); break;
       case "slide.goto":
@@ -103,12 +293,77 @@ export class SimDaemon implements DaemonLike {
     return ack(e.id, this.snapshotForUi());
   }
 
+  /** A command from a device on the network channel. @internal (use connect()). */
+  async handleDevice(conn: DeviceConnection, e: Envelope): Promise<Ack> {
+    if (conn.closed) return nack(e.id, "unavailable", "connection closed");
+    if (this.state.restarting) return nack(e.id, "bad_message", "daemon is restarting");
+    const c = e.command;
+    switch (c.type) {
+      case "pair.request": {
+        if (!this.pairingOpen()) return nack(e.id, "unauthorized", "pairing isn't open; open it on the church computer");
+        const others = this.pending.filter((r) => r.conn !== conn);
+        if (others.length >= MAX_PENDING_PAIRINGS) return nack(e.id, "unauthorized", "too many pairing requests waiting");
+        const req: PendingPairing = { requestId: randomId(), name: c.name, publicKey: c.publicKey, code: randomCode(), conn };
+        this.pending = [...others, req];
+        this.pairingChanged();
+        return ack(e.id, undefined, { request: { requestId: req.requestId, code: req.code } });
+      }
+      case "auth.hello":
+        conn.hello = { publicKey: c.publicKey, challenge: randomId(32) };
+        return ack(e.id, undefined, { challenge: conn.hello.challenge, daemonId: this.daemonId });
+      case "auth.prove": {
+        const hello = conn.hello;
+        conn.hello = undefined; // one try per challenge
+        if (!hello || !(await verify(hello.publicKey, c.signature, authMessage(this.daemonId, hello.challenge))))
+          return nack(e.id, "unauthorized", "not a paired device");
+        // Looked up after the (async) check, so a device removed meanwhile gets nothing.
+        const device = this.devices.find((d) => d.publicKey === hello.publicKey);
+        if (!device || conn.closed) return nack(e.id, "unauthorized", "not a paired device");
+        conn.deviceId = device.deviceId;
+        return ack(e.id, this.snapshotForUi(), { deviceId: device.deviceId });
+      }
+    }
+    if (!conn.deviceId) return nack(e.id, "unauthorized", "pair this device first");
+    if (!DEVICE_COMMANDS.has(c.type)) return nack(e.id, "unauthorized", "only the church computer can do that");
+    return this.handle(e);
+  }
+
+  private pairingOpen(): boolean {
+    return this.now() < this.pairingOpenUntil;
+  }
+
+  private pairingStatus(): PairingStatus {
+    if (!this.pairingOpen()) return { open: false, requests: [] };
+    const requests = this.pending.map(({ requestId, name, code }) => ({ requestId, name, code }));
+    return { open: true, closesInMs: this.pairingOpenUntil - this.now(), requests };
+  }
+
+  private pairingAck(id: string): Ack {
+    return ack(id, undefined, { pairing: this.pairingStatus() });
+  }
+
+  /** Tells the church computer; when pairing has closed, waiting devices hear they weren't approved. */
+  private pairingChanged(): void {
+    if (!this.pairingOpen()) {
+      for (const r of this.pending) r.conn.emit({ v: PROTOCOL_VERSION, event: "pair.result", approved: false });
+      this.pending = [];
+    }
+    const status = this.pairingStatus();
+    for (const l of this.pairingListeners) l(status);
+  }
+
+  private deviceList(): DeviceInfo[] {
+    return this.devices.map(({ deviceId, name, pairedAt }) => ({ deviceId, name, pairedAt }));
+  }
+
   /** The protocol's view of the state, as the real daemon reports it. */
   snapshotForUi(): StateSnapshot {
     const { slideIndex, black, stream, recording, diskFreeGb } = this.state;
+    const streamDestinations = this.streamDestinations();
     return {
       slideIndex, black, stream, streamWanted: this.wantStream,
       recording, recordingWanted: this.wantRecording, recordingLowDisk: this.wantRecording && diskFreeGb < LOW_DISK_GB,
+      ...(streamDestinations.length ? { streamDestinations } : {}),
     };
   }
 
@@ -130,6 +385,11 @@ export class SimDaemon implements DaemonLike {
   /** Kill the engine. It restarts from the last snapshot on the same slide. */
   crash(): void {
     if (this.state.restarting) return;
+    // Connections and pairing requests die with the engine; devices reconnect and prove
+    // their keys again. Paired devices are kept.
+    for (const conn of [...this.connections]) conn.close();
+    this.pending = [];
+    this.pairingOpenUntil = 0;
     // Only the engine dies: the video process keeps writing the same recording file.
     this.state = { ...this.state, restarting: true };
     this.emit();
@@ -162,5 +422,83 @@ export class SimDaemon implements DaemonLike {
 
   private emit(): void {
     for (const l of this.listeners) l(this.state);
+    const now = this.streamDestinations();
+    for (const alert of streamAlerts(this.shownDestinations, now)) {
+      for (const l of this.alertListeners) l(alert);
+      for (const conn of this.connections) if (conn.deviceId) conn.emit(alertEvent(alert));
+    }
+    this.shownDestinations = now;
+  }
+}
+
+/** One device's connection on the network channel. */
+export class DeviceConnection implements DaemonLike {
+  /** @internal Set once the device has proven its key. */
+  deviceId?: string;
+  /** @internal The challenge from the last auth.hello. */
+  hello?: { publicKey: string; challenge: string };
+  closed = false;
+  private listeners = new Set<(e: DaemonEvent) => void>();
+  private closeListeners = new Set<() => void>();
+
+  constructor(private readonly daemon: SimDaemon) {}
+
+  handle(e: Envelope): Promise<Ack> {
+    return this.daemon.handleDevice(this, e);
+  }
+
+  /** Events for this connection (pair.result). */
+  onEvent(fn: (e: DaemonEvent) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  onClose(fn: () => void): void {
+    this.closeListeners.add(fn);
+  }
+
+  /** @internal */
+  emit(e: DaemonEvent): void {
+    if (!this.closed) for (const l of this.listeners) l(e);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const l of this.closeListeners) l();
+  }
+}
+
+export function toBase64Url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function fromBase64Url(s: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+}
+
+function randomId(bytes = 12): string {
+  return toBase64Url(crypto.getRandomValues(new Uint8Array(bytes)));
+}
+
+/** 6 digits, every code equally likely. */
+function randomCode(): string {
+  const n = new Uint32Array(1);
+  do crypto.getRandomValues(n);
+  while (n[0]! >= 4_294_000_000); // a multiple of 1,000,000
+  return String(n[0]! % 1_000_000).padStart(6, "0");
+}
+
+/** ECDSA P-256 / SHA-256 over the UTF-8 message; false for a bad key or signature. */
+async function verify(publicKey: string, signature: string, message: string): Promise<boolean> {
+  try {
+    const key = await crypto.subtle.importKey("raw", fromBase64Url(publicKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    const data = new TextEncoder().encode(message);
+    return await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, fromBase64Url(signature), data);
+  } catch {
+    return false;
   }
 }

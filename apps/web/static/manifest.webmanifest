@@ -1,0 +1,13 @@
+{
+  "name": "Jivvy Live",
+  "short_name": "Jivvy",
+  "description": "Run the service: slides, songs, and the live stream.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#10224F",
+  "theme_color": "#10224F",
+  "icons": [
+    { "src": "/brand/jivvy-app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

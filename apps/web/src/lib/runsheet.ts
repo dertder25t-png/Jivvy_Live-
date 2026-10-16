@@ -13,7 +13,7 @@ import {
   type Slide,
 } from "@jivvy/protocol";
 
-export type ItemKind = "song" | "scripture" | "countdown" | "text" | "loop" | "image";
+export type ItemKind = "song" | "scripture" | "countdown" | "text" | "loop" | "image" | "pdf";
 
 export interface DraftItem {
   id: string;
@@ -27,6 +27,8 @@ export interface DraftItem {
   seconds?: number;
   /** Images and PDF slides: one slide per image id (kept in this browser, see media.ts). */
   images?: string[];
+  /** PDF slides: the title last taken from the file's name (a title typed by hand is kept). */
+  titleFrom?: string;
 }
 
 export interface Draft {
@@ -54,8 +56,9 @@ export function newItem(kind: ItemKind): DraftItem {
     text: "Announcement",
     loop: "Before the service",
     image: "Images",
+    pdf: "PDF slides",
   }[kind];
-  if (kind === "image") return { id: newId(), kind, title, text: "", images: [] };
+  if (kind === "image" || kind === "pdf") return { id: newId(), kind, title, text: "", images: [] };
   if (kind === "countdown") return { id: newId(), kind, title, text: "Service starts in", at: "10:30" };
   if (kind === "loop") return { id: newId(), kind, title, text: "", seconds: LOOP_SECONDS };
   return { id: newId(), kind, title, text: "" };
@@ -125,6 +128,7 @@ export function slidesFor(item: DraftItem, now = new Date()): Slide[] {
       }));
     }
     case "image":
+    case "pdf": // each page already drawn as a picture in this browser (pdf.ts)
       return (item.images ?? []).map((image) => ({ lines: [], image }));
     case "countdown": {
       const to = nextTime(item.at ?? "", now);

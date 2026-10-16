@@ -3,6 +3,7 @@
   import { onDestroy, onMount } from "svelte";
   import { DaemonConnection, type Status } from "$lib/daemon";
   import { addImage, upload } from "$lib/media";
+  import { addPdf } from "$lib/pdf";
   import { build, imagesIn, newId, newItem, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
   import Thumb from "$lib/Thumb.svelte";
 
@@ -14,6 +15,7 @@
     { kind: "countdown", label: "Countdown" },
     { kind: "loop", label: "Pre-service loop" },
     { kind: "image", label: "Images" },
+    { kind: "pdf", label: "PDF slides" },
     { kind: "text", label: "Text" },
   ];
 
@@ -111,6 +113,34 @@
       }
     }
     adding = "";
+  }
+
+  /**
+   * A PDF item holds one document: picking another replaces its pages. Only the newest pick
+   * for an item counts, so a slow earlier one can't land on top of it.
+   */
+  const pdfPicks = new Map<string, number>();
+  async function addPdfTo(item: DraftItem, file: File | undefined) {
+    if (!file) return;
+    const pick = (pdfPicks.get(item.id) ?? 0) + 1;
+    pdfPicks.set(item.id, pick);
+    const newest = () => pdfPicks.get(item.id) === pick;
+    sendError = "";
+    try {
+      const pages = await addPdf(file, (page, total) => {
+        if (newest()) adding = `Reading page ${page} of ${total}…`;
+      });
+      if (!newest()) return;
+      item.images = pages;
+      const name = file.name.replace(/\.pdf$/i, "");
+      // Named after the file unless someone has typed a title of their own.
+      if (!item.title || item.title === "PDF slides" || item.title === item.titleFrom) item.title = name;
+      item.titleFrom = name;
+    } catch (e) {
+      if (newest()) sendError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (newest()) adding = "";
+    }
   }
 
   const go = (type: "slide.next" | "slide.prev") => conn?.send({ type });
@@ -219,7 +249,7 @@
           >
           <button class="icon" onclick={() => remove(i)} aria-label="Remove">✕</button>
         </div>
-        {#if item.kind === "image"}
+        {#if item.kind === "image" || item.kind === "pdf"}
           <div class="thumbs">
             {#each item.images ?? [] as image, n (n)}
               <div class="thumb">
@@ -232,20 +262,36 @@
               </div>
             {/each}
           </div>
-          <label class="pick">
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              onchange={(e) => {
-                const input = e.currentTarget;
-                void addImages(item, input.files).then(() => (input.value = ""));
-              }}
-            />
-            + Add pictures
-          </label>
-          {#if adding}<span class="hint">{adding}</span>{/if}
-          <p class="hint">Each picture is one slide, shown filling the screen.</p>
+          {#if item.kind === "pdf"}
+            <label class="pick">
+              <input
+                type="file"
+                accept="application/pdf,.pdf"
+                onchange={(e) => {
+                  const input = e.currentTarget;
+                  void addPdfTo(item, input.files?.[0]).then(() => (input.value = ""));
+                }}
+              />
+              {item.images?.length ? "Choose another PDF" : "+ Choose a PDF"}
+            </label>
+            {#if adding}<span class="hint">{adding}</span>{/if}
+            <p class="hint">Each page is one slide, drawn here and sent as a picture.</p>
+          {:else}
+            <label class="pick">
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                onchange={(e) => {
+                  const input = e.currentTarget;
+                  void addImages(item, input.files).then(() => (input.value = ""));
+                }}
+              />
+              + Add pictures
+            </label>
+            {#if adding}<span class="hint">{adding}</span>{/if}
+            <p class="hint">Each picture is one slide, shown filling the screen.</p>
+          {/if}
         {:else if item.kind === "countdown"}
           <div class="row">
             <label>Text <input bind:value={item.text} maxlength="200" /></label>

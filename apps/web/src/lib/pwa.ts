@@ -17,9 +17,6 @@ export function isPagePath(pathname: string): boolean {
   return !(pathname.split("/").pop() ?? "").includes(".");
 }
 
-/** Where the build lists the pdf.js files, so the worker can store them with the app. */
-export const PDFJS_LIST = "/pdfjs/files.json";
-
 /** True when the worker should answer this request from its cache. Everything else is left alone. */
 export function isCacheable(request: { method: string; mode?: string }, url: URL, origin: string, precached: ReadonlySet<string>): boolean {
   if (request.method !== "GET") return false;

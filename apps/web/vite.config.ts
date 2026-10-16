@@ -32,8 +32,6 @@ function pdfjsAssets(): Plugin {
     },
     generateBundle() {
       for (const path of files) this.emitFile({ type: "asset", fileName: published(path), source: readFileSync(path) });
-      // The service worker stores these with the app so PDF slides draw offline.
-      this.emitFile({ type: "asset", fileName: "pdfjs/files.json", source: JSON.stringify(files.map((f) => `/${published(f)}`)) });
     },
   };
 }

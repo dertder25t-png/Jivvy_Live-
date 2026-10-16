@@ -292,6 +292,7 @@ mod ui {
         let mut model = Model::new(&args.data_dir);
         let mut windows: HashMap<String, OutputWindow> = HashMap::new();
         let mut ticks = 0u64;
+        let keys = client::KeyWorker::start(args.connect.clone());
         event_loop.run(move |event, target, control_flow| {
             *control_flow = ControlFlow::Wait;
             match event {
@@ -318,15 +319,8 @@ mod ui {
                 }
                 Event::UserEvent(UserEvent::Key(key)) => {
                     let black = model.shown.as_ref().is_some_and(|s| s.black);
-                    if let Some(command) = client::key_command(&key, black) {
-                        // Off the UI thread, so a slow engine can't freeze the windows.
-                        let addr = args.connect.clone();
-                        std::thread::spawn(move || {
-                            if !client::send_command(&addr, command) {
-                                log("outputs", "key command was not accepted by the engine");
-                            }
-                        });
-                    }
+                    // One worker thread sends keys in order, off the UI thread.
+                    keys.press(&key, black);
                 }
                 // Outputs close only when unplugged or reconfigured, never by accident.
                 Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {}

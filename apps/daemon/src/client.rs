@@ -88,10 +88,52 @@ pub fn key_command(key: &str, black_now: bool) -> Option<Value> {
 }
 
 /// Sends one command to the engine on its own short-lived connection and waits for the ack.
-/// True only if the engine answered ok.
-pub fn send_command(addr: &str, command: Value) -> bool {
+/// Gives the engine's state from the ack, only if the engine answered ok.
+pub fn send_command(addr: &str, command: Value) -> Option<LiveState> {
     let msg = serde_json::json!({ "v": 1, "id": "keys", "ts": 0, "command": command });
-    connect(addr).is_ok_and(|mut c| exchange(&mut c, &msg))
+    let (mut w, mut r) = connect(addr).ok()?;
+    let mut ack = String::new();
+    if writeln!(w, "{msg}").is_err() || r.read_line(&mut ack).unwrap_or(0) == 0 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&ack).ok()?;
+    if v["ok"] != true {
+        return None;
+    }
+    state_in(&ack)
+}
+
+/// Sends the keys pressed in output windows to the engine from one thread, strictly in the
+/// order they were pressed (a quick Next then Back can't swap), one command at a time.
+pub struct KeyWorker {
+    tx: std::sync::mpsc::Sender<(String, bool)>,
+}
+
+impl KeyWorker {
+    pub fn start(addr: String) -> KeyWorker {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+        std::thread::spawn(move || {
+            // Whether the screen is black as of the engine's last answer to us.
+            let mut black: Option<bool> = None;
+            for (key, shown_black) in rx {
+                let Some(command) = key_command(&key, black.unwrap_or(shown_black)) else { continue };
+                match send_command(&addr, command) {
+                    Some(state) => black = Some(state.black),
+                    None => {
+                        black = None;
+                        crate::log("outputs", "key command was not accepted by the engine");
+                    }
+                }
+            }
+        });
+        KeyWorker { tx }
+    }
+
+    /// Queues a key; `shown_black` is the output's own idea of black, used until the engine
+    /// has answered one of our commands.
+    pub fn press(&self, key: &str, shown_black: bool) {
+        let _ = self.tx.send((key.to_string(), shown_black));
+    }
 }
 
 /// Sends the video process's reports (audio levels, stream status) to the engine from a
@@ -235,11 +277,22 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let e = engine.clone();
         std::thread::spawn(move || serve(listener, e));
-        assert!(send_command(&addr, key_command("ArrowRight", false).unwrap()));
-        assert!(send_command(&addr, key_command(".", false).unwrap()));
+        let index = |engine: &Arc<Mutex<Engine>>| {
+            let r = engine.lock().unwrap().handle_line(r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#);
+            serde_json::to_value(r).unwrap()["state"]["slideIndex"].as_u64().unwrap()
+        };
+        let worker = KeyWorker::start(addr);
+        // Next then Back in quick succession arrive in order and end where they started,
+        // and two quick black presses toggle twice instead of repeating the same value.
+        let start = index(&engine);
+        worker.press("ArrowRight", false);
+        worker.press("ArrowLeft", false);
+        worker.press(".", false);
+        worker.press("b", false);
+        worker.press("ArrowRight", false); // the last key: once it lands, all the others have
+        wait_until("the keys reach the engine", || index(&engine) == start + 1);
         let r = engine.lock().unwrap().handle_line(r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#);
-        let r = serde_json::to_value(r).unwrap();
-        assert_eq!(r["state"]["black"], serde_json::json!(true));
+        assert_eq!(serde_json::to_value(r).unwrap()["state"]["black"], serde_json::json!(false));
         let _ = std::fs::remove_dir_all(&dir); // only reached when the test passed
     }
 

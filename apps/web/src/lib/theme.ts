@@ -7,15 +7,19 @@
  *     "v": 1,                          format version; readers ignore a theme with a higher v
  *     "font": "sans",                  "sans" | "serif" | "mono"
  *     "bold": true,
- *     "size": 7,                       text height as % of the screen height (2 to 20)
+ *     "size": 7,                       text height as % of the screen height (2 to 20); assumes 16:9 for now
  *     "text": "#FFFFFF",               #RRGGBB
  *     "shadow": true,                  dark shadow behind text, for busy backgrounds
  *     "background": { "kind": "color", "color": "#10224F" }
  *                 or { "kind": "image", "image": "<image id>", "color": "#10224F" }
  *   }
  *
- * "image" is an image id as the run sheet uses (kept in the browser that added it, see
- * media.ts); `color` is what shows where there is no such image. Add fields, never rename or
+ * "image" is an image id as the run sheet uses. Images are browser-local for now (kept in the
+ * browser that added them, see media.ts), so anywhere else `color` is shown instead. A keyed
+ * lyric layer (the stream's) ignores `background`: it draws only the text over the video.
+ *
+ * Which theme is in use is a "setting" document, id "active-theme": { "v": 1, "themeId": "..." }.
+ * Add fields, never rename or
  * remove, and keep reading v 1: the native lyric layer (apps/daemon/src/lyrics.rs) will read
  * these same bodies. The three font names are a fixed list; each renderer picks its own face.
  */
@@ -107,4 +111,16 @@ export function themeStyle(t: Theme): string {
     `--t-shadow:${t.shadow ? "0 0 0.25em #000, 0 0 0.1em #000" : "none"}`,
     `--t-bg:${t.background.color}`,
   ].join(";");
+}
+
+export const ACTIVE_THEME_ID = "active-theme";
+
+export function activeBody(themeId: string): Record<string, unknown> {
+  return { v: 1, themeId };
+}
+
+/** The theme id a saved "active-theme" setting names; null if it isn't one this version reads. */
+export function activeFromDoc(doc: Doc): string | null {
+  const id = doc.body.themeId;
+  return doc.body.v === 1 && typeof id === "string" && id ? id : null;
 }

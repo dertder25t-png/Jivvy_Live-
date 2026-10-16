@@ -596,6 +596,9 @@ pub struct StateSnapshot {
     /// The slide at `slide_index`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slide: Option<Slide>,
+    /// The active theme's body, as the library keeps it; left out when none is picked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<Value>,
 }
 
 /// A device waiting for approval, as the church computer sees it.
@@ -1109,6 +1112,7 @@ mod tests {
             run_sheet_rev: None,
             slide_count: None,
             slide: None,
+            theme: None,
         };
         assert_eq!(
             serde_json::to_string(&ack("x", Some(state))).unwrap(),
@@ -1128,6 +1132,7 @@ mod tests {
             run_sheet_rev: None,
             slide_count: None,
             slide: None,
+            theme: None,
         };
         assert_eq!(
             serde_json::to_string(&state_event(state)).unwrap(),

@@ -31,10 +31,30 @@
   const image = document.getElementById("image");
   const canvas = window.__jivvyCanvas || { w: 1920, h: 1080, label: "" };
 
-  // The slide's text at 9% of the canvas height, smaller if that's what it takes for every
-  // line to fit (run sheets allow 16 lines): shrunk, never cut off.
+  // The theme the operator picked (font, size, colors, solid background), if the engine sent
+  // one; with none, everything below is as it always was. Sizes are a share of the canvas height.
+  const FONTS = {
+    sans: 'system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+    serif: 'Georgia, "Times New Roman", serif',
+    mono: 'ui-monospace, Consolas, "Courier New", monospace',
+  };
+  const HEX = /^#[0-9A-Fa-f]{6}$/;
+  let textPercent = 9;
+  function applyTheme(t) {
+    const ok = t && t.v === 1 && FONTS[t.font] && HEX.test(t.text) && t.background && HEX.test(t.background.color) &&
+      typeof t.size === "number" && t.size >= 2 && t.size <= 20;
+    slide.style.fontFamily = ok ? FONTS[t.font] : "";
+    slide.style.fontWeight = ok ? (t.bold ? "700" : "400") : "";
+    slide.style.color = ok ? t.text : "";
+    slide.style.textShadow = ok ? (t.shadow ? "0 0 .25em #000, 0 .05em .1em #000" : "none") : "";
+    textPercent = ok ? t.size : 9;
+    return ok ? t.background.color : "#000";
+  }
+
+  // The slide's text at the theme's size (9% of the canvas height without one), smaller if
+  // that's what it takes for every line to fit (run sheets allow 16 lines): shrunk, never cut off.
   function fitText() {
-    let size = canvas.h * 0.09;
+    let size = canvas.h * textPercent / 100;
     slide.style.fontSize = size + "px";
     // Too tall, or too wide (a word that can't break): smaller until it fits. No floor and
     // fractional sizes: even a 16 px canvas gets the whole slide, tiny, rather than cut off.
@@ -69,6 +89,9 @@
   window.jivvy = {
     render(state) {
       ident.classList.add("hidden");
+      const background = applyTheme(state.theme);
+      // Black is black, whatever the theme.
+      stage.style.background = state.black ? "#000" : background;
       slide.replaceChildren();
       // The run sheet's slide; with no run sheet set, the slide number.
       const lines = state.slide ? state.slide.lines : ["Slide " + (state.slideIndex + 1)];

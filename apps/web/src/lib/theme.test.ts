@@ -1,7 +1,7 @@
 import type { Ack, Command } from "@jivvy/protocol";
 import { describe, expect, it } from "vitest";
 import { getDoc, saveDoc, type Sender } from "./library";
-import { BUILT_IN, themeBody, themeFromDoc, themeStyle } from "./theme";
+import { ACTIVE_THEME_ID, BUILT_IN, activeBody, activeFromDoc, themeBody, themeFromDoc, themeStyle } from "./theme";
 
 describe("themes", () => {
   it("saves a theme like a song, reads it back, and ignores one it can't read", async () => {
@@ -28,6 +28,10 @@ describe("themes", () => {
     const doc = { kind: "theme", id: "n", title: "", rev: 1, updatedAt: 1 };
     expect(themeFromDoc({ ...doc, body: { ...themeBody(theme), v: 2 } })).toBeNull();
     expect(themeFromDoc({ ...doc, body: { ...themeBody(theme), text: "red" } })).toBeNull();
+    // The theme in use is a setting every device reads.
+    await saveDoc(conn, { kind: "setting", id: ACTIVE_THEME_ID, title: "Active theme", body: activeBody("mine") });
+    expect(activeFromDoc(await getDoc(conn, "setting", ACTIVE_THEME_ID))).toBe("mine");
+    expect(activeFromDoc({ ...doc, body: { v: 2, themeId: "x" } })).toBeNull();
     for (const b of BUILT_IN) expect(themeFromDoc({ ...doc, body: themeBody(b.theme) })).toEqual(b.theme);
   });
 });

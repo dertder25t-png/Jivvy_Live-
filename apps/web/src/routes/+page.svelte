@@ -8,6 +8,7 @@
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
   import { getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
+  import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
@@ -464,6 +465,7 @@
       <input id="address" bind:value={address} spellcheck="false" autocomplete="off" />
       <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
     </form>
+    <Export {ready} sender={() => conn} />
   {/if}
   <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
     {locked ? "Unlock" : "Lock for volunteers"}

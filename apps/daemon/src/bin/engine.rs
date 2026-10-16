@@ -81,9 +81,9 @@ fn main() {
             let mut on = false;
             loop {
                 let now = engine.lock().unwrap_or_else(|p| p.into_inner()).in_service();
-                if now != on {
+                // `on` changes only once the call worked, so a failure is retried next second.
+                if now != on && jivvy_daemon::power::keep_awake(now) {
                     on = now;
-                    jivvy_daemon::power::keep_awake(on);
                     log(
                         "engine",
                         if on { "service on: keeping the computer awake" } else { "service off: sleep allowed" },

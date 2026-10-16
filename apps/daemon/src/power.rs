@@ -32,8 +32,9 @@ pub fn in_service(a: &Activity) -> bool {
 
 /// Holds the system and display awake for as long as `on` is true. Call from one dedicated
 /// thread (Windows ties the request to the calling thread); repeating a value is harmless.
-pub fn keep_awake(on: bool) {
-    imp::keep_awake(on);
+/// Returns whether the request was made; on false the caller should try again.
+pub fn keep_awake(on: bool) -> bool {
+    imp::keep_awake(on)
 }
 
 #[cfg(windows)]
@@ -47,19 +48,29 @@ mod imp {
         fn SetThreadExecutionState(flags: u32) -> u32;
     }
 
-    pub fn keep_awake(on: bool) {
+    /// Set while failing, so a failure that repeats every second is logged once.
+    static FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn keep_awake(on: bool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         let flags = if on { ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED } else { ES_CONTINUOUS };
         // SAFETY: plain Win32 call with flag values; no pointers.
-        if unsafe { SetThreadExecutionState(flags) } == 0 {
-            crate::log("power", "SetThreadExecutionState failed; the computer may sleep");
+        let ok = unsafe { SetThreadExecutionState(flags) } != 0;
+        if !ok && !FAILING.swap(true, Relaxed) {
+            crate::log("power", "SetThreadExecutionState failed; the computer may sleep; retrying");
+        } else if ok {
+            FAILING.store(false, Relaxed);
         }
+        ok
     }
 }
 
 // macOS and Linux: no-op for now (see docs/HARDENING.md).
 #[cfg(not(windows))]
 mod imp {
-    pub fn keep_awake(_on: bool) {}
+    pub fn keep_awake(_on: bool) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

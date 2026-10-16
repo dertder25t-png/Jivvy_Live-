@@ -188,7 +188,7 @@ pub fn start_converter(data_dir: PathBuf, feed: Arc<Feed>, status: Arc<Mutex<Rec
 /// True while nothing is live: the recording and the stream are both off, as far as the
 /// engine has said.
 fn idle(feed: &Feed) -> bool {
-    feed.live.lock().unwrap().is_some_and(|s| !s.recording_wanted && !s.stream_wanted)
+    feed.live.lock().unwrap().as_ref().is_some_and(|s| !s.recording_wanted && !s.stream_wanted)
 }
 
 fn run(data_dir: &Path, feed: &Arc<Feed>, status: &Mutex<RecordingInfo>) {

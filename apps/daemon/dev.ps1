@@ -1,8 +1,8 @@
 # Daemon dev commands. GStreamer's paths are set for this process only, and only for the
 # commands that need the `video` feature (jivvy-video). Usage: .\dev.ps1 <command>
-#   .\dev.ps1 check     -> before pushing: cargo fmt, clippy, FAST tier, npm run typecheck, npm test.
+#   .\dev.ps1 check     -> before pushing (the whole PR gate in Stage 1A): cargo fmt, clippy, FAST tier, npm run typecheck, npm test.
 #                          Says at the end what it did not cover. No GStreamer needed.
-#   .\dev.ps1 test-full -> everything, once per PR: fmt, clippy and all tests with video, engine
+#   .\dev.ps1 test-full -> everything (nightly in CI; by hand when hardening): fmt, clippy and all tests with video, engine
 #                          killed 100 times, plus npm typecheck, tests and build (GStreamer + MediaMTX)
 #   .\dev.ps1 fast      -> FAST tier: unit tests (lib + bins, not jivvy-video) and the chaos tests without video,
 #                          debug build, kill test at JIVVY_CHAOS_ITERATIONS (default 10). No GStreamer.

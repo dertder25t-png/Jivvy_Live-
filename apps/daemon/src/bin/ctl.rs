@@ -37,25 +37,52 @@ fn run(inv: &ctl::Invocation) -> Result<(), String> {
     let id = format!("ctl-{}", std::process::id());
     let line = ctl::envelope(&inv.command, &id, jivvy_daemon::now_ms());
     conn.write_all(line.as_bytes()).map_err(|e| unreachable(&e))?;
-    // The ack comes at once; a watch then waits as long as it takes for the next event.
-    conn.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    let mut lines = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?).lines();
-    let ack = match lines.next() {
-        Some(Ok(l)) => l,
-        Some(Err(e)) => return Err(format!("no answer from the engine: {e}")),
-        None => return Err("the engine closed the connection without answering".into()),
+    // Timeouts go on the stream being read: on Windows a clone's timeout doesn't apply to it.
+    let mut reader = BufReader::new(conn);
+    let mut next_line = |timeout: Option<Duration>| -> Result<Option<String>, String> {
+        reader.get_ref().set_read_timeout(timeout).map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line.trim_end().to_string())),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    // The ack comes at once.
+    let ack = match next_line(Some(Duration::from_secs(5))) {
+        Ok(Some(l)) => l,
+        Err(e) => return Err(format!("no answer from the engine: {e}")),
+        Ok(None) => return Err("the engine closed the connection without answering".into()),
     };
     println!("{ack}");
     let ok = serde_json::from_str::<serde_json::Value>(&ack).is_ok_and(|v| v["ok"] == true);
     if !ok {
         return Err("the engine refused the command".into());
     }
-    if inv.watch {
-        conn.set_read_timeout(None).map_err(|e| e.to_string())?;
-        for event in lines {
-            println!("{}", event.map_err(|e| format!("connection lost: {e}"))?);
+    if let Some(name) = inv.until {
+        // The result follows the ack; the test takes about 5 s.
+        loop {
+            match next_line(Some(Duration::from_secs(40))) {
+                Ok(Some(event)) => {
+                    if serde_json::from_str::<serde_json::Value>(&event).is_ok_and(|v| v["event"] == name) {
+                        println!("{event}");
+                        return Ok(());
+                    }
+                }
+                Ok(None) => return Err("the engine closed the connection".into()),
+                Err(e) => return Err(format!("no {name} result: {e}")),
+            }
         }
-        return Err("the engine closed the connection".into());
+    }
+    if inv.watch {
+        // A watch waits as long as it takes for the next event.
+        loop {
+            match next_line(None) {
+                Ok(Some(event)) => println!("{event}"),
+                Ok(None) => return Err("the engine closed the connection".into()),
+                Err(e) => return Err(format!("connection lost: {e}")),
+            }
+        }
     }
     Ok(())
 }

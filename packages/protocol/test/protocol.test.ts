@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, type Command, type DaemonLike } from "../src/index";
+import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type StreamDestination } from "../src/index";
 import fixtures from "../fixtures/parse-cases.json";
+import alertFixtures from "../fixtures/stream-alerts.json";
+import preflightFixtures from "../fixtures/preflight-summary.json";
 
 type Case = { name: string; input: string; expect: { ok: boolean; command?: unknown; code?: string; id?: string } };
 const cases = fixtures.cases as Case[];
@@ -17,6 +19,20 @@ describe("shared conformance cases (also run by the Rust daemon)", () => {
   });
 });
 
+describe("stream alerts (the same cases run in the Rust daemon)", () => {
+  type AlertCase = { name: string; before: StreamDestination[]; after: StreamDestination[]; expect: unknown[] };
+  it.each((alertFixtures.cases as AlertCase[]).map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    expect(streamAlerts(c.before, c.after)).toEqual(c.expect);
+  });
+});
+
+describe("pre-flight summary (the same cases run in the Rust daemon)", () => {
+  type Case = { name: string; destinations: PreflightDestination[]; expect: string };
+  it.each((preflightFixtures.cases as Case[]).map((c) => [c.name, c] as const))("%s", (_name, c) => {
+    expect(preflightSummary(c.destinations)).toBe(c.expect);
+  });
+});
+
 describe("parseEnvelope", () => {
   it("round-trips every command", () => {
     for (const command of [
@@ -24,6 +40,11 @@ describe("parseEnvelope", () => {
       { type: "output.black", on: true }, { type: "stream.start" }, { type: "stream.stop" }, { type: "state.get" }, { type: "state.subscribe" },
       { type: "media.levels", peakDb: [-6, -7.5], rmsDb: [-18, -20] }, { type: "stream.report", status: "live" },
       { type: "recording.start" }, { type: "recording.stop" }, { type: "recording.report", status: "waiting", lowDisk: true },
+      { type: "runsheet.get" },
+      { type: "runsheet.set", runSheet: { id: "sun", title: "Sunday", items: [
+        { id: "s1", kind: "song", title: "Amazing Grace", slides: [{ lines: ["Amazing grace"] }, { lines: [] }] },
+        { id: "c1", kind: "countdown", title: "Countdown", slides: [{ lines: ["Starts in"], countdownTo: 1_760_000_000_000 }] },
+      ] } },
     ] satisfies Command[]) {
       const r = parseEnvelope(JSON.stringify(makeEnvelope(command)));
       expect(r.ok && r.envelope.command).toEqual(command);

@@ -1,5 +1,5 @@
 {
-  "about": "Shared behavior scenarios: command sequences and the acks they must produce, run against both the simulated daemon (packages/sim-daemon/test/scenarios.test.ts) and the real one (apps/daemon/tests/chaos.rs, shared_scenarios_*), so the two can't drift apart. Each step either sends a command or crashes the engine (it restarts from its snapshot). `expect` is matched as a subset of the ack. Stream steps check `streamWanted`, not `stream`, and recording steps `recordingWanted`, not `recording`: the simulated daemon simulates both itself, while the real engine reports them only once the video process does. New behavior goes here first: protocol, then sim-daemon, then the real daemon. Add scenarios; never change an existing expectation without a protocol version bump.",
+  "about": "Shared behavior scenarios: command sequences and the acks they must produce, run against both the simulated daemon (packages/sim-daemon/test/scenarios.test.ts) and the real one (apps/daemon/tests/chaos.rs, shared_scenarios_*), so the two can't drift apart. Each step either sends a command or crashes the engine (it restarts from its snapshot). `expect` is matched as a subset of the ack. Stream steps check `streamWanted`, not `stream`, and recording steps `recordingWanted`, not `recording`: the simulated daemon simulates both itself, while the real engine reports them only once the video process does. New behavior goes here first: protocol, then sim-daemon, then the real daemon. Add scenarios; never change an existing expectation without a protocol version bump. `connection` says who sends the steps: absent, any trusted connection (the church computer's local channel, or a device that has paired and proven its key); churchComputer, only the local channel; unpaired, a device on the network channel that hasn't paired or proven its key. A runner that can't make that kind of connection skips the scenario.",
   "scenarios": [
     {
       "name": "navigates and clamps at both ends",
@@ -116,6 +116,44 @@
         { "send": { "type": "recording.start" }, "expect": { "ok": true, "state": { "recordingWanted": true } } },
         { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false } } },
         { "send": { "type": "recording.stop" }, "expect": { "ok": true, "state": { "recordingWanted": false } } }
+      ]
+    },
+    {
+      "name": "pairing is closed until the church computer opens it, and only it can list or remove devices",
+      "slides": 5,
+      "connection": "churchComputer",
+      "steps": [
+        { "send": { "type": "device.list" }, "expect": { "ok": true, "devices": [] } },
+        { "send": { "type": "pair.open" }, "expect": { "ok": true, "pairing": { "open": true, "requests": [] } } },
+        { "send": { "type": "pair.close" }, "expect": { "ok": true, "pairing": { "open": false, "requests": [] } } },
+        { "send": { "type": "pair.approve", "requestId": "nope" }, "expect": { "ok": false, "code": "bad_arguments" } },
+        { "send": { "type": "pair.deny", "requestId": "nope" }, "expect": { "ok": false, "code": "bad_arguments" } },
+        { "send": { "type": "device.remove", "deviceId": "nope" }, "expect": { "ok": false, "code": "bad_arguments" } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": true, "state": { "slideIndex": 1 } } }
+      ]
+    },
+    {
+      "name": "an unpaired device can only ask to pair or prove its key, and nothing else",
+      "slides": 5,
+      "connection": "unpaired",
+      "steps": [
+        { "send": { "type": "state.get" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "slide.next" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "output.black", "on": true }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "stream.start" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "state.subscribe" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "stream.report", "status": "live" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "recording.report", "status": "recording" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "media.levels", "peakDb": [-6], "rmsDb": [-18] }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "pair.open" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "pair.approve", "requestId": "r1" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "device.list" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "device.remove", "deviceId": "d1" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "pair.request", "publicKey": "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "name": "Phone" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "auth.prove", "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "auth.hello", "publicKey": "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, "expect": { "ok": true } },
+        { "send": { "type": "auth.prove", "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }, "expect": { "ok": false, "code": "unauthorized" } },
+        { "send": { "type": "state.get" }, "expect": { "ok": false, "code": "unauthorized" } }
       ]
     }
   ]

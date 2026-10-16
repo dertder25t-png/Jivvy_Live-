@@ -20,7 +20,7 @@ use jivvy_daemon::{log, now_ms};
 use crate::program::Feed;
 use jivvy_daemon::bandwidth::{Quality, Tier};
 
-use crate::stream::{Link, PAUSED_DETAIL, Packet, lowered_detail, restarted, retimed, running_time, set, wanted};
+use crate::stream::{Link, PAUSED_DETAIL, Packet, restarted, retimed, running_time, set, wanted};
 
 /// One destination's queue, shared by its segmenter and uploader.
 struct Shared {
@@ -77,7 +77,7 @@ fn spool_lock(name: &str) -> Arc<Mutex<()>> {
 
 /// The engine's "wanted" flag: None until the engine has said (right after a restart).
 fn wanted_known(feed: &Feed) -> Option<bool> {
-    feed.live.lock().unwrap().map(|s| s.stream_wanted)
+    feed.live.lock().unwrap().as_ref().map(|s| s.stream_wanted)
 }
 
 /// One HLS destination, for as long as it is configured.
@@ -408,7 +408,7 @@ fn upload(
             };
             let (state, mut detail) = hls::health(confirmed_any, last_error.as_deref(), behind);
             if state == "live" {
-                detail = lowered_detail(&quality);
+                detail = link.detail(&quality);
             }
             set(&status, state, detail, kbps);
             status.lock().unwrap().quality = quality.label();

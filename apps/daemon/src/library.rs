@@ -100,7 +100,18 @@ impl Library {
 
     /// Every picture id (64 hex characters) named anywhere in a saved document, so pruning
     /// keeps the pictures plans and themes use.
-    pub fn media_ids(&self) -> Result<std::collections::HashSet<String>, Error> {
+    /// Reads them with a connection of its own that only reads (and waits if the library is
+    /// busy), so it can run beside the engine's.
+    pub fn scan_media_ids(data_dir: &Path) -> Result<std::collections::HashSet<String>, Error> {
+        let db = Connection::open_with_flags(
+            data_dir.join(FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        Library { db }.media_ids()
+    }
+
+    fn media_ids(&self) -> Result<std::collections::HashSet<String>, Error> {
         fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
             match v {
                 Value::String(_) => out.extend(crate::protocol::media_id(Some(v))),

@@ -728,7 +728,7 @@ impl Engine {
         self.pruning = Some(std::thread::spawn(move || {
             // Read the library here, not under the engine's lock.
             if has_library {
-                match crate::library::Library::open(&dir).and_then(|l| l.media_ids()) {
+                match crate::library::Library::scan_media_ids(&dir) {
                     Ok(ids) => {
                         protected.lock().unwrap_or_else(|p| p.into_inner()).extend(ids.iter().cloned());
                         *library_pictures.lock().unwrap_or_else(|p| p.into_inner()) = ids;
@@ -1327,7 +1327,7 @@ fn ws_session<S: OverTcp>(
     if !head.upgrade {
         // A picture by id (`/media/<id>`), for devices showing a plan or theme that uses it.
         if let Some(id) = head.path.strip_prefix("/media/") {
-            return crate::web::respond_image(&mut stream, data_dir, id, &head);
+            return crate::web::respond_image(&mut stream, data_dir, id, &head, &access.origins);
         }
         return crate::web::respond(&mut stream, access.web_dir.as_deref(), &head);
     }

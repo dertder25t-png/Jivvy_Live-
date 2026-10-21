@@ -18,6 +18,8 @@ pub struct Head {
     pub path: String,
     /// It asks to become a WebSocket.
     pub upgrade: bool,
+    /// The `Origin` header, if the request has one.
+    pub origin: Option<String>,
 }
 
 /// Reads a request head (up to the blank line) and returns every byte read, so the WebSocket
@@ -44,12 +46,15 @@ pub fn parse(head: &[u8]) -> Option<Head> {
     let mut first = lines.next()?.split(' ');
     let (method, target) = (first.next()?.to_string(), first.next()?);
     let path = target.split(['?', '#']).next().unwrap_or("/").to_string();
-    let upgrade = lines.take_while(|l| !l.is_empty()).any(|l| {
-        l.split_once(':').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("upgrade") && v.trim().eq_ignore_ascii_case("websocket")
-        })
-    });
-    Some(Head { method, path, upgrade })
+    let (mut upgrade, mut origin) = (false, None);
+    for (k, v) in lines.take_while(|l| !l.is_empty()).filter_map(|l| l.split_once(':')) {
+        let (k, v) = (k.trim(), v.trim());
+        upgrade |= k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket");
+        if k.eq_ignore_ascii_case("origin") {
+            origin = Some(v.to_string());
+        }
+    }
+    Some(Head { method, path, upgrade, origin })
 }
 
 /// The file for a URL path under `root`: the file itself, or the app's `index.html` for a
@@ -121,9 +126,27 @@ pub fn respond<W: Write>(w: &mut W, root: Option<&Path>, head: &Head) -> std::io
 
 /// A complete picture by id (`/media/<id>`): what any device loads to show a plan's or theme's
 /// picture. Ids are SHA-256 hashes of the bytes; anything else is a 404.
-pub fn respond_image<W: Write>(w: &mut W, data_dir: &Path, id: &str, head: &Head) -> std::io::Result<()> {
+/// A page from one of `allowed_origins` (the same list that may open the channel) may load it
+/// cross-origin; any other origin gets no CORS headers and the same-origin policy stands.
+pub fn respond_image<W: Write>(
+    w: &mut W,
+    data_dir: &Path,
+    id: &str,
+    head: &Head,
+    allowed_origins: &[String],
+) -> std::io::Result<()> {
     match crate::images::serve(data_dir, id) {
-        Some((kind, body)) => reply(w, head, "200 OK", kind, "private, max-age=31536000, immutable", &body),
+        Some((kind, body)) => {
+            let cors = head.origin.as_deref().filter(|o| allowed_origins.iter().any(|a| a.eq_ignore_ascii_case(o)));
+            let extra = match cors {
+                // The origin was matched against the list, so it holds no header-breaking bytes.
+                Some(o) => format!(
+                    "Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\nCross-Origin-Resource-Policy: cross-origin\r\n"
+                ),
+                None => "Vary: Origin\r\nCross-Origin-Resource-Policy: same-origin\r\n".to_string(),
+            };
+            reply_with(w, head, "200 OK", kind, "private, max-age=31536000, immutable", &extra, &body)
+        }
         None => reply(w, head, "404 Not Found", "text/plain; charset=utf-8", "", b"not found\n"),
     }
 }
@@ -131,11 +154,24 @@ pub fn respond_image<W: Write>(w: &mut W, data_dir: &Path, id: &str, head: &Head
 /// On every response. A page framed by another site would still be this origin, with this
 /// device's key and the channel open to it, so a click there could press Next or Black:
 /// never let it be framed (`frame-ancestors`, and `X-Frame-Options` for older browsers).
-const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\n";
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
 
 fn reply<W: Write>(w: &mut W, head: &Head, status: &str, kind: &str, cache: &str, body: &[u8]) -> std::io::Result<()> {
+    reply_with(w, head, status, kind, cache, "Cross-Origin-Resource-Policy: same-origin\r\n", body)
+}
+
+/// `extra`: more header lines, each ending in CRLF.
+fn reply_with<W: Write>(
+    w: &mut W,
+    head: &Head,
+    status: &str,
+    kind: &str,
+    cache: &str,
+    extra: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     let mut out = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}{extra}Connection: close\r\n",
         body.len()
     );
     if !cache.is_empty() {
@@ -174,6 +210,29 @@ impl<S: Write> Write for Replay<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_are_cross_origin_only_for_listed_origins() {
+        let dir = std::env::temp_dir().join(format!("jivvy-webimg-{}-{}", std::process::id(), crate::now_ms()));
+        std::fs::create_dir_all(crate::images::dir(&dir)).unwrap();
+        let id = "c".repeat(64);
+        std::fs::write(crate::images::path(&dir, &id), [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1]).unwrap();
+        let get = |origin: &str| {
+            let head =
+                parse(format!("GET /media/{id} HTTP/1.1\r\nHost: a\r\nOrigin: {origin}\r\n\r\n").as_bytes()).unwrap();
+            let mut out = Vec::new();
+            respond_image(&mut out, &dir, &id, &head, &["https://app.jivvy.org".to_string()]).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let ok = get("https://app.jivvy.org");
+        assert!(
+            ok.contains("Access-Control-Allow-Origin: https://app.jivvy.org")
+                && ok.contains("Resource-Policy: cross-origin")
+        );
+        let other = get("https://evil.example");
+        assert!(!other.contains("Access-Control-Allow-Origin") && other.contains("Resource-Policy: same-origin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn serves_files_pages_fall_back_to_the_app_and_nothing_escapes_the_folder() {

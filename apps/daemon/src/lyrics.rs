@@ -6,17 +6,50 @@ use ab_glyph::{Font, FontRef, PxScale, PxScaleFont, ScaleFont, point};
 
 type Scaled<'a, 'f> = PxScaleFont<&'a FontRef<'f>>;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Style {
     /// Text height as a fraction of frame height (0.06 = 65px at 1080p).
     pub size: f32,
     /// Gap between the text block and the bottom edge, as a fraction of frame height.
     pub bottom_margin: f32,
+    /// Text color, RGB.
+    pub color: [u8; 3],
+    /// A dark shadow behind the text.
+    pub shadow: bool,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Self { size: 0.06, bottom_margin: 0.08 }
+        Self { size: 0.06, bottom_margin: 0.08, color: [255, 255, 255], shadow: true }
     }
+}
+
+impl Style {
+    /// The style for the active theme (body format in apps/web/src/lib/theme.ts): size, text
+    /// color and shadow. No theme, or another version's, draws as it always did. A keyed layer
+    /// ignores `background`. Fonts: the layer has one face (the system bold sans `load_font`
+    /// finds), so every `font`, and `bold: false`, fall back to it until themes bundle fonts.
+    pub fn from_theme(theme: Option<&serde_json::Value>) -> Style {
+        let mut style = Style::default();
+        let Some(t) = theme.filter(|t| t.get("v").and_then(|v| v.as_u64()) == Some(1)) else { return style };
+        if let Some(size) = t.get("size").and_then(|v| v.as_f64()) {
+            style.size = (size.clamp(2.0, 20.0) / 100.0) as f32;
+        }
+        if let Some(color) = t.get("text").and_then(|v| v.as_str()).and_then(hex_color) {
+            style.color = color;
+        }
+        if let Some(shadow) = t.get("shadow").and_then(|v| v.as_bool()) {
+            style.shadow = shadow;
+        }
+        style
+    }
+}
+
+/// "#RRGGBB" as RGB.
+fn hex_color(s: &str) -> Option<[u8; 3]> {
+    let hex = s.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|c| c.is_ascii_hexdigit()))?;
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
 }
 
 /// Loads a TTF: the given path, else a common bold system font. (Themes will bundle fonts.)
@@ -71,7 +104,10 @@ pub fn render(font: &FontRef, lines: &[&str], frame_w: u32, frame_h: u32, style:
     let mut bgra = vec![0u8; (width * height * 4) as usize];
 
     // Shadow first, then the text on top.
-    for (pass, (color, offset)) in [([0u8, 0, 0], shadow), ([255u8, 255, 255], 0.0)].into_iter().enumerate() {
+    for (pass, (color, offset)) in [([0u8, 0, 0], shadow), (style.color, 0.0)].into_iter().enumerate() {
+        if pass == 0 && !style.shadow {
+            continue;
+        }
         let alpha = if pass == 0 { 0.7 } else { 1.0 };
         for (i, line) in lines.iter().enumerate() {
             let x0 = (width as f32 - widths[i]) / 2.0 + offset;
@@ -193,6 +229,25 @@ mod tests {
         let line = "W".repeat(200); // 200 characters, the protocol's longest line
         let l = render(&f, &[line.as_str()], 854, 480, &Style::default()).unwrap();
         assert!(l.width < 854 && l.x > 0, "fits without being cut: width {}", l.width);
+    }
+
+    #[test]
+    fn a_theme_sets_the_color_and_size_and_no_theme_draws_as_before() {
+        let f = font();
+        let lines = ["Amazing grace, how sweet the sound"];
+        let plain = render(&f, &lines, 1920, 1080, &Style::default()).unwrap();
+        let none = render(&f, &lines, 1920, 1080, &Style::from_theme(None)).unwrap();
+        assert_eq!((none.x, none.y, none.width, none.height), (plain.x, plain.y, plain.width, plain.height));
+        assert!(none.bgra == plain.bgra, "no theme must draw exactly as before");
+
+        let theme = serde_json::json!({ "v": 1, "font": "serif", "bold": false, "size": 9, "text": "#FF0000",
+            "shadow": false, "background": { "kind": "color", "color": "#F4F1EA" } });
+        let themed = render(&f, &lines, 1920, 1080, &Style::from_theme(Some(&theme))).unwrap();
+        assert!(themed.height > plain.height && themed.width > plain.width, "9% is bigger than the 6% default");
+        assert!(themed.y + themed.height as i32 <= 1080 && themed.x >= 0, "still inside the frame");
+        let solid: Vec<&[u8]> = themed.bgra.chunks(4).filter(|p| p[3] == 255).collect();
+        assert!(solid.len() > 1000, "expected visible glyph pixels, got {}", solid.len());
+        assert!(solid.iter().all(|p| p[..3] == [0, 0, 255]), "solid pixels are pure red (BGRA)");
     }
 
     #[test]

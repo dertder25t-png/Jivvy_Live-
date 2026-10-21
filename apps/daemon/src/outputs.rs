@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "outputs.json";
 pub const STATUS_FILE: &str = "outputs-status.json";
+/// The status file is written again at least this often even when nothing changed, so its age
+/// tells pre-flight whether `jivvy-outputs` is still running (`preflight::OUTPUTS_STATUS_STALE`).
+pub const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 pub const CONFIG_VERSION: u32 = 1;
 /// Largest canvas side accepted; anything else falls back to the monitor's native size.
 pub const MAX_SIDE: u32 = 16_384;
@@ -193,6 +196,7 @@ pub struct Model {
     pub connected: bool,
     pub shown: Option<LiveState>,
     last_written: Vec<u8>,
+    written_at: Option<std::time::Instant>,
 }
 
 impl Model {
@@ -212,6 +216,7 @@ impl Model {
             connected: false,
             shown: None,
             last_written: Vec::new(),
+            written_at: None,
         }
     }
 
@@ -239,12 +244,15 @@ impl Model {
         }
     }
 
-    /// Writes `outputs-status.json` if anything changed since the last write.
+    /// Writes `outputs-status.json` if anything changed since the last write, or every
+    /// `STATUS_REFRESH` anyway.
     pub fn write_status(&mut self) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(&self.status())?;
-        if bytes != self.last_written {
+        let due = self.written_at.is_none_or(|at| at.elapsed() >= STATUS_REFRESH);
+        if bytes != self.last_written || due {
             crate::write_atomic(&self.dir.join(STATUS_FILE), &bytes)?;
             self.last_written = bytes;
+            self.written_at = Some(std::time::Instant::now());
         }
         Ok(())
     }
@@ -279,6 +287,7 @@ mod tests {
             stream_wanted: false,
             recording_wanted: false,
             slide: None,
+            theme: None,
         });
         m.write_status().unwrap();
         let status: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(STATUS_FILE)).unwrap()).unwrap();

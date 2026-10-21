@@ -73,6 +73,27 @@ fn main() {
         }
     }
 
+    // Keeps the computer awake while a service is on. One thread for the engine's whole life:
+    // Windows ties the request to the thread that made it.
+    {
+        let engine = engine.clone();
+        std::thread::spawn(move || {
+            let mut on = false;
+            loop {
+                let now = engine.lock().unwrap_or_else(|p| p.into_inner()).in_service();
+                // `on` changes only once the call worked, so a failure is retried next second.
+                if now != on && jivvy_daemon::power::keep_awake(now) {
+                    on = now;
+                    log(
+                        "engine",
+                        if on { "service on: keeping the computer awake" } else { "service off: sleep allowed" },
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
     if supervised {
         // The watchdog holds our stdin open; end-of-file means it is gone, so exit
         // rather than keep the command port from the next engine.

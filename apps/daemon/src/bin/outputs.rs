@@ -130,6 +130,8 @@ mod ui {
         Update(Update),
         /// An output's page finished loading and can be drawn.
         Ready(String),
+        /// A key pressed in an output window (a clicker's, usually).
+        Key(String),
     }
 
     struct OutputWindow {
@@ -222,6 +224,8 @@ mod ui {
             .with_ipc_handler(move |req| {
                 if req.body() == "ready" {
                     let _ = proxy.send_event(UserEvent::Ready(id.clone()));
+                } else if let Some(key) = req.body().strip_prefix("key:") {
+                    let _ = proxy.send_event(UserEvent::Key(key.to_string()));
                 }
             })
             .build(&window)
@@ -288,6 +292,7 @@ mod ui {
         let mut model = Model::new(&args.data_dir);
         let mut windows: HashMap<String, OutputWindow> = HashMap::new();
         let mut ticks = 0u64;
+        let keys = client::KeyWorker::start(args.connect.clone());
         event_loop.run(move |event, target, control_flow| {
             *control_flow = ControlFlow::Wait;
             match event {
@@ -300,6 +305,8 @@ mod ui {
                     if ticks.is_multiple_of(RESCAN_TICKS) {
                         reconcile(target, &mut model, &mut windows, &proxy);
                     }
+                    // Unchanged, it is rewritten only every STATUS_REFRESH: its age says this is alive.
+                    write_status(&mut model);
                 }
                 Event::UserEvent(UserEvent::Update(u)) => {
                     if let Some(state) = apply(&mut model, u) {
@@ -311,6 +318,11 @@ mod ui {
                     if let (Some(w), Some(state)) = (windows.get(&id), model.shown.as_ref()) {
                         render(w, state);
                     }
+                }
+                Event::UserEvent(UserEvent::Key(key)) => {
+                    let black = model.shown.as_ref().is_some_and(|s| s.black);
+                    // One worker thread sends keys in order, off the UI thread.
+                    keys.press(&key, black);
                 }
                 // Outputs close only when unplugged or reconfigured, never by accident.
                 Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {}

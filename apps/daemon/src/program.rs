@@ -401,7 +401,8 @@ mod tests {
                 black: false,
                 stream_wanted: false,
                 recording_wanted: false,
-                slide: None
+                slide: None,
+                theme: None
             })),
             ["Slide 3"]
         );
@@ -411,7 +412,8 @@ mod tests {
                 black: true,
                 stream_wanted: false,
                 recording_wanted: false,
-                slide: None
+                slide: None,
+                theme: None
             }))
             .is_empty()
         );

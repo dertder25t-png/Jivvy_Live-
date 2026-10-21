@@ -1,6 +1,6 @@
 import type { Ack, Command } from "@jivvy/protocol";
 import { describe, expect, it } from "vitest";
-import { getDoc, planFromDoc, saveDoc, songFromDoc, type Sender } from "./library";
+import { deleteDoc, getDoc, listDocs, planFromDoc, saveDoc, songFromDoc, type Sender } from "./library";
 
 /** A church computer's library in memory, with the daemon's revision rule. */
 function fakeDaemon(): Sender {
@@ -19,6 +19,20 @@ function fakeDaemon(): Sender {
         const d = docs.get(`${c.kind}/${c.id}`);
         if (!d) return { ...base, ok: false, code: "bad_arguments", message: "none" };
         return { ...base, ok: true, doc: { kind: c.kind, id: c.id, title: d.title, rev: d.rev, updatedAt: 1, body: d.body } };
+      }
+      if (c.type === "doc.list") {
+        const docs_ = [...docs].filter(([k]) => k.startsWith(`${c.kind}/`)).map(([k, d]) => ({
+          kind: c.kind, id: k.slice(c.kind.length + 1), title: d.title, rev: d.rev, updatedAt: 1,
+        }));
+        return { ...base, ok: true, docs: docs_ };
+      }
+      if (c.type === "doc.delete") {
+        const key = `${c.kind}/${c.id}`;
+        const d = docs.get(key);
+        if (!d) return { ...base, ok: false, code: "bad_arguments", message: "none" };
+        if (c.baseRev !== undefined && c.baseRev !== d.rev) return { ...base, ok: false, code: "conflict", message: "changed" };
+        docs.delete(key);
+        return { ...base, ok: true };
       }
       return { ...base, ok: false, code: "unknown_command", message: c.type };
     },
@@ -41,5 +55,23 @@ describe("library", () => {
     expect(planFromDoc(await getDoc(conn, "plan", "sun"))).toEqual({ id: "sun", title: "Sunday", items });
     // A body this version can't read is left alone rather than half-loaded.
     expect(planFromDoc({ kind: "plan", id: "x", title: "", rev: 1, updatedAt: 1, body: { items: [{ id: 1 }] } })).toBeNull();
+  });
+
+  it("deleting a song takes it out of the library list", async () => {
+    const conn = fakeDaemon();
+    const song = { title: "Amazing Grace", sections: [{ id: "v1", label: "Verse 1", text: "Amazing grace" }], arrangement: ["v1"] };
+    await saveDoc(conn, { kind: "song", id: "amazing-grace", title: "Amazing Grace", body: song });
+    expect((await listDocs(conn, "song")).map((d) => d.id)).toEqual(["amazing-grace"]);
+    // Another device saved after this one (revision 1 -> 2): a delete from the old copy is refused and nothing is lost.
+    await saveDoc(conn, { kind: "song", id: "amazing-grace", title: "Amazing Grace", body: song }, 1);
+    expect(await deleteDoc(conn, "song", "amazing-grace", 1)).toEqual({
+      ok: false,
+      conflict: true,
+      message: "changed",
+    });
+    expect((await listDocs(conn, "song")).map((d) => d.id)).toEqual(["amazing-grace"]);
+    // From the current revision it goes, and the doc leaves the list.
+    expect(await deleteDoc(conn, "song", "amazing-grace", 2)).toEqual({ ok: true });
+    expect(await listDocs(conn, "song")).toEqual([]);
   });
 });

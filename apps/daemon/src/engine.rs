@@ -28,6 +28,8 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
 /// restarting): screens see "reconnecting", never a stale "live".
+/// How long a picture a device just sent stays even if nothing names it yet.
+const RECENT_PICTURES: Duration = Duration::from_secs(600);
 pub const STREAM_REPORT_STALE: Duration = Duration::from_secs(3);
 /// The same for the recording: a silent video process is never shown as recording.
 pub const RECORDING_REPORT_STALE: Duration = Duration::from_secs(3);
@@ -130,11 +132,23 @@ pub struct Engine {
     /// sent, asked about or named since. Each clean-up checks it just before each delete, so
     /// an older one still running can never remove an image a newer run sheet shows.
     protected: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Pictures a device uploaded or asked about recently, and when: kept for `RECENT_PICTURES`
+    /// even if no saved document names them yet (the device saves right after uploading).
+    recent_pictures: Vec<(String, Instant)>,
+    recent_for: Duration,
+    /// What the library named at the last clean-up; kept until the next one finishes its scan.
+    library_pictures: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
+    /// When an operator command last changed what is shown (slide, black, run sheet); the
+    /// engine's start counts. Not saved: for `in_service` only.
+    last_shown_change: Instant,
     /// Songs, plans, themes and settings (`library.sqlite3`); None if it couldn't be opened,
     /// which never stops a service: the doc commands answer `unavailable`.
     library: Option<crate::library::Library>,
+    /// The body of the active theme (the "active-theme" setting names it), read from the library
+    /// whenever a theme or setting is saved; screens get it in the state.
+    theme: Option<serde_json::Value>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -196,8 +210,13 @@ impl Engine {
             uploads: Default::default(),
             pruning: None,
             protected: Default::default(),
+            recent_pictures: Vec::new(),
+            recent_for: RECENT_PICTURES,
+            library_pictures: Default::default(),
             shown_since: None,
+            last_shown_change: Instant::now(),
             library,
+            theme: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -214,6 +233,7 @@ impl Engine {
             recording_report: None,
             last_sent: None,
         };
+        engine.refresh_theme();
         // Left from before a crash: images no run sheet shows, pieces of uploads that stopped.
         engine.prune_images();
         engine
@@ -221,6 +241,18 @@ impl Engine {
 
     pub fn state(&self) -> &Snapshot {
         &self.state
+    }
+
+    /// A service is on (see `power::in_service`). A future updater must not install or restart
+    /// anything while this is true.
+    pub fn in_service(&self) -> bool {
+        crate::power::in_service(&crate::power::Activity {
+            stream_wanted: self.state.stream_wanted,
+            recording_wanted: self.state.recording_wanted,
+            run_sheet_set: self.run_sheet.is_some(),
+            black: self.state.black,
+            since_last_change: self.last_shown_change.elapsed(),
+        })
     }
 
     /// How many slides there are: the run sheet's, else `--slides`. Never 0.
@@ -274,6 +306,25 @@ impl Engine {
                 .run_sheet
                 .as_ref()
                 .map(|s| s.run_sheet.slides().nth(self.state.slide_index as usize).cloned().unwrap_or_default()),
+            theme: self.theme.clone(),
+        }
+    }
+
+    /// Reads the active theme from the library: the "active-theme" setting names a "theme"
+    /// document, whose body is sent to the screens as it is, or a built-in theme (which has no
+    /// document). None if either is missing or the theme isn't valid; a library read that fails
+    /// keeps the theme already in use.
+    fn refresh_theme(&mut self) {
+        let Some(lib) = self.library.as_ref() else { return };
+        let read = || -> Result<Option<serde_json::Value>, crate::library::Error> {
+            let Some(active) = lib.get("setting", "active-theme")? else { return Ok(None) };
+            let Some(id) = active.body.get("themeId").and_then(|v| v.as_str()) else { return Ok(None) };
+            let Some(doc) = lib.get("theme", id)? else { return Ok(built_in_theme(id)) };
+            Ok(valid_theme(&doc.body).then_some(serde_json::Value::Object(doc.body)))
+        };
+        match read() {
+            Ok(found) => self.theme = found,
+            Err(e) => crate::log("engine", format!("library: can't read the theme, keeping the last one: {e:?}")),
         }
     }
 
@@ -408,6 +459,7 @@ impl Engine {
             Command::MediaHas { ids } => {
                 // A device skips sending what is here, so it has to stay until the run sheet.
                 self.protect(ids.iter().cloned());
+                self.recent_pictures.extend(ids.iter().map(|i| (i.clone(), Instant::now())));
                 let missing = ids.into_iter().filter(|m| !crate::images::has(self.store.dir(), m)).collect();
                 return protocol::ack_with(id, None, AckExtras { missing: Some(missing), ..Default::default() });
             }
@@ -511,6 +563,9 @@ impl Engine {
                 // they come straight back to the same slide before it.
                 self.shown_since = None;
             }
+            if next.slide_index != self.state.slide_index || next.black != self.state.black {
+                self.last_shown_change = Instant::now();
+            }
             self.state = next;
             self.broadcast();
         }
@@ -584,6 +639,7 @@ impl Engine {
         match crate::images::put(&mut self.uploads, self.store.dir(), media, offset, &bytes, last) {
             Ok(progress) => {
                 if progress.complete && last {
+                    self.recent_pictures.push((media.to_string(), Instant::now()));
                     crate::log("engine", format!("image {} received ({} bytes)", &media[..12], progress.received));
                 }
                 protocol::ack_with(id, None, AckExtras { media: Some(progress), ..Default::default() })
@@ -632,6 +688,7 @@ impl Engine {
         next.run_sheet_id = Some(saved.run_sheet.id.clone());
         next.loop_stopped = false;
         self.run_sheet = Some(saved);
+        self.last_shown_change = Instant::now();
         // A loop in the new run sheet gets its full time on its first slide, even if the
         // slide number is the same as before.
         self.shown_since = None;
@@ -656,18 +713,44 @@ impl Engine {
     /// Runs on its own thread: deleting many files must never hold the engine's lock (the
     /// heartbeat waits on it).
     fn prune_images(&mut self) {
-        let keep: std::collections::HashSet<String> =
+        let mut keep: std::collections::HashSet<String> =
             self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.clone()).collect();
+        // A picture a device just sent stays a while: it saves its plan or theme right after.
+        let window = self.recent_for;
+        self.recent_pictures.retain(|(_, at)| at.elapsed() < window);
+        keep.extend(self.recent_pictures.iter().map(|(id, _)| id.clone()));
+        // Pictures saved plans and themes use stay too (as of the last scan until this one ends).
+        keep.extend(self.library_pictures.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned());
         let (dir, arriving) = (self.store.dir().to_path_buf(), self.uploads.ids());
         // From now on only these are protected, plus whatever devices send or name next.
         *self.protected.lock().unwrap_or_else(|p| p.into_inner()) = keep.union(&arriving).cloned().collect();
         let protected = self.protected.clone();
+        let (has_library, library_pictures) = (self.library.is_some(), self.library_pictures.clone());
         self.pruning = Some(std::thread::spawn(move || {
+            // Read the library here, not under the engine's lock.
+            if has_library {
+                match crate::library::Library::scan_media_ids(&dir) {
+                    Ok(ids) => {
+                        protected.lock().unwrap_or_else(|p| p.into_inner()).extend(ids.iter().cloned());
+                        *library_pictures.lock().unwrap_or_else(|p| p.into_inner()) = ids;
+                    }
+                    Err(e) => {
+                        // Can't tell what the library uses: keep everything this round.
+                        crate::log("engine", format!("library: can't list its pictures, not pruning: {e:?}"));
+                        return;
+                    }
+                }
+            }
             let removed = crate::images::prune(&dir, &protected, &arriving);
             if removed > 0 {
                 crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
             }
         }));
+    }
+
+    /// The folder the images and the library live in.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        self.store.dir().to_path_buf()
     }
 
     fn protect(&self, ids: impl IntoIterator<Item = String>) {
@@ -716,9 +799,21 @@ impl Engine {
         let cancel = Arc::new(AtomicBool::new(false));
         self.preflight_cancel = Some(cancel.clone());
         let (dir, url) = (self.store.dir().to_path_buf(), self.upload_test_url.clone());
+        // The video process reports about once a second: fresh reports mean its status file is current.
+        let now = Instant::now();
+        let video_alive =
+            self.stream_report.as_ref().is_some_and(|r| now.saturating_duration_since(r.1) < STREAM_REPORT_STALE)
+                || self
+                    .recording_report
+                    .as_ref()
+                    .is_some_and(|r| now.saturating_duration_since(r.2) < RECORDING_REPORT_STALE);
+        let live = crate::preflight::Live {
+            video_installed: video_alive || crate::preflight::Live::video_installed_here(),
+            video_alive,
+        };
         crate::log("engine", "pre-flight: testing the upload");
         std::thread::spawn(move || {
-            let result = crate::preflight::run(&dir, &url, cancel);
+            let result = crate::preflight::run(&dir, &url, cancel, live);
             let Some(engine) = handle.upgrade() else { return };
             let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
             e.preflight_cancel = None;
@@ -912,6 +1007,13 @@ impl Engine {
             _ => unreachable!("only doc commands come here"),
         };
         let (saved, deleted) = changed;
+        if saved.kind == "theme" || saved.kind == "setting" {
+            let before = self.theme.clone();
+            self.refresh_theme();
+            if self.theme != before {
+                self.broadcast();
+            }
+        }
         if let Ok(line) = serde_json::to_vec(&protocol::doc_changed_event(&saved, deleted)) {
             self.send_to_subscribers(line);
         }
@@ -950,6 +1052,44 @@ impl Engine {
 }
 
 /// One event to one connection, if it can receive events; never blocks.
+/// The built-in themes (`BUILT_IN` in apps/web/src/lib/theme.ts; keep the two the same), which
+/// the web app never saves as documents. Black is the default look, so it sends no theme and
+/// every screen draws exactly as it does with none.
+fn built_in_theme(id: &str) -> Option<serde_json::Value> {
+    let (font, bold, text, background) = match id {
+        "jivvy-navy" => ("sans", true, "#F4F1EA", "#10224F"),
+        "jivvy-paper" => ("serif", false, "#10224F", "#F4F1EA"),
+        _ => return None, // "jivvy-black", or not a built-in
+    };
+    Some(serde_json::json!({ "v": 1, "font": font, "bold": bold, "size": 7, "text": text, "shadow": false,
+        "background": { "kind": "color", "color": background } }))
+}
+
+/// The same checks as `themeFromDoc` (apps/web/src/lib/theme.ts), and a small size cap: a theme
+/// that fails them is not sent to the screens, which then draw as they always did.
+fn valid_theme(b: &serde_json::Map<String, serde_json::Value>) -> bool {
+    use serde_json::Value;
+    let color = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|c| c.is_ascii_hexdigit()))
+    };
+    let Some(Value::Object(bg)) = b.get("background") else { return false };
+    let background = match bg.get("kind").and_then(Value::as_str) {
+        Some("color") => true,
+        Some("image") => bg.get("image").and_then(Value::as_str).is_some_and(|s| !s.is_empty()),
+        _ => false,
+    };
+    b.get("v") == Some(&Value::from(1))
+        && serde_json::to_string(b).is_ok_and(|s| s.len() <= 4096)
+        && b.get("font").and_then(Value::as_str).is_some_and(|f| ["sans", "serif", "mono"].contains(&f))
+        && b.get("size").and_then(Value::as_f64).is_some_and(|n| (2.0..=20.0).contains(&n))
+        && b.get("bold").is_some_and(Value::is_boolean)
+        && b.get("shadow").is_some_and(Value::is_boolean)
+        && color(b.get("text"))
+        && color(bg.get("color"))
+        && background
+}
+
 fn send_event(outbox: Option<&Outbox>, event: &impl serde::Serialize) {
     if let (Some(o), Ok(mut line)) = (outbox, serde_json::to_vec(event)) {
         line.push(b'\n');
@@ -1113,11 +1253,12 @@ impl WsAccess {
 /// With `tls`, every connection is `wss://` with the church's certificate; there is no plain
 /// fallback.
 pub fn serve_ws(listener: TcpListener, engine: Arc<Mutex<Engine>>, access: Arc<WsAccess>, tls: Option<Arc<TlsFiles>>) {
+    let data_dir = engine.lock().unwrap_or_else(|p| p.into_inner()).data_dir();
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let (engine, access, tls) = (engine.clone(), access.clone(), tls.clone());
+        let (engine, access, tls, data_dir) = (engine.clone(), access.clone(), tls.clone(), data_dir.clone());
         std::thread::spawn(move || {
-            let _ = serve_ws_connection(stream, &engine, &access, tls.as_deref());
+            let _ = serve_ws_connection(stream, &engine, &access, &data_dir, tls.as_deref());
         });
     }
 }
@@ -1126,6 +1267,7 @@ fn serve_ws_connection(
     stream: TcpStream,
     engine: &Mutex<Engine>,
     access: &WsAccess,
+    data_dir: &std::path::Path,
     tls: Option<&TlsFiles>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
@@ -1133,12 +1275,20 @@ fn serve_ws_connection(
     let shared = Arc::new(stream.try_clone()?);
     let mut session = Session::device();
     let result = match tls {
-        None => ws_session(stream, &shared, engine, access, &mut session, false),
+        None => ws_session(stream, &shared, engine, access, data_dir, &mut session, false),
         // No good certificate yet: refuse rather than serve in plain text.
         Some(tls) => match tls.config() {
             Some(config) => {
                 let conn = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
-                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access, &mut session, true)
+                ws_session(
+                    rustls::StreamOwned::new(conn, stream),
+                    &shared,
+                    engine,
+                    access,
+                    data_dir,
+                    &mut session,
+                    true,
+                )
             }
             None => Ok(()),
         },
@@ -1178,6 +1328,7 @@ fn ws_session<S: OverTcp>(
     socket: &Arc<TcpStream>,
     engine: &Mutex<Engine>,
     access: &WsAccess,
+    data_dir: &std::path::Path,
     session: &mut Session,
     secure: bool,
 ) -> std::io::Result<()> {
@@ -1188,6 +1339,10 @@ fn ws_session<S: OverTcp>(
     let Some(raw) = crate::web::read_head(&mut stream)? else { return Ok(()) };
     let Some(head) = crate::web::parse(&raw) else { return Ok(()) };
     if !head.upgrade {
+        // A picture by id (`/media/<id>`), for devices showing a plan or theme that uses it.
+        if let Some(id) = head.path.strip_prefix("/media/") {
+            return crate::web::respond_image(&mut stream, data_dir, id, &head, &access.origins);
+        }
         return crate::web::respond(&mut stream, access.web_dir.as_deref(), &head);
     }
     let stream = crate::web::Replay { head: std::io::Cursor::new(raw), inner: stream };
@@ -1287,6 +1442,40 @@ mod tests {
     }
 
     #[test]
+    fn the_state_carries_the_active_theme_once_the_setting_and_theme_are_saved() {
+        let (mut e, _dir) = engine("theme", 10);
+        assert_eq!(e.view().theme, None);
+        let theme = json!({ "v": 1, "font": "serif", "bold": false, "size": 7, "text": "#10224F", "shadow": false,
+            "background": { "kind": "color", "color": "#F4F1EA" } });
+        send(&mut e, json!({ "type": "doc.put", "kind": "theme", "id": "paper", "title": "Paper", "body": theme }));
+        send(
+            &mut e,
+            json!({ "type": "doc.put", "kind": "setting", "id": "active-theme", "title": "Active theme",
+                "body": { "v": 1, "themeId": "paper" } }),
+        );
+        assert_eq!(e.view().theme, Some(theme.clone()));
+        // A theme that fails the checks (a color that isn't #RRGGBB) is not sent.
+        let bad = json!({ "v": 1, "font": "serif", "bold": false, "size": 7, "text": "red", "shadow": false,
+            "background": { "kind": "color", "color": "#F4F1EA" } });
+        send(&mut e, json!({ "type": "doc.put", "kind": "theme", "id": "paper", "title": "Paper", "body": bad }));
+        assert_eq!(e.view().theme, None);
+        // A built-in has no document: the engine knows it. Black is the default look: no theme.
+        let pick = |e: &mut Engine, id: &str| {
+            send(
+                e,
+                json!({ "type": "doc.put", "kind": "setting", "id": "active-theme", "title": "Active theme",
+                    "body": { "v": 1, "themeId": id } }),
+            );
+        };
+        pick(&mut e, "jivvy-navy");
+        let navy = e.view().theme.expect("the built-in Navy theme is sent");
+        assert_eq!((navy["text"].as_str(), navy["background"]["color"].as_str()), (Some("#F4F1EA"), Some("#10224F")));
+        assert!(valid_theme(navy.as_object().unwrap()));
+        pick(&mut e, "jivvy-black");
+        assert_eq!(e.view().theme, None);
+    }
+
+    #[test]
     fn the_library_keeps_songs_across_a_restart_and_every_screen_hears_of_changes() {
         let (mut e, dir) = engine("library", 10);
         let (tx, rx) = sync_channel(OUTBOX_CAPACITY);
@@ -1308,6 +1497,43 @@ mod tests {
         let mut e = Engine::new(Store::new(&dir).unwrap(), Snapshot::default(), 10);
         assert_eq!(send(&mut e, json!({ "type": "doc.list", "kind": "song" }))["docs"][0]["title"], "Amazing Grace");
         assert_eq!(send(&mut e, json!({ "type": "doc.get", "kind": "song", "id": "grace" }))["doc"]["body"], song);
+    }
+
+    #[test]
+    fn pictures_in_saved_plans_and_themes_are_kept_and_served_by_id() {
+        let (mut e, dir) = engine("library-media", 10);
+        // The clean-up the engine starts at boot must be done before files appear without going
+        // through an upload (it protects nothing else), or it may sweep them.
+        e.wait_for_pruning();
+        let (used, unused) = ("a".repeat(64), "b".repeat(64));
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend([1u8; 16]);
+        std::fs::create_dir_all(crate::images::dir(&dir)).unwrap();
+        for id in [&used, &unused] {
+            std::fs::write(crate::images::path(&dir, id), &png).unwrap();
+        }
+        let plan = json!({ "items": [{ "id": "i", "kind": "image", "title": "", "text": "", "images": [used] }] });
+        send(
+            &mut e,
+            json!({ "type": "doc.put", "kind": "plan", "id": "sun", "title": "Sunday", "body": plan, "baseRev": 0 }),
+        );
+        // Any run sheet change prunes: the picture the plan uses stays, the other goes.
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": { "id": "x", "title": "", "items": [] } }));
+        e.wait_for_pruning();
+        assert!(crate::images::has(&dir, &used), "the picture a saved plan uses is kept");
+        assert!(!crate::images::has(&dir, &unused), "a picture nothing uses goes");
+        let (kind, bytes) = crate::images::serve(&dir, &used).unwrap();
+        assert_eq!((kind, bytes), ("image/png", png.clone()));
+
+        // A picture uploaded but not yet named by a saved document survives a run sheet change.
+        use base64::Engine as _;
+        let fresh: String =
+            ring::digest::digest(&ring::digest::SHA256, &png).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        send(&mut e, json!({ "type": "media.put", "id": fresh, "offset": 0, "data": data, "last": true }));
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": { "id": "y", "title": "", "items": [] } }));
+        e.wait_for_pruning();
+        assert!(crate::images::has(&dir, &fresh), "kept until a document names it");
     }
 
     #[test]
@@ -1464,7 +1690,9 @@ mod tests {
         assert_eq!(crate::images::prune(&dir, &e.protected, &Default::default()), 0);
         assert!(crate::images::has(&dir, &id));
 
-        // The next run sheet doesn't show it: the church computer doesn't keep it.
+        // The next run sheet doesn't show it: the church computer doesn't keep it (once it is
+        // no longer a picture a device just sent).
+        e.recent_for = Duration::ZERO;
         let next = json!({ "id": "next", "title": "", "items": [] });
         send(&mut e, json!({ "type": "runsheet.set", "runSheet": next }));
         e.wait_for_pruning();
@@ -2297,6 +2525,7 @@ mod tests {
         drop(e);
         let heard = wait_event(&screen, "preflight");
         assert_eq!(heard["preflight"]["status"], "failed");
+        assert_eq!(heard["preflight"]["stopped"], true);
         assert!(heard["preflight"]["message"].as_str().unwrap().contains("the stream started"));
         let mut e = shared.lock().unwrap();
         assert_eq!(send(&mut e, json!({ "type": "stream.preflight" }))["code"], "unavailable");

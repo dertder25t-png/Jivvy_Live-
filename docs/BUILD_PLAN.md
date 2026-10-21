@@ -208,17 +208,17 @@ Everything a church needs to run a whole service. Built and tested by us on our 
 - [x] Local database on the church computer (SQLite) holding the library, plans, themes and settings. It is the master copy during a service and the only copy for churches without Plus; the cloud is a synced copy, never the source of truth on Sunday
   - Done (`apps/daemon/src/library.rs`, protocol `doc.*`, PR #46): `library.sqlite3` in the data directory (SQLite compiled in, WAL, every commit synced before the ack) holds documents by kind (`song`, `plan`, `theme`, `setting`; the daemon keeps each body as given, so new kinds need no daemon change). `doc.list`, `doc.get`, `doc.put`, `doc.delete`; every save bumps a revision, and a save or delete with an older `baseRev` gets `conflict`, so an edit made on another device is never silently overwritten (the base the sync engine builds on). Subscribers hear `doc.changed`. A library that can't be opened answers `unavailable` and never stops the engine. The web app saves songs to the library and adds them back from it (beside the hymns), and keeps the run sheet as a plan on the church computer as you edit; a plan changed on another device stops saving here with a plain message until it is opened again from Plans. Tested end to end against the release daemon, including a change from another device.
   - Left for later: themes and settings screens (their items); pictures in a plan stay in the browser that added them, so a plan opened on another device shows its words but not its pictures until media moves into the library; deleting songs and plans from the UI; backups and export (System screen and export items).
-- [ ] Themes (fonts, colors, backgrounds)
-- [ ] Pre-flight check (a web app screen using the daemon's checks and streaming summary)
-- [ ] Installable PWA that keeps working offline
-- [ ] Keyboard and clicker control on the computer itself
+- [x] Themes (fonts, colors, backgrounds) — #49, #58 (output windows and the stream lyric layer use the active theme; pictures travel via #57)
+- [x] Pre-flight check (a web app screen using the daemon's checks and streaming summary) — #53, #55 (left for later: stream key validity with each platform)
+- [x] Installable PWA that keeps working offline — #48 (secure origins only; a plain-http LAN address works without install or offline)
+- [x] Keyboard and clicker control on the computer itself — #50
 
 **Then**
 
 - [ ] No-audio and stream-down alerts (web push + email)
-- [ ] Blocks sleep during services; no updates during service windows
+- [x] Blocks sleep during services; no updates during service windows — #51 (Windows; `in_service()` is what the future updater checks; macOS/Linux in HARDENING.md)
 - [ ] Church account, Stripe checkout, license key, 30-day trial
-- [ ] Export of songs, run sheets, themes and settings in open formats, available on every license
+- [x] Export of songs, run sheets, themes and settings in open formats, available on every license — #52
 - [ ] Sync engine between the church computer and Supabase: queues edits made offline, syncs when the connection returns, resolves edits made in two places (per-field last-writer-wins with a visible "changed elsewhere" notice; songs keep both versions), and shows sync status. Pauses cleanly when Plus ends, leaving the local copy complete. (Its chaos test, editing on two devices while the internet is cut, is written in 1B.)
 
 **Parked until Stage 1B or Stage 2 (nothing here is dropped)**

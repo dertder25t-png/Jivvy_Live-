@@ -596,6 +596,9 @@ pub struct StateSnapshot {
     /// The slide at `slide_index`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slide: Option<Slide>,
+    /// The active theme's body, as the library keeps it; left out when none is picked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<Value>,
 }
 
 /// A device waiting for approval, as the church computer sees it.
@@ -704,6 +707,25 @@ pub struct Preflight {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Added in v1: the church computer's other checks (disk, streaming settings, video check,
+    /// screens, camera and microphone). Left out while measuring and when the test was stopped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<PreflightCheck>,
+    /// Added in v1: `Some(true)` when the stream starting stopped the test; left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<bool>,
+}
+
+/// One pre-flight check (same shape as the TypeScript `PreflightCheck`).
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct PreflightCheck {
+    pub id: String,
+    /// "ok", "warn" or "bad".
+    pub level: String,
+    pub label: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1085,6 +1107,34 @@ mod tests {
     }
 
     #[test]
+    fn a_preflight_with_checks_is_sent_exactly_as_the_fixture_says() {
+        const EVENT: &str = include_str!("../../../packages/protocol/fixtures/preflight-event.json");
+        let doc: Value = serde_json::from_str(EVENT).unwrap();
+        let p = &doc["event"]["preflight"];
+        let preflight = Preflight {
+            status: "done",
+            upload_kbps: p["uploadKbps"].as_f64(),
+            measured: p["measured"].as_bool(),
+            measured_at: p["measuredAt"].as_u64(),
+            destinations: serde_json::from_value(p["destinations"].clone()).unwrap(),
+            summary: p["summary"].as_str().unwrap().into(),
+            message: p["message"].as_str().map(Into::into),
+            checks: serde_json::from_value(p["checks"].clone()).unwrap(),
+            stopped: None,
+        };
+        // Stopped by the stream starting: exactly what the daemon sends then.
+        let stopped = serde_json::to_value(preflight_event(&crate::preflight::stopped())).unwrap();
+        assert_eq!(stopped, doc["stopped"]);
+        let mut sent = serde_json::to_value(preflight_event(&preflight)).unwrap();
+        let mut expect = doc["event"].clone();
+        // A number either way: 12000.0 here, 12000 in the fixture.
+        let kbps =
+            |v: &mut Value| v["preflight"].as_object_mut().unwrap().remove("uploadKbps").and_then(|k| k.as_f64());
+        assert_eq!(kbps(&mut sent), kbps(&mut expect));
+        assert_eq!(sent, expect);
+    }
+
+    #[test]
     fn preflight_summaries_match_the_typescript_ones_word_for_word() {
         const CASES: &str = include_str!("../../../packages/protocol/fixtures/preflight-summary.json");
         let doc: Value = serde_json::from_str(CASES).unwrap();
@@ -1109,6 +1159,7 @@ mod tests {
             run_sheet_rev: None,
             slide_count: None,
             slide: None,
+            theme: None,
         };
         assert_eq!(
             serde_json::to_string(&ack("x", Some(state))).unwrap(),
@@ -1128,6 +1179,7 @@ mod tests {
             run_sheet_rev: None,
             slide_count: None,
             slide: None,
+            theme: None,
         };
         assert_eq!(
             serde_json::to_string(&state_event(state)).unwrap(),

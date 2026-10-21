@@ -24,6 +24,9 @@ pub struct LiveState {
     /// The run sheet's slide on screen; engines without a run sheet (or older ones) leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slide: Option<crate::protocol::Slide>,
+    /// The active theme's body (font, size, colors, background); older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +75,67 @@ pub fn follow(addr: &str, mut on: impl FnMut(Update)) -> ! {
             reported_down = true;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The command a key pressed in an output window (a presentation clicker's Page Up/Down,
+/// arrows, Space, B or ".") stands for. `black_now` is whether the screen is black now.
+pub fn key_command(key: &str, black_now: bool) -> Option<Value> {
+    let kind = match key {
+        "ArrowRight" | "ArrowDown" | "PageDown" | " " => "slide.next",
+        "ArrowLeft" | "ArrowUp" | "PageUp" => "slide.prev",
+        "b" | "B" | "." => return Some(serde_json::json!({ "type": "output.black", "on": !black_now })),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "type": kind }))
+}
+
+/// Sends one command to the engine on its own short-lived connection and waits for the ack.
+/// Gives the engine's state from the ack, only if the engine answered ok.
+pub fn send_command(addr: &str, command: Value) -> Option<LiveState> {
+    let msg = serde_json::json!({ "v": 1, "id": "keys", "ts": 0, "command": command });
+    let (mut w, mut r) = connect(addr).ok()?;
+    let mut ack = String::new();
+    if writeln!(w, "{msg}").is_err() || r.read_line(&mut ack).unwrap_or(0) == 0 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&ack).ok()?;
+    if v["ok"] != true {
+        return None;
+    }
+    state_in(&ack)
+}
+
+/// Sends the keys pressed in output windows to the engine from one thread, strictly in the
+/// order they were pressed (a quick Next then Back can't swap), one command at a time.
+pub struct KeyWorker {
+    tx: std::sync::mpsc::Sender<(String, bool)>,
+}
+
+impl KeyWorker {
+    pub fn start(addr: String) -> KeyWorker {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+        std::thread::spawn(move || {
+            // Whether the screen is black as of the engine's last answer to us.
+            let mut black: Option<bool> = None;
+            for (key, shown_black) in rx {
+                let Some(command) = key_command(&key, black.unwrap_or(shown_black)) else { continue };
+                match send_command(&addr, command) {
+                    Some(state) => black = Some(state.black),
+                    None => {
+                        black = None;
+                        crate::log("outputs", "key command was not accepted by the engine");
+                    }
+                }
+            }
+        });
+        KeyWorker { tx }
+    }
+
+    /// Queues a key; `shown_black` is the output's own idea of black, used until the engine
+    /// has answered one of our commands.
+    pub fn press(&self, key: &str, shown_black: bool) {
+        let _ = self.tx.send((key.to_string(), shown_black));
     }
 }
 
@@ -180,11 +244,27 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn a_state_with_a_theme_keeps_it_and_one_without_is_unchanged() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../packages/protocol/fixtures/state-theme.json")).unwrap();
+        let state = state_in(&fixture.to_string()).unwrap();
+        assert_eq!(state.theme.unwrap()["font"], "serif");
+        assert_eq!(state_in(r#"{"state":{"slideIndex":1,"black":false}}"#).unwrap().theme, None);
+    }
+
+    #[test]
     fn reads_state_from_acks_and_events_and_ignores_the_rest() {
         let s = state_in(r#"{"v":1,"event":"state","state":{"slideIndex":4,"black":true,"stream":"off"}}"#);
         assert_eq!(
             s,
-            Some(LiveState { slide_index: 4, black: true, stream_wanted: false, recording_wanted: false, slide: None })
+            Some(LiveState {
+                slide_index: 4,
+                black: true,
+                stream_wanted: false,
+                recording_wanted: false,
+                slide: None,
+                theme: None
+            })
         );
         assert!(state_in(r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":0,"black":false}}"#).is_some());
         assert_eq!(state_in(r#"{"v":1,"event":"something.new"}"#), None);
@@ -197,6 +277,42 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out waiting for: {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn clicker_keys_become_commands_and_reach_the_engine() {
+        assert_eq!(key_command("PageDown", false), Some(serde_json::json!({ "type": "slide.next" })));
+        assert_eq!(key_command("PageUp", false), Some(serde_json::json!({ "type": "slide.prev" })));
+        assert_eq!(key_command(".", false), Some(serde_json::json!({ "type": "output.black", "on": true })));
+        assert_eq!(key_command("b", true), Some(serde_json::json!({ "type": "output.black", "on": false })));
+        assert_eq!(key_command("F5", false), None);
+        assert_eq!(key_command("Escape", false), None);
+
+        let dir = std::env::temp_dir().join(format!("jivvy-keys-{}-{}", std::process::id(), crate::now_ms()));
+        let store = Store::new(&dir).unwrap();
+        let (snap, _) = store.load();
+        let engine = Arc::new(Mutex::new(Engine::new(store, snap, 10)));
+        let listener = bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let e = engine.clone();
+        std::thread::spawn(move || serve(listener, e));
+        let index = |engine: &Arc<Mutex<Engine>>| {
+            let r = engine.lock().unwrap().handle_line(r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#);
+            serde_json::to_value(r).unwrap()["state"]["slideIndex"].as_u64().unwrap()
+        };
+        let worker = KeyWorker::start(addr);
+        // Next then Back in quick succession arrive in order and end where they started,
+        // and two quick black presses toggle twice instead of repeating the same value.
+        let start = index(&engine);
+        worker.press("ArrowRight", false);
+        worker.press("ArrowLeft", false);
+        worker.press(".", false);
+        worker.press("b", false);
+        worker.press("ArrowRight", false); // the last key: once it lands, all the others have
+        wait_until("the keys reach the engine", || index(&engine) == start + 1);
+        let r = engine.lock().unwrap().handle_line(r#"{"v":1,"id":"g","ts":1,"command":{"type":"state.get"}}"#);
+        assert_eq!(serde_json::to_value(r).unwrap()["state"]["black"], serde_json::json!(false));
+        let _ = std::fs::remove_dir_all(&dir); // only reached when the test passed
     }
 
     #[test]
@@ -261,7 +377,8 @@ mod tests {
                 black: false,
                 stream_wanted: false,
                 recording_wanted: false,
-                slide: None
+                slide: None,
+                theme: None
             })
         );
         engine.lock().unwrap().handle_line(r#"{"v":1,"id":"r","ts":1,"command":{"type":"slide.goto","index":7}}"#);
@@ -272,7 +389,8 @@ mod tests {
                 black: false,
                 stream_wanted: false,
                 recording_wanted: false,
-                slide: None
+                slide: None,
+                theme: None
             })
         );
     }

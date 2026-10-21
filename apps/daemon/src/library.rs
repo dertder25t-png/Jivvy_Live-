@@ -98,6 +98,39 @@ impl Library {
         }))
     }
 
+    /// Every picture id (64 hex characters) named anywhere in a saved document, so pruning
+    /// keeps the pictures plans and themes use.
+    /// Reads them with a connection of its own that only reads (and waits if the library is
+    /// busy), so it can run beside the engine's.
+    pub fn scan_media_ids(data_dir: &Path) -> Result<std::collections::HashSet<String>, Error> {
+        let db = Connection::open_with_flags(
+            data_dir.join(FILE),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        Library { db }.media_ids()
+    }
+
+    fn media_ids(&self) -> Result<std::collections::HashSet<String>, Error> {
+        fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
+            match v {
+                Value::String(_) => out.extend(crate::protocol::media_id(Some(v))),
+                Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let mut stmt = self.db.prepare("SELECT body FROM docs WHERE deleted = 0")?;
+        let bodies = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for body in bodies {
+            if let Ok(v) = serde_json::from_str::<Value>(&body?) {
+                walk(&v, &mut out);
+            }
+        }
+        Ok(out)
+    }
+
     /// The highest revision this id has had (deleted or not), and whether it exists now.
     fn revision(db: &Connection, kind: &str, id: &str) -> Result<(u64, bool), Error> {
         let row = db

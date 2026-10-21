@@ -23,6 +23,22 @@ export async function getDoc(conn: Sender, kind: string, id: string): Promise<Do
   return ack.doc;
 }
 
+/**
+ * Deletes a song or plan. `baseRev` is the revision the caller last saw: if another device saved since,
+ * the daemon refuses (`conflict`) instead of deleting their edit. The daemon keeps a delete marker,
+ * so the doc leaves every list.
+ */
+export async function deleteDoc(
+  conn: Sender,
+  kind: string,
+  id: string,
+  baseRev?: number,
+): Promise<{ ok: true } | { ok: false; conflict: boolean; message: string }> {
+  const ack = await conn.send({ type: "doc.delete", kind, id, ...(baseRev === undefined ? {} : { baseRev }) });
+  if (ack.ok) return { ok: true };
+  return { ok: false, conflict: ack.code === "conflict", message: ack.message };
+}
+
 export type Saved = { ok: true; rev: number } | { ok: false; conflict: boolean; message: string };
 
 export async function saveDoc(

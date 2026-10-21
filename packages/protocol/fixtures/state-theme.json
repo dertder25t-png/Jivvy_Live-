@@ -1,0 +1,16 @@
+{
+  "state": {
+    "slideIndex": 0,
+    "black": false,
+    "slide": { "lines": ["Amazing grace"] },
+    "theme": {
+      "v": 1,
+      "font": "serif",
+      "bold": false,
+      "size": 7,
+      "text": "#10224F",
+      "shadow": false,
+      "background": { "kind": "color", "color": "#F4F1EA" }
+    }
+  }
+}

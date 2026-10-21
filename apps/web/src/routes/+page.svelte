@@ -2,13 +2,19 @@
   import { runSheetSlides, type DocInfo, type Levels, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
   import { onDestroy, onMount } from "svelte";
   import { DaemonConnection, type Status } from "$lib/daemon";
-  import { addImage, upload } from "$lib/media";
+  import { addImage, docImages, setMediaSource, upload } from "$lib/media";
   import { addPdf } from "$lib/pdf";
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
-  import { getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
+  import { deleteDoc, getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
+  import { ACTIVE_THEME_ID, BUILT_IN, DEFAULT_THEME_ID, activeBody, activeFromDoc, newThemeId, themeBody, themeFromDoc, type Theme } from "$lib/theme";
+  import SlideView from "$lib/SlideView.svelte";
+  import ThemePicker from "$lib/ThemePicker.svelte";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
+  import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
+  import PreflightCheck from "$lib/Preflight.svelte";
+  import type { Preflight } from "@jivvy/protocol";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
 
@@ -58,7 +64,8 @@
   $effect(() => store(DRAFT_KEY, draft));
 
   /** Edit builds the run sheet; Operate runs the service. A locked browser only operates. */
-  let view = $state<"edit" | "operate">(stored(VIEW_KEY, "edit"));
+  let view = $state<"edit" | "operate" | "preflight">(stored(VIEW_KEY, "edit"));
+  let preflight = $state<Preflight | null>(null);
   $effect(() => store(VIEW_KEY, view));
   let locked = $state(isLocked());
   /** Locked or unlocked in another tab of this browser: follow it at once. */
@@ -111,6 +118,8 @@
     store(ADDRESS_KEY, address);
     live = null;
     onScreens = null;
+    preflight = null;
+    setMediaSource(address.trim());
     conn = new DaemonConnection(address.trim(), {
       status: (s) => (status = s),
       state: (s) => (live = s),
@@ -120,6 +129,7 @@
         levelsAt = Date.now();
       },
       docChanged: (d) => docChanged(d),
+      preflight: (p) => (preflight = p),
     });
     conn.connect();
   }
@@ -309,6 +319,24 @@
         : result.message;
     }
   }
+  /** Removes a song from the church computer's library; this run sheet keeps its own copy. */
+  async function deleteSong(item: DraftItem) {
+    if (!conn || !item.libraryId || locked || !confirm(`Delete '${item.title}'? This can't be undone.`)) return;
+    const here = conn.daemonId ?? undefined;
+    const baseRev = item.libraryDaemon === here ? (item.libraryRev ?? 0) : 0;
+    try {
+      const result = await deleteDoc(conn, "song", item.libraryId, baseRev);
+      if (!result.ok) {
+        songNotes[item.id] = result.conflict ? "Changed on another device; reload before deleting." : result.message;
+        return;
+      }
+      item.libraryId = undefined;
+      item.libraryRev = undefined;
+      songNotes[item.id] = "Deleted from the church computer's library.";
+    } catch (e) {
+      songNotes[item.id] = e instanceof Error ? e.message : String(e);
+    }
+  }
 
   /**
    * Plans: this run sheet is kept on the church computer as you edit. The revision each save
@@ -344,10 +372,16 @@
       queuePlanSave({ id: draft.id, title: draft.title, items: JSON.stringify(draft.items) });
   }
   let planSaving = false;
+  let planRun: Promise<void> | null = null;
   function queuePlanSave(plan: { id: string; title: string; items: string }) {
     planPending.delete(plan.id); // re-added last: plans save in the order they were edited
     planPending.set(plan.id, { title: plan.title, items: plan.items });
-    if (!planSaving) void flushPlanSaves();
+    if (!planSaving) planRun = flushPlanSaves();
+  }
+  /** Before an export: the last edit goes now and every save queued has finished. */
+  async function savePlansNow() {
+    saveCurrentPlanNow();
+    await planRun;
   }
   async function flushPlanSaves() {
     planSaving = true;
@@ -365,6 +399,9 @@
     const key = planKey(id);
     if (!conn || planHeld === key) return;
     const body = { items: JSON.parse(items) as unknown };
+    // Pictures go to the church computer first, so other devices can load them.
+    const failed = await upload(conn, docImages(body), () => {});
+    if (failed) return void (planNote = failed);
     const result = await saveDoc(conn, { kind: "plan", id, title: title.trim() || "Untitled plan", body }, planRevs[key] ?? 0);
     if (result.ok) {
       planRevs[key] = result.rev;
@@ -404,8 +441,93 @@
       planNote = e instanceof Error ? e.message : String(e);
     }
   }
+  /** Deletes a plan. Deleting the open one opens the next plan, or an empty run sheet. */
+  async function deletePlan(info: DocInfo) {
+    if (!conn || locked || !confirm(`Delete '${info.title || "Untitled plan"}'? This can't be undone.`)) return;
+    const key = planKey(info.id);
+    try {
+      planPending.delete(info.id); // no queued save may bring it back
+      if (draft.id === info.id) clearTimeout(planTimer);
+      await planRun;
+      const result = await deleteDoc(conn, "plan", info.id, info.rev);
+      if (!result.ok) {
+        planNote = result.conflict ? "Changed on another device; reload before deleting." : result.message;
+        return;
+      }
+      delete planRevs[key];
+      if (planHeld === key) planHeld = "";
+      plans = plans.filter((p) => p.id !== info.id);
+      if (draft.id === info.id) {
+        const nextInfo = plans[0];
+        const doc = nextInfo ? await getDoc(conn, "plan", nextInfo.id) : null;
+        const next = doc ? planFromDoc(doc) : null;
+        if (doc && next) planRevs[planKey(doc.id)] = doc.rev;
+        draft = next ?? { id: newId(), title: "Sunday service", items: [] };
+      }
+      planNote = "Plan deleted.";
+    } catch (e) {
+      planNote = e instanceof Error ? e.message : String(e);
+    }
+  }
+  // ---- Themes: the look of the screens, one for the whole service ----
+
+  let savedThemes = $state<{ id: string; title: string; theme: Theme }[]>([]);
+  /** The theme in use, kept as a library setting so every device (and later the screens) share it. */
+  let themeId = $state(DEFAULT_THEME_ID);
+  let themesLoaded = $state(false);
+  async function refreshActive() {
+    if (!conn || !ready) return;
+    try {
+      const id = activeFromDoc(await getDoc(conn, "setting", ACTIVE_THEME_ID));
+      if (id) themeId = id;
+    } catch {
+      // nothing chosen yet, or an older church computer: the default
+    }
+  }
+  async function pickTheme(id: string) {
+    themeId = id;
+    if (conn) await saveDoc(conn, { kind: "setting", id: ACTIVE_THEME_ID, title: "Active theme", body: activeBody(id) });
+  }
+  // A theme that was deleted or never existed here falls back to the default.
+  $effect(() => {
+    if (themesLoaded && !themes.some((t) => t.id === themeId)) themeId = DEFAULT_THEME_ID;
+  });
+  const themes = $derived([...BUILT_IN, ...savedThemes]);
+  const theme = $derived((themes.find((t) => t.id === themeId) ?? BUILT_IN.find((t) => t.id === DEFAULT_THEME_ID)!).theme);
+  async function refreshThemes() {
+    if (!conn || !ready) return;
+    try {
+      const found = [];
+      for (const info of await listDocs(conn, "theme")) {
+        const t = themeFromDoc(await getDoc(conn, "theme", info.id));
+        if (t) found.push({ id: info.id, title: info.title, theme: t });
+      }
+      savedThemes = found;
+      themesLoaded = true;
+    } catch {
+      savedThemes = []; // an older church computer without a library: the built-in themes
+    }
+  }
+  $effect(() => {
+    if (ready) void refreshThemes().then(refreshActive);
+  });
+  async function saveTheme(title: string, t: Theme): Promise<string> {
+    if (!conn) return "Not connected.";
+    const id = newThemeId(title);
+    const body = themeBody(t);
+    const failed = await upload(conn, docImages(body), () => {});
+    if (failed) return failed;
+    const result = await saveDoc(conn, { kind: "theme", id, title, body }, 0);
+    if (!result.ok) return result.message;
+    await refreshThemes();
+    themeId = id;
+    return "Saved to the church computer's library.";
+  }
+
   /** Another device saved or deleted something: open lists follow it. */
   function docChanged(doc: DocInfo) {
+    if (doc.kind === "theme") void refreshThemes();
+    if (doc.kind === "setting" && doc.id === ACTIVE_THEME_ID) void refreshActive();
     if (doc.kind === "song" && hymnsOpen) void refreshSaved();
     if (doc.kind === "plan" && plansOpen && conn) void listDocs(conn, "plan").then((p) => (plans = p), () => {});
   }
@@ -431,7 +553,7 @@
     if (e.key === " " && t.closest("button, a, summary, [role=button]")) return;
     if (["ArrowRight", "ArrowDown", "PageDown", " "].includes(e.key)) go("slide.next");
     else if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) go("slide.prev");
-    else if (e.key === "b" || e.key === "B") black();
+    else if (e.key === "b" || e.key === "B" || e.key === ".") black();
     else return;
     e.preventDefault();
   }
@@ -452,6 +574,9 @@
       <button class:active={view === "operate"} aria-pressed={view === "operate"} onclick={() => (view = "operate")}
         >Operate</button
       >
+      <button class:active={view === "preflight"} aria-pressed={view === "preflight"} onclick={() => (view = "preflight")}
+        >Pre-flight</button
+      >
     </nav>
     <form
       class="connect"
@@ -464,6 +589,7 @@
       <input id="address" bind:value={address} spellcheck="false" autocomplete="off" />
       <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
     </form>
+    <Export {ready} sender={() => conn} beforeExport={savePlansNow} />
   {/if}
   <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
     {locked ? "Unlock" : "Lock for volunteers"}
@@ -550,7 +676,10 @@
 {/if}
 
 {#if locked || view === "operate"}
-  <Operator {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
+  <Operator {theme} {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
+  {#if locked}<PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />{/if}
+{:else if view === "preflight"}
+  <PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />
 {:else}
 <main>
   <section class="plan" aria-label="Run sheet">
@@ -568,6 +697,7 @@
                 <strong>{p.title || "Untitled plan"}</strong>
                 <span class="hint">saved {new Date(p.updatedAt).toLocaleString()}</span>
               </button>
+              {#if !locked}<button class="quiet" onclick={() => deletePlan(p)}>Delete</button>{/if}
             </li>
           {:else}
             <li class="hint">No plans on the church computer yet. This one is saved there as you edit.</li>
@@ -643,6 +773,7 @@
             <button class="quiet" onclick={() => saveSong(item)} disabled={!ready || songSaving[item.id]}
               >{item.libraryId ? "Save changes to the library" : "Save to the library"}</button
             >
+            {#if item.libraryId && !locked}<button class="quiet" onclick={() => deleteSong(item)} disabled={!ready}>Delete from library</button>{/if}
             {#if songNotes[item.id]}<span class="hint">{songNotes[item.id]}</span>{/if}
           </div>
         {:else if item.kind === "countdown"}
@@ -729,13 +860,12 @@
   </section>
 
   <section class="live" aria-label="Live">
+    <ThemePicker {themes} selected={themeId} canSave={ready} pick={(id) => void pickTheme(id)} save={saveTheme} />
     <div class="screen" class:black={live?.black}>
       {#if live?.black}
         <span class="note">Screens are black</span>
       {:else if live?.slide}
-        {#if live.slide.image}<Thumb id={live.slide.image} fill />{/if}
-        {#each live.slide.lines as line, i (i)}<div class="over">{line}</div>{/each}
-        {#if live.slide.countdownTo}<div class="note">Countdown</div>{/if}
+        <SlideView slide={live.slide} {theme} />
       {:else if live}
         <span class="note">Slide {live.slideIndex + 1}</span>
       {:else}
@@ -1100,10 +1230,6 @@
   }
   .pick:focus-within {
     outline: 2px solid var(--blue);
-  }
-  .over {
-    position: relative;
-    text-shadow: 0 0 0.25em #000;
   }
   .screen {
     aspect-ratio: 16 / 9;

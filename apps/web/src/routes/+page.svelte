@@ -2,7 +2,7 @@
   import { runSheetSlides, type DocInfo, type Levels, type RunSheet, type StateSnapshot } from "@jivvy/protocol";
   import { onDestroy, onMount } from "svelte";
   import { DaemonConnection, type Status } from "$lib/daemon";
-  import { addImage, upload } from "$lib/media";
+  import { addImage, docImages, setMediaSource, upload } from "$lib/media";
   import { addPdf } from "$lib/pdf";
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
@@ -119,6 +119,7 @@
     live = null;
     onScreens = null;
     preflight = null;
+    setMediaSource(address.trim());
     conn = new DaemonConnection(address.trim(), {
       status: (s) => (status = s),
       state: (s) => (live = s),
@@ -398,6 +399,9 @@
     const key = planKey(id);
     if (!conn || planHeld === key) return;
     const body = { items: JSON.parse(items) as unknown };
+    // Pictures go to the church computer first, so other devices can load them.
+    const failed = await upload(conn, docImages(body), () => {});
+    if (failed) return void (planNote = failed);
     const result = await saveDoc(conn, { kind: "plan", id, title: title.trim() || "Untitled plan", body }, planRevs[key] ?? 0);
     if (result.ok) {
       planRevs[key] = result.rev;
@@ -510,7 +514,10 @@
   async function saveTheme(title: string, t: Theme): Promise<string> {
     if (!conn) return "Not connected.";
     const id = newThemeId(title);
-    const result = await saveDoc(conn, { kind: "theme", id, title, body: themeBody(t) }, 0);
+    const body = themeBody(t);
+    const failed = await upload(conn, docImages(body), () => {});
+    if (failed) return failed;
+    const result = await saveDoc(conn, { kind: "theme", id, title, body }, 0);
     if (!result.ok) return result.message;
     await refreshThemes();
     themeId = id;

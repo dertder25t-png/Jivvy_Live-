@@ -337,7 +337,117 @@ pub fn checks(dir: &Path, live: Live) -> Vec<PreflightCheck> {
             }
         });
     }
+
+    out.push(restart_row(pending_restart()));
     out
+}
+
+/// Which signs of a pending OS restart were found.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PendingRestart {
+    pub windows_update: bool,
+    pub servicing: bool,
+    pub file_renames: bool,
+}
+
+/// The "Pending restart" row from what was found; `None` means it couldn't be read, or this
+/// isn't Windows. Then the row says so in green, like the "Not part of this setup" rows.
+fn restart_row(found: Option<PendingRestart>) -> PreflightCheck {
+    let label = "Pending restart";
+    match found {
+        None => check("restart", "ok", label, "Not checked on this computer.", None),
+        Some(f) if f == PendingRestart::default() => check("restart", "ok", label, "No restart is waiting.", None),
+        Some(f) => {
+            let mut why = Vec::new();
+            if f.windows_update {
+                why.push("Windows Update");
+            }
+            if f.servicing {
+                why.push("a Windows component");
+            }
+            if f.file_renames {
+                why.push("an installed program");
+            }
+            check(
+                "restart",
+                "warn",
+                label,
+                format!("The computer is waiting to restart ({}).", why.join(", ")),
+                Some("Restart the computer before the service, not during it."),
+            )
+        }
+    }
+}
+
+/// Reads the Windows registry for a pending restart. Quick: three lookups, no shell.
+#[cfg(windows)]
+fn pending_restart() -> Option<PendingRestart> {
+    type Hkey = isize;
+    const HKLM: Hkey = 0x8000_0002u32 as i32 as isize;
+    const KEY_READ: u32 = 0x20019;
+    const KEY_WOW64_64KEY: u32 = 0x0100;
+    const NOT_FOUND: i32 = 2;
+    const MORE_DATA: i32 = 234;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(key: Hkey, sub: *const u16, options: u32, access: u32, out: *mut Hkey) -> i32;
+        fn RegQueryValueExW(
+            key: Hkey,
+            name: *const u16,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            len: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: Hkey) -> i32;
+    }
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    // Some(true) found, Some(false) absent, None unreadable.
+    let exists = |sub: &str, value: Option<&str>| -> Option<bool> {
+        let mut key: Hkey = 0;
+        // SAFETY: valid NUL-terminated UTF-16 strings and out-pointers for the calls' duration.
+        unsafe {
+            match RegOpenKeyExW(HKLM, wide(sub).as_ptr(), 0, KEY_READ | KEY_WOW64_64KEY, &mut key) {
+                0 => {}
+                NOT_FOUND => return Some(false),
+                _ => return None,
+            }
+            let found = match value {
+                None => Some(true),
+                Some(v) => {
+                    let mut len = 0u32;
+                    match RegQueryValueExW(
+                        key,
+                        wide(v).as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut len,
+                    ) {
+                        // An empty multi-string (just terminators) isn't a pending rename.
+                        0 | MORE_DATA => Some(len > 4),
+                        NOT_FOUND => Some(false),
+                        _ => None,
+                    }
+                }
+            };
+            RegCloseKey(key);
+            found
+        }
+    };
+    Some(PendingRestart {
+        windows_update: exists(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+            None,
+        )?,
+        servicing: exists(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending", None)?,
+        file_renames: exists(r"SYSTEM\CurrentControlSet\Control\Session Manager", Some("PendingFileRenameOperations"))?,
+    })
+}
+
+#[cfg(not(windows))]
+fn pending_restart() -> Option<PendingRestart> {
+    None
 }
 
 /// Runs the whole check: measure (or fall back to the last speed measured), then plan.
@@ -554,6 +664,17 @@ pub(crate) mod tests {
         std::fs::write(dir.join("recording.json"), "{").unwrap();
         let disk = checks(&dir, alive).into_iter().find(|c| c.id == "disk").unwrap();
         assert!(disk.level == "warn" && disk.message.contains("can't be read"), "{disk:?}");
+    }
+
+    #[test]
+    fn a_pending_restart_is_amber_with_a_fix_and_nothing_pending_is_green() {
+        let row = restart_row(Some(PendingRestart { windows_update: true, ..Default::default() }));
+        assert_eq!((row.id.as_str(), row.level.as_str()), ("restart", "warn"));
+        assert!(row.message.contains("Windows Update"), "{row:?}");
+        assert_eq!(row.fix.as_deref(), Some("Restart the computer before the service, not during it."));
+        let clear = restart_row(Some(PendingRestart::default()));
+        assert_eq!((clear.level.as_str(), clear.fix), ("ok", None));
+        assert_eq!(restart_row(None).level, "ok");
     }
 
     #[test]

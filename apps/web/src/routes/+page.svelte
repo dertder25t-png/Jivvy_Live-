@@ -14,6 +14,7 @@
   import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
   import PreflightCheck from "$lib/Preflight.svelte";
+  import Recordings from "$lib/Recordings.svelte";
   import type { Preflight } from "@jivvy/protocol";
   import StreamSettings from "$lib/StreamSettings.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
@@ -65,7 +66,7 @@
   $effect(() => store(DRAFT_KEY, draft));
 
   /** Edit builds the run sheet; Operate runs the service. A locked browser only operates. */
-  let view = $state<"edit" | "operate" | "preflight" | "stream">(stored(VIEW_KEY, "edit"));
+  let view = $state<"edit" | "operate" | "preflight" | "stream" | "recordings">(stored(VIEW_KEY, "edit"));
   let preflight = $state<Preflight | null>(null);
   $effect(() => store(VIEW_KEY, view));
   let locked = $state(isLocked());
@@ -581,6 +582,9 @@
       <button class:active={view === "stream"} aria-pressed={view === "stream"} onclick={() => (view = "stream")}
         >Streaming</button
       >
+      <button class:active={view === "recordings"} aria-pressed={view === "recordings"} onclick={() => (view = "recordings")}
+        >Recordings</button
+      >
     </nav>
     <form
       class="connect"
@@ -686,6 +690,9 @@
   <PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />
 {:else if view === "stream"}
   <StreamSettings {live} {ready} send={(c) => conn?.send(c)} />
+{:else if view === "recordings"}
+  <Recordings {ready} send={(c) => conn?.send(c)} />
+
 {:else}
 <main>
   <section class="plan" aria-label="Run sheet">

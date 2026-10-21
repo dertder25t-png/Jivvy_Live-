@@ -94,6 +94,7 @@ fn device_may(command: &Command) -> bool {
             | Command::StreamStop
             | Command::RecordingStart
             | Command::RecordingStop
+            | Command::RecordingList
             | Command::StateGet
             | Command::StateSubscribe
             | Command::StreamPreflight
@@ -518,8 +519,51 @@ impl Engine {
                 return protocol::ack(id, None);
             }
             // Saved like the stream: a crash mid-service resumes the recording by itself.
-            Command::RecordingStart => next.recording_wanted = true,
-            Command::RecordingStop => next.recording_wanted = false,
+            Command::RecordingStart => {
+                // The plan live now goes on the set the video process starts (a resumed set keeps its own).
+                if !self.state.recording_wanted {
+                    let plan = self.run_sheet.as_ref().map(|s| (s.run_sheet.id.as_str(), s.run_sheet.title.as_str()));
+                    crate::recording::note_plan(self.store.dir(), plan);
+                }
+                next.recording_wanted = true
+            }
+            Command::RecordingList => {
+                let dir = self.store.dir();
+                let folder = match crate::recording::load_config(dir) {
+                    Ok(c) => c.folder(dir),
+                    // recording.json is broken: the recorder keeps its last good folder.
+                    Err(_) => match crate::recording::last_good_folder(dir) {
+                        Some(f) => f,
+                        None => {
+                            return protocol::nack(
+                                id,
+                                ErrorCode::Unavailable,
+                                "Can't read the recording settings (recording.json).",
+                            );
+                        }
+                    },
+                };
+                return match crate::recording::list(dir, &folder) {
+                    Ok(recordings) => protocol::ack_with(
+                        id,
+                        None,
+                        AckExtras {
+                            recordings: Some(recordings),
+                            recordings_folder: Some(folder.display().to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    Err(m) => protocol::nack(id, ErrorCode::Unavailable, &m),
+                };
+            }
+            Command::RecordingStop => {
+                if self.state.recording_wanted
+                    && let Ok(config) = crate::recording::load_config(self.store.dir())
+                {
+                    crate::recording::note_end(self.store.dir(), &config.folder(self.store.dir()), crate::now_ms());
+                }
+                next.recording_wanted = false
+            }
             Command::RecordingReport { status, low_disk } => {
                 self.recording_report = Some((status, low_disk, Instant::now()));
                 self.tick();

@@ -1,0 +1,11 @@
+{
+  "about": "A recording.list ack (RecordingSet in packages/protocol, SetInfo in the Rust daemon). The first set is what the daemon test produces for a set started under the plan 'Sunday 9:30' (size and length vary there); the second is an older set without a label. Add fields, never rename.",
+  "command": { "type": "recording.list" },
+  "ack": {
+    "recordingsFolder": "C:\\Users\\Church\\AppData\\Local\\Jivvy Live\\recordings",
+    "recordings": [
+      { "folder": "2026-10-10_15-30-12Z", "startedMs": 1791646212000, "durationSecs": 4320, "bytes": 5400000000, "mp4": "waiting", "planId": "sunday", "label": "Sunday 9:30" },
+      { "folder": "2026-10-04_15-00-00Z", "startedMs": 1791126000000, "durationSecs": 4200, "bytes": 8100000000, "mp4": "ready" }
+    ]
+  }
+}

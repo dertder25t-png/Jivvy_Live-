@@ -196,6 +196,411 @@ Flowery meadow, flashing sea,
 Singing bird and flowing fountain
 Call us to rejoice in Thee.`,
   },
+  {
+    id: "holy-holy-holy",
+    title: "Holy, Holy, Holy",
+    author: "Reginald Heber",
+    year: 1826,
+    lyrics: `Verse 1
+Holy, holy, holy! Lord God Almighty!
+Early in the morning our song shall rise to Thee;
+Holy, holy, holy, merciful and mighty,
+God in three Persons, blessed Trinity!
+
+Verse 2
+Holy, holy, holy! All the saints adore Thee,
+Casting down their golden crowns around the glassy sea;
+Cherubim and seraphim falling down before Thee,
+Which wert and art and evermore shalt be.
+
+Verse 3
+Holy, holy, holy! Though the darkness hide Thee,
+Though the eye of sinful man Thy glory may not see,
+Only Thou art holy; there is none beside Thee,
+Perfect in power, in love, and purity.
+
+Verse 4
+Holy, holy, holy! Lord God Almighty!
+All Thy works shall praise Thy name in earth, and sky, and sea;
+Holy, holy, holy, merciful and mighty,
+God in three Persons, blessed Trinity!`,
+  },
+  {
+    id: "be-thou-my-vision",
+    title: "Be Thou My Vision",
+    author: "Mary Byrne (trans. Eleanor Hull)",
+    year: 1912,
+    lyrics: `Verse 1
+Be Thou my Vision, O Lord of my heart;
+Naught be all else to me, save that Thou art;
+Thou my best Thought, by day or by night,
+Waking or sleeping, Thy presence my light.
+
+Verse 2
+Be Thou my Wisdom, and Thou my true Word;
+I ever with Thee and Thou with me, Lord;
+Thou my great Father, I Thy true son;
+Thou in me dwelling, and I with Thee one.
+
+Verse 3
+Riches I heed not, nor man's empty praise,
+Thou mine Inheritance, now and always;
+Thou and Thou only, first in my heart,
+High King of heaven, my Treasure Thou art.
+
+Verse 4
+High King of heaven, my victory won,
+May I reach heaven's joys, O bright Heaven's Sun!
+Heart of my own heart, whatever befall,
+Still be my Vision, O Ruler of all.`,
+  },
+  {
+    id: "crown-him",
+    title: "Crown Him with Many Crowns",
+    author: "Matthew Bridges, Godfrey Thring",
+    year: 1851,
+    lyrics: `Verse 1
+Crown Him with many crowns,
+The Lamb upon His throne;
+Hark! how the heavenly anthem drowns
+All music but its own!
+Awake, my soul, and sing
+Of Him who died for thee,
+And hail Him as thy matchless King
+Through all eternity.
+
+Verse 2
+Crown Him the Lord of love;
+Behold His hands and side,
+Those wounds, yet visible above,
+In beauty glorified:
+All hail, Redeemer, hail!
+For Thou hast died for me;
+Thy praise and glory shall not fail
+Through all eternity.`,
+  },
+  {
+    id: "fairest-lord-jesus",
+    title: "Fairest Lord Jesus",
+    author: "Joseph A. Seiss (trans.)",
+    year: 1873,
+    lyrics: `Verse 1
+Fairest Lord Jesus,
+Ruler of all nature,
+O Thou of God and man the Son,
+Thee will I cherish,
+Thee will I honor,
+Thou, my soul's glory, joy, and crown.
+
+Verse 2
+Fair are the meadows,
+Fairer still the woodlands,
+Robed in the blooming garb of spring:
+Jesus is fairer,
+Jesus is purer,
+Who makes the woeful heart to sing.
+
+Verse 3
+Fair is the sunshine,
+Fairer still the moonlight,
+And all the twinkling starry host:
+Jesus shines brighter,
+Jesus shines purer
+Than all the angels heaven can boast.`,
+  },
+  {
+    id: "o-worship-the-king",
+    title: "O Worship the King",
+    author: "Robert Grant",
+    year: 1833,
+    lyrics: `Verse 1
+O worship the King, all glorious above,
+O gratefully sing His power and His love;
+Our Shield and Defender, the Ancient of Days,
+Pavilioned in splendor, and girded with praise.
+
+Verse 2
+O tell of His might, O sing of His grace,
+Whose robe is the light, whose canopy space;
+His chariots of wrath the deep thunderclouds form,
+And dark is His path on the wings of the storm.
+
+Verse 3
+Thy bountiful care, what tongue can recite?
+It breathes in the air, it shines in the light;
+It streams from the hills, it descends to the plain,
+And sweetly distills in the dew and the rain.
+
+Verse 4
+Frail children of dust, and feeble as frail,
+In Thee do we trust, nor find Thee to fail;
+Thy mercies how tender, how firm to the end,
+Our Maker, Defender, Redeemer, and Friend.`,
+  },
+  {
+    id: "praise-to-the-lord",
+    title: "Praise to the Lord, the Almighty",
+    author: "Joachim Neander (trans. Catherine Winkworth)",
+    year: 1863,
+    lyrics: `Verse 1
+Praise to the Lord, the Almighty, the King of creation!
+O my soul, praise Him, for He is thy health and salvation!
+All ye who hear, now to His temple draw near,
+Joining in glad adoration.
+
+Verse 2
+Praise to the Lord, who o'er all things so wondrously reigneth,
+Shelters thee under His wings, yea, so gently sustaineth;
+Hast thou not seen how thy desires e'er have been
+Granted in what He ordaineth?`,
+  },
+  {
+    id: "all-hail-the-power",
+    title: "All Hail the Power of Jesus' Name",
+    author: "Edward Perronet",
+    year: 1779,
+    lyrics: `Verse 1
+All hail the power of Jesus' name!
+Let angels prostrate fall;
+Bring forth the royal diadem,
+And crown Him Lord of all.
+
+Verse 2
+Crown Him, ye martyrs of your God,
+Who from His altar call;
+Extol the stem of Jesse's rod,
+And crown Him Lord of all.
+
+Verse 3
+Ye seed of Israel's chosen race,
+Ye ransomed from the fall,
+Hail Him who saves you by His grace,
+And crown Him Lord of all.
+
+Verse 4
+Let every kindred, every tribe,
+On this terrestrial ball,
+To Him all majesty ascribe,
+And crown Him Lord of all.`,
+  },
+  {
+    id: "what-a-friend",
+    title: "What a Friend We Have in Jesus",
+    author: "Joseph Scriven",
+    year: 1855,
+    lyrics: `Verse 1
+What a friend we have in Jesus,
+All our sins and griefs to bear!
+What a privilege to carry
+Everything to God in prayer!
+O what peace we often forfeit,
+O what needless pain we bear,
+All because we do not carry
+Everything to God in prayer!
+
+Verse 2
+Have we trials and temptations?
+Is there trouble anywhere?
+We should never be discouraged;
+Take it to the Lord in prayer.
+Can we find a friend so faithful
+Who will all our sorrows share?
+Jesus knows our every weakness;
+Take it to the Lord in prayer.
+
+Verse 3
+Are we weak and heavy laden,
+Cumbered with a load of care?
+Precious Savior, still our refuge,
+Take it to the Lord in prayer.
+Do thy friends despise, forsake thee?
+Take it to the Lord in prayer!
+In His arms He'll take and shield thee;
+Thou wilt find a solace there.`,
+  },
+  {
+    id: "abide-with-me",
+    title: "Abide with Me",
+    author: "Henry Francis Lyte",
+    year: 1847,
+    lyrics: `Verse 1
+Abide with me; fast falls the eventide;
+The darkness deepens; Lord, with me abide.
+When other helpers fail and comforts flee,
+Help of the helpless, O abide with me.
+
+Verse 2
+Swift to its close ebbs out life's little day;
+Earth's joys grow dim, its glories pass away;
+Change and decay in all around I see;
+O Thou who changest not, abide with me.
+
+Verse 3
+I need Thy presence every passing hour;
+What but Thy grace can foil the tempter's power?
+Who like Thyself my guide and stay can be?
+Through cloud and sunshine, O abide with me.`,
+  },
+  {
+    id: "love-divine",
+    title: "Love Divine, All Loves Excelling",
+    author: "Charles Wesley",
+    year: 1747,
+    lyrics: `Verse 1
+Love divine, all loves excelling,
+Joy of heaven, to earth come down;
+Fix in us Thy humble dwelling,
+All Thy faithful mercies crown.
+Jesus, Thou art all compassion,
+Pure, unbounded love Thou art;
+Visit us with Thy salvation;
+Enter every trembling heart.
+
+Verse 2
+Breathe, O breathe Thy loving Spirit
+Into every troubled breast;
+Let us all in Thee inherit,
+Let us find that second rest.
+Take away our bent to sinning;
+Alpha and Omega be;
+End of faith, as its beginning,
+Set our hearts at liberty.
+
+Verse 3
+Finish, then, Thy new creation;
+Pure and spotless let us be;
+Let us see Thy great salvation
+Perfectly restored in Thee;
+Changed from glory into glory,
+Till in heaven we take our place,
+Till we cast our crowns before Thee,
+Lost in wonder, love, and praise.`,
+  },
+  {
+    id: "i-need-thee",
+    title: "I Need Thee Every Hour",
+    author: "Annie S. Hawks",
+    year: 1872,
+    lyrics: `Verse 1
+I need Thee every hour,
+Most gracious Lord;
+No tender voice like Thine
+Can peace afford.
+
+Refrain
+I need Thee, O I need Thee;
+Every hour I need Thee;
+O bless me now, my Savior,
+I come to Thee.
+
+Verse 2
+I need Thee every hour,
+Stay Thou near by;
+Temptations lose their power
+When Thou art nigh.
+
+Verse 3
+I need Thee every hour,
+In joy or pain;
+Come quickly and abide,
+Or life is vain.`,
+  },
+  {
+    id: "be-still-my-soul",
+    title: "Be Still, My Soul",
+    author: "Katharina von Schlegel (trans. Jane Borthwick)",
+    year: 1855,
+    lyrics: `Verse 1
+Be still, my soul: the Lord is on thy side;
+Bear patiently the cross of grief or pain;
+Leave to thy God to order and provide;
+In every change He faithful will remain.
+Be still, my soul: thy best, thy heavenly Friend
+Through thorny ways leads to a joyful end.
+
+Verse 2
+Be still, my soul: thy God doth undertake
+To guide the future as He has the past;
+Thy hope, thy confidence let nothing shake;
+All now mysterious shall be bright at last.
+Be still, my soul: the waves and winds still know
+His voice who ruled them while He dwelt below.
+
+Verse 3
+Be still, my soul: the hour is hastening on
+When we shall be forever with the Lord,
+When disappointment, grief, and fear are gone,
+Sorrow forgot, love's purest joys restored.
+Be still, my soul: when change and tears are past,
+All safe and blessed we shall meet at last.`,
+  },
+  {
+    id: "guide-me",
+    title: "Guide Me, O Thou Great Jehovah",
+    author: "William Williams (trans. Peter Williams)",
+    year: 1771,
+    lyrics: `Verse 1
+Guide me, O Thou great Jehovah,
+Pilgrim through this barren land;
+I am weak, but Thou art mighty;
+Hold me with Thy powerful hand.
+Bread of heaven, Bread of heaven,
+Feed me till I want no more.
+
+Verse 2
+Open now the crystal fountain,
+Whence the healing stream doth flow;
+Let the fiery, cloudy pillar
+Lead me all my journey through.
+Strong Deliverer, strong Deliverer,
+Be Thou still my Strength and Shield.
+
+Verse 3
+When I tread the verge of Jordan,
+Bid my anxious fears subside;
+Death of death, and hell's Destruction,
+Land me safe on Canaan's side.
+Songs of praises, songs of praises,
+I will ever give to Thee.`,
+  },
+  {
+    id: "for-the-beauty-of-the-earth",
+    title: "For the Beauty of the Earth",
+    author: "Folliott S. Pierpoint",
+    year: 1864,
+    lyrics: `Verse 1
+For the beauty of the earth,
+For the glory of the skies,
+For the love which from our birth
+Over and around us lies,
+Lord of all, to Thee we raise
+This our hymn of grateful praise.
+
+Verse 2
+For the joy of human love,
+Brother, sister, parent, child,
+Friends on earth, and friends above,
+For all gentle thoughts and mild,
+Lord of all, to Thee we raise
+This our hymn of grateful praise.`,
+  },
+  {
+    id: "now-the-day-is-over",
+    title: "Now the Day Is Over",
+    author: "Sabine Baring-Gould",
+    year: 1865,
+    lyrics: `Verse 1
+Now the day is over,
+Night is drawing nigh;
+Shadows of the evening
+Steal across the sky.
+
+Verse 2
+Jesus, give the weary
+Calm and sweet repose;
+With Thy tenderest blessing
+May our eyelids close.`,
+  },
 ];
 
 /** A hymn as a song, ready for the run sheet. */

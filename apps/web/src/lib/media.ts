@@ -57,11 +57,46 @@ export async function getImage(id: string): Promise<Blob | undefined> {
   return run<Blob | undefined>(await open(), "media", "readonly", (s) => s.get(id));
 }
 
+/** Where the church computer serves pictures (`<base>/media/<id>`), set once connected. */
+let mediaBase = "";
+export function setMediaSource(wsUrl: string): void {
+  mediaBase = wsUrl.replace(/^ws/, "http").replace(/\/+$/, "");
+  urls.clear(); // pictures that weren't found may be there now
+}
+
+/** This browser's copy, else the church computer's (kept here afterwards). */
+export async function loadImage(id: string, fetcher: typeof fetch = fetch): Promise<Blob | undefined> {
+  const local = await getImage(id).catch(() => undefined);
+  if (local || !mediaBase) return local;
+  try {
+    const res = await fetcher(`${mediaBase}/media/${id}`);
+    if (!res.ok) return undefined;
+    const blob = await res.blob();
+    await run(await open(), "media", "readwrite", (s) => s.put(blob, id)).catch(() => undefined);
+    return blob;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Object URLs for previews, one per image for the life of the page. */
 const urls = new Map<string, Promise<string | null>>();
 export function previewUrl(id: string): Promise<string | null> {
-  if (!urls.has(id)) urls.set(id, getImage(id).then((b) => (b ? URL.createObjectURL(b) : null)));
+  if (!urls.has(id)) urls.set(id, loadImage(id).then((b) => (b ? URL.createObjectURL(b) : null)));
   return urls.get(id)!;
+}
+
+/** Every picture id (64 hex characters) named anywhere in a plan's or theme's body. */
+export function docImages(body: unknown): string[] {
+  const found = new Set<string>();
+  const walk = (v: unknown) => {
+    if (typeof v === "string") {
+      if (/^[0-9a-f]{64}$/.test(v)) found.add(v);
+    } else if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") Object.values(v).forEach(walk);
+  };
+  walk(body);
+  return [...found];
 }
 
 function base64(bytes: Uint8Array): string {

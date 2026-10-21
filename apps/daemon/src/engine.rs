@@ -699,8 +699,18 @@ impl Engine {
     /// Runs on its own thread: deleting many files must never hold the engine's lock (the
     /// heartbeat waits on it).
     fn prune_images(&mut self) {
-        let keep: std::collections::HashSet<String> =
+        let mut keep: std::collections::HashSet<String> =
             self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.clone()).collect();
+        // Pictures that saved plans and themes use stay too, so every device can load them.
+        match self.library.as_ref().map(|l| l.media_ids()) {
+            Some(Ok(ids)) => keep.extend(ids),
+            Some(Err(e)) => {
+                // Can't tell what the library uses: keep everything this round.
+                crate::log("engine", format!("library: can't list its pictures, not pruning: {e:?}"));
+                return;
+            }
+            None => {}
+        }
         let (dir, arriving) = (self.store.dir().to_path_buf(), self.uploads.ids());
         // From now on only these are protected, plus whatever devices send or name next.
         *self.protected.lock().unwrap_or_else(|p| p.into_inner()) = keep.union(&arriving).cloned().collect();
@@ -711,6 +721,11 @@ impl Engine {
                 crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
             }
         }));
+    }
+
+    /// The folder the images and the library live in.
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        self.store.dir().to_path_buf()
     }
 
     fn protect(&self, ids: impl IntoIterator<Item = String>) {
@@ -1275,6 +1290,11 @@ fn ws_session<S: OverTcp>(
     let Some(raw) = crate::web::read_head(&mut stream)? else { return Ok(()) };
     let Some(head) = crate::web::parse(&raw) else { return Ok(()) };
     if !head.upgrade {
+        // A picture by id (`/media/<id>`), for devices showing a plan or theme that uses it.
+        if let Some(id) = head.path.strip_prefix("/media/") {
+            let dir = engine.lock().unwrap_or_else(|p| p.into_inner()).data_dir();
+            return crate::web::respond_image(&mut stream, &dir, id, &head);
+        }
         return crate::web::respond(&mut stream, access.web_dir.as_deref(), &head);
     }
     let stream = crate::web::Replay { head: std::io::Cursor::new(raw), inner: stream };
@@ -1415,6 +1435,29 @@ mod tests {
         let mut e = Engine::new(Store::new(&dir).unwrap(), Snapshot::default(), 10);
         assert_eq!(send(&mut e, json!({ "type": "doc.list", "kind": "song" }))["docs"][0]["title"], "Amazing Grace");
         assert_eq!(send(&mut e, json!({ "type": "doc.get", "kind": "song", "id": "grace" }))["doc"]["body"], song);
+    }
+
+    #[test]
+    fn pictures_in_saved_plans_and_themes_are_kept_and_served_by_id() {
+        let (mut e, dir) = engine("library-media", 10);
+        let (used, unused) = ("a".repeat(64), "b".repeat(64));
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend([1u8; 16]);
+        std::fs::create_dir_all(crate::images::dir(&dir)).unwrap();
+        for id in [&used, &unused] {
+            std::fs::write(crate::images::path(&dir, id), &png).unwrap();
+        }
+        let plan = json!({ "items": [{ "id": "i", "kind": "image", "title": "", "text": "", "images": [used] }] });
+        send(
+            &mut e,
+            json!({ "type": "doc.put", "kind": "plan", "id": "sun", "title": "Sunday", "body": plan, "baseRev": 0 }),
+        );
+        // Any run sheet change prunes: the picture the plan uses stays, the other goes.
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": { "id": "x", "title": "", "items": [] } }));
+        e.wait_for_pruning();
+        assert!(crate::images::has(&dir, &used) && !crate::images::has(&dir, &unused));
+        let (kind, bytes) = crate::images::serve(&dir, &used).unwrap();
+        assert_eq!((kind, bytes), ("image/png", png));
     }
 
     #[test]

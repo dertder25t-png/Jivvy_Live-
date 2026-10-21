@@ -119,6 +119,15 @@ pub fn respond<W: Write>(w: &mut W, root: Option<&Path>, head: &Head) -> std::io
     }
 }
 
+/// A complete picture by id (`/media/<id>`): what any device loads to show a plan's or theme's
+/// picture. Ids are SHA-256 hashes of the bytes; anything else is a 404.
+pub fn respond_image<W: Write>(w: &mut W, data_dir: &Path, id: &str, head: &Head) -> std::io::Result<()> {
+    match crate::images::serve(data_dir, id) {
+        Some((kind, body)) => reply(w, head, "200 OK", kind, "public, max-age=31536000, immutable", &body),
+        None => reply(w, head, "404 Not Found", "text/plain; charset=utf-8", "", b"not found\n"),
+    }
+}
+
 /// On every response. A page framed by another site would still be this origin, with this
 /// device's key and the channel open to it, so a click there could press Next or Black:
 /// never let it be framed (`frame-ancestors`, and `X-Frame-Options` for older browsers).

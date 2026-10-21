@@ -123,6 +123,14 @@
     },
   };
 
+  // A clicker's keys land here when this window has focus: pass them to the daemon, which
+  // turns them into next / previous / black. Every key is swallowed so F5, Esc, F11 and
+  // friends can't reload or leave the fullscreen page. Held keys (repeat) are ignored.
+  addEventListener("keydown", (e) => {
+    e.preventDefault();
+    if (!e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) window.ipc.postMessage("key:" + e.key);
+  });
+
   addEventListener("resize", fit);
   fit();
   window.ipc.postMessage("ready");

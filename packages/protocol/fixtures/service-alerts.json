@@ -1,0 +1,13 @@
+{
+  "about": "The whole-stream alerts (SERVICE_ALERT_MESSAGES / serviceAlert in packages/protocol, service_alert in the Rust daemon) and the test push. Both must give exactly these, word for word. Change a message only on purpose, in both places.",
+  "alerts": [
+    {"kind": "stream.down", "destinationId": "", "name": "", "quality": "", "message": "The stream is down: it isn't reaching the platforms. Jivvy keeps trying by itself; check the church computer's internet."},
+    {"kind": "stream.up", "destinationId": "", "name": "", "quality": "", "message": "The stream is live again."},
+    {"kind": "audio.silent", "destinationId": "", "name": "", "quality": "", "message": "No sound on the stream: check the microphones and the sound desk."},
+    {"kind": "audio.back", "destinationId": "", "name": "", "quality": "", "message": "Sound is back on the stream."}
+  ],
+  "test": {"message": "Test alert from Jivvy Live: alerts reach this device.", "tag": "test"},
+  "streamDownAfterMs": 7000,
+  "silenceAfterMs": 10000,
+  "silenceDb": -60
+}

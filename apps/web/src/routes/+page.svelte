@@ -14,6 +14,7 @@
   import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
   import PreflightCheck from "$lib/Preflight.svelte";
+  import AlertPush from "$lib/AlertPush.svelte";
   import Recordings from "$lib/Recordings.svelte";
   import type { Preflight } from "@jivvy/protocol";
   import StreamSettings from "$lib/StreamSettings.svelte";
@@ -688,6 +689,7 @@
   {#if locked}<PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />{/if}
 {:else if view === "preflight"}
   <PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />
+  <AlertPush {ready} send={(c) => conn?.send(c)} />
 {:else if view === "stream"}
   <StreamSettings {live} {ready} send={(c) => conn?.send(c)} />
 {:else if view === "recordings"}

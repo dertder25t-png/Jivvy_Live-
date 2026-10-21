@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type StreamDestination, type StateSnapshot } from "../src/index";
+import { PROTOCOL_VERSION, SILENCE_AFTER_MS, SILENCE_DB, STREAM_DOWN_AFTER_MS, TEST_ALERT_MESSAGE, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, serviceAlert, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type ServiceAlertKind, type StreamDestination, type StateSnapshot } from "../src/index";
+import serviceAlertFixtures from "../fixtures/service-alerts.json";
 import fixtures from "../fixtures/parse-cases.json";
 import alertFixtures from "../fixtures/stream-alerts.json";
 import preflightFixtures from "../fixtures/preflight-summary.json";
@@ -24,6 +25,15 @@ describe("stream alerts (the same cases run in the Rust daemon)", () => {
   type AlertCase = { name: string; before: StreamDestination[]; after: StreamDestination[]; expect: unknown[] };
   it.each((alertFixtures.cases as AlertCase[]).map((c) => [c.name, c] as const))("%s", (_name, c) => {
     expect(streamAlerts(c.before, c.after)).toEqual(c.expect);
+  });
+});
+
+describe("whole-stream alerts and the test push (the same fixture is read by the Rust daemon)", () => {
+  it("say exactly the fixture's words", () => {
+    expect(serviceAlertFixtures.alerts.map((a) => serviceAlert(a.kind as ServiceAlertKind))).toEqual(serviceAlertFixtures.alerts);
+    expect(TEST_ALERT_MESSAGE).toBe(serviceAlertFixtures.test.message);
+    expect([STREAM_DOWN_AFTER_MS, SILENCE_AFTER_MS, SILENCE_DB])
+      .toEqual([serviceAlertFixtures.streamDownAfterMs, serviceAlertFixtures.silenceAfterMs, serviceAlertFixtures.silenceDb]);
   });
 });
 

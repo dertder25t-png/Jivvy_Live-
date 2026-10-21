@@ -132,6 +132,45 @@ pub enum Command {
         #[serde(rename = "baseRev", skip_serializing_if = "Option::is_none")]
         base_rev: Option<u64>,
     },
+    /// The VAPID public key a browser subscribes with (`pushKey` on the ack).
+    #[serde(rename = "push.key")]
+    PushKey,
+    /// This device's web push subscription; replaces any it had.
+    #[serde(rename = "push.subscribe")]
+    PushSubscribe { endpoint: String, p256dh: String, auth: String },
+    /// A test alert to this device's subscription.
+    #[serde(rename = "push.test")]
+    PushTest,
+}
+
+/// The push services pushes may go to: these hosts, or any host under them.
+pub const PUSH_HOSTS: [&str; 4] =
+    ["fcm.googleapis.com", "push.services.mozilla.com", "notify.windows.com", "push.apple.com"];
+
+/// A known push service's endpoint, as the TypeScript `isPushEndpoint`: https, printable ASCII,
+/// a host in `PUSH_HOSTS` (exact or under it) with no user info, port or IP literal.
+pub fn is_push_endpoint(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("https://") else { return false };
+    if rest.is_empty() || rest.len() > 2040 || !rest.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains(['@', ':', '[', ']']) {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    PUSH_HOSTS.iter().any(|h| host == *h || host.strip_suffix(h).is_some_and(|p| p.ends_with('.') && p.len() > 1))
+}
+
+fn push_endpoint(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    is_push_endpoint(s).then(|| s.into())
+}
+
+/// A push subscription's 16-byte auth secret, base64url without padding.
+fn push_auth(v: Option<&Value>) -> Option<String> {
+    let s = v?.as_str()?;
+    (s.len() == 22 && is_b64url(s)).then(|| s.into())
 }
 
 /// The `config` of `stream.config.set`, kept as given (the engine checks it). It can hold
@@ -413,7 +452,8 @@ fn destination_list(v: &Value) -> Option<Vec<StreamDestination>> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Alert {
-    /// "stream.lowered", "stream.paused" or "stream.resumed".
+    /// "stream.lowered", "stream.paused" or "stream.resumed"; for the whole stream (with
+    /// "" for the platform fields) "stream.down", "stream.up", "audio.silent", "audio.back".
     pub kind: &'static str,
     pub destination_id: String,
     pub name: String,
@@ -431,6 +471,33 @@ pub struct AlertEvent<'a> {
 
 pub fn alert_event(alert: &Alert) -> AlertEvent<'_> {
     AlertEvent { v: PROTOCOL_VERSION, event: "alert", alert }
+}
+
+/// How long the wanted stream isn't live before it is an alert (`STREAM_DOWN_AFTER_MS`). With
+/// a report going stale after 3 s and a tick every 250 ms, that is about 10.5 s at worst from
+/// the stream stopping to the push leaving: inside the plan's 15 s.
+pub const STREAM_DOWN_AFTER: std::time::Duration = std::time::Duration::from_secs(7);
+/// How long the live stream is silent before it is an alert (`SILENCE_AFTER_MS`).
+pub const SILENCE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+/// Below this peak level (dBFS) on every channel, the stream counts as silent (`SILENCE_DB`).
+pub const SILENCE_DB: f64 = -60.0;
+/// What the "Send test alert" button pushes, with the tag "test" (`TEST_ALERT_MESSAGE`).
+pub const TEST_ALERT_MESSAGE: &str = "Test alert from Jivvy Live: alerts reach this device.";
+
+/// An alert about the whole stream, word for word as the TypeScript `serviceAlert`
+/// (packages/protocol/fixtures/service-alerts.json): "stream.down", "stream.up",
+/// "audio.silent" or "audio.back".
+pub fn service_alert(kind: &'static str) -> Alert {
+    let message = match kind {
+        "stream.down" => {
+            "The stream is down: it isn't reaching the platforms. Jivvy keeps trying by itself; check the church computer's internet."
+        }
+        "stream.up" => "The stream is live again.",
+        "audio.silent" => "No sound on the stream: check the microphones and the sound desk.",
+        "audio.back" => "Sound is back on the stream.",
+        _ => unreachable!("not a whole-stream alert: {kind}"),
+    };
+    Alert { kind, destination_id: String::new(), name: String::new(), quality: String::new(), message: message.into() }
 }
 
 /// Height of a quality label ("720p" -> 720); audio only ranks below every picture; 0 for none.
@@ -695,6 +762,9 @@ pub struct AckExtras {
     /// doc.put, doc.delete
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved: Option<DocInfo>,
+    /// push.key: the VAPID public key, raw P-256, base64url.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_key: Option<String>,
     /// recording.list
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recordings: Option<Vec<crate::recording::SetInfo>>,
@@ -941,6 +1011,19 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
             }
         }
         "runsheet.get" => Command::RunSheetGet,
+        "push.key" => Command::PushKey,
+        "push.test" => Command::PushTest,
+        "push.subscribe" => {
+            match (push_endpoint(obj.get("endpoint")), public_key(obj.get("p256dh")), push_auth(obj.get("auth"))) {
+                (Some(endpoint), Some(p256dh), Some(auth)) => Command::PushSubscribe { endpoint, p256dh, auth },
+                _ => {
+                    return Err((
+                        ErrorCode::BadArguments,
+                        "push.subscribe needs an https endpoint, a P-256 p256dh key and a 16-byte auth",
+                    ));
+                }
+            }
+        }
         "media.put" => {
             let offset = obj.get("offset").and_then(js_integer).filter(|f| *f >= 0.0);
             match (media_id(obj.get("id")), offset, base64_chunk(obj.get("data"))) {
@@ -1152,6 +1235,21 @@ mod tests {
             let got = serde_json::to_value(stream_alerts(&list(&c["before"]), &list(&c["after"]))).unwrap();
             assert_eq!(got, c["expect"], "{}", c["name"]);
         }
+    }
+
+    #[test]
+    fn service_alerts_and_the_test_push_match_the_typescript_ones_word_for_word() {
+        const FIXTURE: &str = include_str!("../../../packages/protocol/fixtures/service-alerts.json");
+        let doc: Value = serde_json::from_str(FIXTURE).unwrap();
+        let got: Vec<Value> = ["stream.down", "stream.up", "audio.silent", "audio.back"]
+            .into_iter()
+            .map(|k| serde_json::to_value(service_alert(k)).unwrap())
+            .collect();
+        assert_eq!(Value::Array(got), doc["alerts"]);
+        assert_eq!(doc["test"]["message"], TEST_ALERT_MESSAGE);
+        assert_eq!(doc["streamDownAfterMs"], STREAM_DOWN_AFTER.as_millis() as u64);
+        assert_eq!(doc["silenceAfterMs"], SILENCE_AFTER.as_millis() as u64);
+        assert_eq!(doc["silenceDb"].as_f64(), Some(SILENCE_DB));
     }
 
     #[test]

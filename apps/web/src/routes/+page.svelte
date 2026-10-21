@@ -11,6 +11,7 @@
   import SlideView from "$lib/SlideView.svelte";
   import ThemePicker from "$lib/ThemePicker.svelte";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
+  import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
@@ -347,10 +348,16 @@
       queuePlanSave({ id: draft.id, title: draft.title, items: JSON.stringify(draft.items) });
   }
   let planSaving = false;
+  let planRun: Promise<void> | null = null;
   function queuePlanSave(plan: { id: string; title: string; items: string }) {
     planPending.delete(plan.id); // re-added last: plans save in the order they were edited
     planPending.set(plan.id, { title: plan.title, items: plan.items });
-    if (!planSaving) void flushPlanSaves();
+    if (!planSaving) planRun = flushPlanSaves();
+  }
+  /** Before an export: the last edit goes now and every save queued has finished. */
+  async function savePlansNow() {
+    saveCurrentPlanNow();
+    await planRun;
   }
   async function flushPlanSaves() {
     planSaving = true;
@@ -521,6 +528,7 @@
       <input id="address" bind:value={address} spellcheck="false" autocomplete="off" />
       <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
     </form>
+    <Export {ready} sender={() => conn} beforeExport={savePlansNow} />
   {/if}
   <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
     {locked ? "Unlock" : "Lock for volunteers"}

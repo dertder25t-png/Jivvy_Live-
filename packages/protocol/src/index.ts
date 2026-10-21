@@ -84,8 +84,9 @@ export type Command =
   | { type: "stream.config.get" }
   /**
    * Added in v1 without a version bump. Replaces the destinations (in the order given: the first
-   * is the main platform) and advanced settings in `stream.json`. Write-only keys: a `key` sets
-   * one; leaving it out keeps the saved one. Checked with the same rules the daemon uses to
+   * is the main platform) and advanced settings in `stream.json`. Church computer only. Write-only
+   * keys: a `key` sets one; leaving it out keeps the saved one, but only while the address shown
+   * by `stream.config.get` is unchanged (another server needs the key typed again). Checked with the same rules the daemon uses to
    * start a stream, saved atomically, and answered with the new `streamConfig`. Refused with
    * `unavailable` while streaming (the video process would reconnect changed destinations
    * mid-service) and with `bad_arguments` and a plain message when something is wrong.
@@ -226,7 +227,7 @@ export interface StreamConfigInput {
 export interface StreamConfigDestination {
   id: string;
   name: string;
-  /** Scheme, host and app only: any key in the saved address is cut off. */
+  /** Scheme and host (and the app when the key is a field of its own); never anything that could be a key. */
   url: string;
   enabled: boolean;
   hasKey: boolean;
@@ -237,6 +238,8 @@ export interface StreamConfigDestination {
 export interface StreamConfigView {
   destinations: StreamConfigDestination[];
   bandwidth?: { mode?: string };
+  /** Whether this connection may change them: only the church computer's own screen may. */
+  canEdit?: boolean;
 }
 
 /** A P-256 public key, raw uncompressed (0x04 || x || y, 65 bytes), base64url without padding. */

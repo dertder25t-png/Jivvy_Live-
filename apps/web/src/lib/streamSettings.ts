@@ -39,12 +39,21 @@ export const fromView = (view: StreamConfigView): Draft => ({
   advanced: view.bandwidth?.mode === "advanced",
 });
 
-/** A fresh id for a destination: the preset's name, made unique among the ones already there. */
-export function newRowId(base: string, taken: string[]): string {
-  const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "stream";
-  let id = slug;
-  for (let n = 2; taken.includes(id); n++) id = `${slug}-${n}`;
+/**
+ * A fresh id for a destination: the name plus a random part, so a destination added after
+ * another was removed never takes over the removed one's saved key.
+ */
+export function newRowId(base: string, taken: string[], random: () => string = randomPart): string {
+  const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "stream";
+  let id = `${slug}-${random()}`;
+  while (taken.includes(id)) id = `${slug}-${random()}`;
   return id;
+}
+
+function randomPart(): string {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export function addRow(draft: Draft, preset: (typeof PRESETS)[number]): Draft {

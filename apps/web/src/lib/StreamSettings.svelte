@@ -21,17 +21,21 @@
 
   let draft = $state<Draft>({ rows: [], advanced: false });
   let loaded = $state(false);
+  /** Only the church computer's own screen may change them; a phone sees them read-only. */
+  let canEdit = $state(false);
   let busy = $state(false);
   let message = $state("");
   let failed = $state(false);
   let preset = $state<string>(PRESETS[0].id);
 
   const isStreaming = $derived(streaming(live));
+  const locked = $derived(!ready || isStreaming || !canEdit);
 
   async function load() {
     const ack = await send({ type: "stream.config.get" });
     if (ack?.ok && ack.streamConfig) {
       draft = fromView(ack.streamConfig);
+      canEdit = ack.streamConfig.canEdit === true;
       loaded = true;
       message = "";
     } else {
@@ -77,14 +81,16 @@
     Where the stream goes. The first destination is the main one. Stream keys are never shown again once saved.
   </p>
 
-  {#if isStreaming}
+  {#if loaded && !canEdit}
+    <p class="note">Change these on the church computer.</p>
+  {:else if isStreaming}
     <p class="note">Stop the stream to change these settings. Saving during a stream would reconnect it and could drop it.</p>
   {:else if !ready}
     <p class="note">Connect to the church computer to change these.</p>
   {/if}
 
   {#each draft.rows as row, i (row.id)}
-    <fieldset class="dest" disabled={!ready || isStreaming}>
+    <fieldset class="dest" disabled={locked}>
       <legend>{row.name || "Destination"}{#if i === 0} (main){/if}</legend>
       <label>Name <input bind:value={row.name} maxlength="64" /></label>
       <label>Server address <input bind:value={row.url} spellcheck="false" autocomplete="off" /></label>
@@ -120,34 +126,34 @@
           </select>
         </label>
       {/if}
-      <div class="actions">
+      {#if canEdit}<div class="actions">
         <button type="button" onclick={() => (draft = moveRow(draft, i, -1))} disabled={i === 0} aria-label="Move up">Up</button>
         <button type="button" onclick={() => (draft = moveRow(draft, i, 1))} disabled={i === draft.rows.length - 1} aria-label="Move down">Down</button>
         <button type="button" class="quiet" onclick={() => remove(i)}>Remove</button>
-      </div>
+      </div>{/if}
     </fieldset>
   {:else}
     {#if loaded}<p class="hint">No destinations yet. Add one below.</p>{/if}
   {/each}
 
-  <div class="add">
-    <select bind:value={preset} aria-label="Kind of destination" disabled={!ready || isStreaming}>
+  {#if canEdit}<div class="add">
+    <select bind:value={preset} aria-label="Kind of destination" disabled={locked}>
       {#each PRESETS as p (p.id)}<option value={p.id}>{p.label}</option>{/each}
     </select>
-    <button type="button" onclick={add} disabled={!ready || isStreaming || !loaded || draft.rows.length >= 16}>Add destination</button>
-  </div>
+    <button type="button" onclick={add} disabled={locked || !loaded || draft.rows.length >= 16}>Add destination</button>
+  </div>{/if}
 
   <label class="inline">
-    <input type="checkbox" bind:checked={draft.advanced} disabled={!ready || isStreaming} />
+    <input type="checkbox" bind:checked={draft.advanced} disabled={locked} />
     Advanced bandwidth settings (a quality limit and a fallback for each destination)
   </label>
 
-  <div class="save">
-    <button class="primary" type="button" onclick={save} disabled={!ready || isStreaming || busy || !loaded}>
+  {#if canEdit}<div class="save">
+    <button class="primary" type="button" onclick={save} disabled={locked || busy || !loaded}>
       {busy ? "Saving…" : "Save"}
     </button>
     {#if message}<span class="msg" role={failed ? "alert" : "status"} data-failed={failed}>{message}</span>{/if}
-  </div>
+  </div>{:else if message}<p class="note" role="alert">{message}</p>{/if}
 </section>
 
 <style>

@@ -98,7 +98,6 @@ fn device_may(command: &Command) -> bool {
             | Command::StateSubscribe
             | Command::StreamPreflight
             | Command::StreamConfigGet
-            | Command::StreamConfigSet { .. }
             | Command::RunSheetSet { .. }
             | Command::RunSheetGet
             | Command::MediaPut { .. }
@@ -440,8 +439,8 @@ impl Engine {
                 }
                 return self.start_preflight(id, outbox);
             }
-            Command::StreamConfigGet => return self.stream_config(id, None),
-            Command::StreamConfigSet { config } => return self.stream_config(id, Some(config.0)),
+            Command::StreamConfigGet => return self.stream_config(id, None, session.local),
+            Command::StreamConfigSet { config } => return self.stream_config(id, Some(config.0), session.local),
             Command::PairRequest { .. } | Command::AuthHello { .. } | Command::AuthProve { .. } => {
                 return protocol::nack(id, ErrorCode::BadArguments, "the church computer doesn't need to pair");
             }
@@ -759,7 +758,7 @@ impl Engine {
     /// `stream.json` every second and reconnects any destination whose address, key or name
     /// changed, which would drop that platform mid-service. Refusing is also simpler to
     /// explain than a change that waits for the next start.
-    fn stream_config(&mut self, id: &str, set: Option<serde_json::Map<String, serde_json::Value>>) -> Ack {
+    fn stream_config(&mut self, id: &str, set: Option<serde_json::Map<String, serde_json::Value>>, local: bool) -> Ack {
         use crate::stream;
         let dir = self.store.dir().to_path_buf();
         let saved = match stream::load_config(&dir) {
@@ -799,7 +798,10 @@ impl Engine {
                 next
             }
         };
-        let extras = AckExtras { stream_config: Some(stream::config_view(&config)), ..Default::default() };
+        let mut view = stream::config_view(&config);
+        // Changing them is the church computer's alone (until roles exist); a phone shows them read-only.
+        view["canEdit"] = serde_json::Value::Bool(local);
+        let extras = AckExtras { stream_config: Some(view), ..Default::default() };
         protocol::ack_with(id, None, extras)
     }
 
@@ -1533,6 +1535,47 @@ mod tests {
         assert_eq!(bad["ok"], false);
         assert!(bad["message"].as_str().unwrap().starts_with("Church: the server address must start with"));
         assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        // The saved key never follows an address to another server, and a key can't carry options.
+        let try_set = |e: &mut Engine, yt: Value| {
+            send(e, json!({ "type": "stream.config.set", "config": { "destinations": [yt] } }))
+        };
+        let moved =
+            try_set(&mut e, json!({ "id": "youtube", "name": "YouTube", "url": "rtmps://evil.example:443/live2" }));
+        assert_eq!(moved["ok"], false);
+        assert!(moved["message"].as_str().unwrap().contains("enter the stream key again"), "{moved}");
+        let spaced = try_set(
+            &mut e,
+            json!({ "id": "youtube", "name": "YouTube", "url": "rtmps://a.rtmps.youtube.com:443/live2", "key": "abc socks=evil" }),
+        );
+        assert_eq!(spaced["ok"], false, "{spaced}");
+        assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        // An address whose only path part could be a key is not shown back, in a get or a set ack.
+        let odd = try_set(
+            &mut e,
+            json!({ "id": "odd", "name": "Odd", "url": "rtmp://host.example/KEYONLY1234", "enabled": false }),
+        );
+        assert_eq!(odd["ok"], true, "{odd}");
+        assert!(!odd.to_string().contains("KEYONLY1234"), "{odd}");
+        let got = send(&mut e, json!({ "type": "stream.config.get" }));
+        assert!(!got.to_string().contains("KEYONLY1234"), "{got}");
+        assert_eq!(got["streamConfig"]["destinations"][0]["url"], "rtmp://host.example");
+        assert_eq!(got["streamConfig"]["canEdit"], true);
+        // A new key for an HLS address keeps its other settings (copy=1) and drops the old cid.
+        std::fs::write(
+            dir.join("stream.json"),
+            r#"{"version":1,"destinations":[{"id":"h","name":"YT","url":"https://a.upload.youtube.com/http_upload_hls?cid=OLDCID1&copy=1"}]}"#,
+        )
+        .unwrap();
+        let hls = try_set(
+            &mut e,
+            json!({ "id": "h", "name": "YT", "url": "https://a.upload.youtube.com/http_upload_hls", "key": "NEWCID2" }),
+        );
+        assert_eq!(hls["ok"], true, "{hls}");
+        let on_disk = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        assert!(on_disk.contains("copy=1") && on_disk.contains("NEWCID2") && !on_disk.contains("OLDCID1"), "{on_disk}");
+        // Put the two-platform setup back for the checks below.
+        send(&mut e, set("YouTube Live", Some(SECRET)));
+        let file = std::fs::read_to_string(dir.join("stream.json")).unwrap();
         // While streaming a save is refused, a read is not.
         send(&mut e, json!({ "type": "stream.start" }));
         assert_eq!(send(&mut e, set("Renamed", None))["code"], "unavailable");

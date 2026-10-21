@@ -33,6 +33,12 @@ const RECENT_PICTURES: Duration = Duration::from_secs(600);
 pub const STREAM_REPORT_STALE: Duration = Duration::from_secs(3);
 /// The same for the recording: a silent video process is never shown as recording.
 pub const RECORDING_REPORT_STALE: Duration = Duration::from_secs(3);
+/// A stream that was never live since it started counts as down only after this.
+const STREAM_START_GRACE: Duration = Duration::from_secs(20);
+/// Level reports come about ten a second; none for this long counts as silence.
+const LEVELS_STALE: Duration = Duration::from_secs(1);
+/// Each alert kind is pushed at most once in this long (screens still see every one).
+const PUSH_COOLDOWN: Duration = Duration::from_secs(120);
 
 /// Where messages for one connection go. All writes to a socket go through its outbox so
 /// acks and events never interleave mid-line.
@@ -189,6 +195,14 @@ pub struct Engine {
     stream_down: Option<(Instant, bool)>,
     /// Since when the live stream is silent, and whether that was alerted yet.
     silent: Option<(Instant, bool)>,
+    /// When the stream was wanted (first seen so by a tick), and whether it has been live since.
+    stream_started: Option<Instant>,
+    been_live: bool,
+    /// When the last level report came.
+    last_levels: Option<Instant>,
+    /// When each alert kind was last pushed, and the "down" kinds whose push went out.
+    last_push: std::collections::HashMap<&'static str, Instant>,
+    pushed_down: std::collections::HashSet<&'static str>,
 }
 
 impl Engine {
@@ -216,10 +230,17 @@ impl Engine {
         let library = crate::library::Library::open(store.dir())
             .map_err(|e| crate::log("engine", format!("the library can't be opened: {e:?}")))
             .ok();
-        let push = crate::push::Push::load(store.dir());
+        let mut push = crate::push::Push::load(store.dir());
+        // A device removed while push.json couldn't be saved gets nothing after a restart either.
+        push.keep_only(|d| d == "this-computer" || devices.contains_id(d));
         let mut engine = Engine {
             push,
             stream_down: None,
+            stream_started: None,
+            been_live: false,
+            last_levels: None,
+            last_push: Default::default(),
+            pushed_down: Default::default(),
             silent: None,
             state,
             store,
@@ -372,61 +393,94 @@ impl Engine {
             })
     }
 
-    /// The wanted stream not live for `ALERT_AFTER` is an alert, and so is it coming back.
+    /// The wanted stream not live for `STREAM_DOWN_AFTER` is an alert, and so is it coming back.
+    /// The clock starts once the stream has been live since it was started, or after
+    /// `STREAM_START_GRACE` if it never got there: connecting isn't "down". Run on every tick,
+    /// which also counts level reports that stopped coming as silence.
     fn watch_stream(&mut self, now: Instant) {
         if !self.state.stream_wanted {
-            (self.stream_down, self.silent) = (None, None);
+            (self.stream_down, self.silent, self.stream_started, self.been_live) = (None, None, None, false);
             return;
         }
-        match (self.stream_live(now), self.stream_down) {
+        let started = *self.stream_started.get_or_insert(now);
+        let live = self.stream_live(now);
+        self.been_live |= live;
+        let counting = self.been_live || now.saturating_duration_since(started) >= STREAM_START_GRACE;
+        match (live, self.stream_down) {
             (true, Some((_, alerted))) => {
                 self.stream_down = None;
                 if alerted {
-                    self.raise(&protocol::service_alert("stream.up"));
+                    self.raise(&protocol::service_alert("stream.up"), now);
                 }
             }
             (true, None) => {}
-            (false, None) => self.stream_down = Some((now, false)),
-            (false, Some((since, false))) if now.saturating_duration_since(since) >= protocol::ALERT_AFTER => {
+            (false, None) if counting => self.stream_down = Some((now, false)),
+            (false, None) => {}
+            (false, Some((since, false))) if now.saturating_duration_since(since) >= protocol::STREAM_DOWN_AFTER => {
                 self.stream_down = Some((since, true));
-                self.raise(&protocol::service_alert("stream.down"));
+                self.raise(&protocol::service_alert("stream.down"), now);
             }
             (false, Some(_)) => {}
         }
+        let levels_stale = self.last_levels.is_none_or(|at| now.saturating_duration_since(at) >= LEVELS_STALE);
+        if !live || levels_stale {
+            self.watch_sound(true, now);
+        }
     }
 
-    /// Every channel below `SILENCE_DB` on the live stream for `ALERT_AFTER` is an alert, and
-    /// so is the sound coming back.
-    fn watch_sound(&mut self, peak_db: &[f64], now: Instant) {
+    /// Every channel below `SILENCE_DB` (or no level reports at all) on the live stream for
+    /// `SILENCE_AFTER` is an alert, and so is the sound coming back.
+    fn watch_sound(&mut self, quiet: bool, now: Instant) {
         if !self.stream_live(now) {
             self.silent = None;
             return;
         }
-        let quiet = peak_db.iter().all(|p| *p < protocol::SILENCE_DB);
         match (quiet, self.silent) {
             (false, Some((_, alerted))) => {
                 self.silent = None;
                 if alerted {
-                    self.raise(&protocol::service_alert("audio.back"));
+                    self.raise(&protocol::service_alert("audio.back"), now);
                 }
             }
             (false, None) => {}
             (true, None) => self.silent = Some((now, false)),
-            (true, Some((since, false))) if now.saturating_duration_since(since) >= protocol::ALERT_AFTER => {
+            (true, Some((since, false))) if now.saturating_duration_since(since) >= protocol::SILENCE_AFTER => {
                 self.silent = Some((since, true));
-                self.raise(&protocol::service_alert("audio.silent"));
+                self.raise(&protocol::service_alert("audio.silent"), now);
             }
             (true, Some(_)) => {}
         }
     }
 
-    /// Tells every screen, and the tech lead's devices by web push.
-    fn raise(&mut self, alert: &protocol::Alert) {
+    /// Tells every screen, and the tech lead's devices by web push (see `should_push`).
+    fn raise(&mut self, alert: &protocol::Alert, now: Instant) {
         crate::log("engine", format!("alert: {}", alert.message));
         if let Ok(line) = serde_json::to_vec(&protocol::alert_event(alert)) {
             self.send_to_subscribers(line);
         }
-        self.push.alert(&alert.message, alert.kind);
+        if self.should_push(alert.kind, now) {
+            self.push.alert(&alert.message, alert.kind);
+        }
+    }
+
+    /// A flapping stream mustn't buzz a phone every few seconds: each kind is pushed at most
+    /// once per `PUSH_COOLDOWN`, and a "back" only if its "down" was pushed. Screens see all.
+    fn should_push(&mut self, kind: &'static str, now: Instant) -> bool {
+        const PAIRS: [(&str, &str); 3] =
+            [("stream.down", "stream.up"), ("audio.silent", "audio.back"), ("stream.paused", "stream.resumed")];
+        if let Some((down, _)) = PAIRS.iter().find(|(_, back)| *back == kind)
+            && !self.pushed_down.remove(down)
+        {
+            return false;
+        }
+        if self.last_push.get(kind).is_some_and(|t| now.saturating_duration_since(*t) < PUSH_COOLDOWN) {
+            return false;
+        }
+        self.last_push.insert(kind, now);
+        if PAIRS.iter().any(|(down, _)| *down == kind) {
+            self.pushed_down.insert(kind);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -534,13 +588,17 @@ impl Engine {
             Command::PushSubscribe { endpoint, p256dh, auth } => {
                 return match self.push.subscribe(&push_owner(session), &endpoint, &p256dh, &auth) {
                     Ok(()) => protocol::ack(id, None),
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    Err(crate::push::SubscribeError::BadKey) => {
                         protocol::nack(id, ErrorCode::BadArguments, "p256dh isn't a valid P-256 key")
                     }
-                    Err(e) => {
-                        crate::log("engine", format!("push.json save failed: {e}"));
-                        protocol::nack(id, ErrorCode::Unavailable, "could not save; try again")
+                    Err(crate::push::SubscribeError::BadEndpoint) => {
+                        protocol::nack(id, ErrorCode::BadArguments, "that isn't a known push service")
                     }
+                    Err(crate::push::SubscribeError::Full) => protocol::nack(
+                        id,
+                        ErrorCode::Unavailable,
+                        "20 devices already get alerts; remove one on the church computer first",
+                    ),
                 };
             }
             Command::PushTest => {
@@ -615,7 +673,7 @@ impl Engine {
                         .is_some_and(|(_, at)| now.saturating_duration_since(at) < STREAM_REPORT_STALE);
                     if fresh && self.state.stream_wanted {
                         for alert in protocol::stream_alerts(&self.stream_destinations, &destinations) {
-                            self.raise(&alert);
+                            self.raise(&alert, now);
                         }
                     }
                     self.stream_destinations = destinations;
@@ -639,7 +697,9 @@ impl Engine {
             }
             Command::StateGet => {}
             Command::MediaLevels(levels) => {
-                self.watch_sound(&levels.peak_db, Instant::now());
+                let now = Instant::now();
+                self.last_levels = Some(now);
+                self.watch_sound(levels.peak_db.iter().all(|p| *p < protocol::SILENCE_DB), now);
                 // Live meter data: relayed, never saved, never a state change.
                 if let Ok(line) = serde_json::to_vec(&protocol::levels_event(&levels)) {
                     self.send_to_subscribers(line);
@@ -2627,24 +2687,36 @@ mod tests {
         let browser = SecretKey::from_slice(&seed).unwrap();
         let auth = [7u8; 16];
         let push_key = phone.send(&mut e, json!({ "type": "push.key" }))["pushKey"].as_str().unwrap().to_string();
-        let sub = phone.send(
-            &mut e,
-            json!({ "type": "push.subscribe", "endpoint": "https://push.example/send/phone",
+        let subscribe = |endpoint: &str| {
+            json!({ "type": "push.subscribe", "endpoint": endpoint,
                     "p256dh": B64.encode(browser.public_key().to_encoded_point(false).as_bytes()),
-                    "auth": B64.encode(auth) }),
-        );
+                    "auth": B64.encode(auth) })
+        };
+        // Pushes only ever go to a known push service, never to this network.
+        let local = phone.send(&mut e, subscribe("https://127.0.0.1/x"));
+        assert_eq!(local["code"], "bad_arguments", "{local}");
+        let sub = phone.send(&mut e, subscribe("https://fcm.googleapis.com/fcm/send/phone"));
         assert_eq!(sub["ok"], true, "{sub}");
         let open = |body: Vec<u8>| -> Value {
             let plain = web_push_native::decrypt(body, &browser, &web_push_native::Auth::clone_from_slice(&auth));
             serde_json::from_slice(&plain.unwrap()).unwrap()
         };
 
-        // Streaming is wanted, and the video process stops reporting.
+        // The stream goes live, then the video process stops reporting.
         send(&mut e, json!({ "type": "stream.start" }));
-        let now = Instant::now();
-        e.tick_at(now);
-        e.tick_at(now + protocol::ALERT_AFTER + Duration::from_secs(1));
+        let t0 = Instant::now();
+        let t = |s: u64| t0 + Duration::from_secs(s);
+        let live_at = |e: &mut Engine, s: u64| {
+            e.stream_report = Some((StreamStatus::Live, t(s)));
+            e.last_levels = Some(t(s));
+            e.tick_at(t(s));
+        };
+        live_at(&mut e, 0);
+        e.tick_at(t(4)); // stale: down from here
+        e.tick_at(t(4) + protocol::STREAM_DOWN_AFTER);
+        let sent = Instant::now();
         let (head, body) = pushes.recv_timeout(Duration::from_secs(20)).expect("a push");
+        eprintln!("local push delivered {:?} after the alert", sent.elapsed());
         let down = protocol::service_alert("stream.down");
         assert_eq!(open(body), json!({ "message": down.message, "tag": "stream.down" }));
         assert!(head.to_ascii_lowercase().contains("content-encoding: aes128gcm"), "{head}");
@@ -2658,21 +2730,34 @@ mod tests {
         assert_eq!(k.trim(), push_key);
         let (signed, sig) = jwt.rsplit_once('.').unwrap();
         let claims: Value = serde_json::from_slice(&B64.decode(signed.split('.').nth(1).unwrap()).unwrap()).unwrap();
-        assert_eq!(claims["aud"], "https://push.example");
+        assert_eq!(claims["aud"], "https://fcm.googleapis.com");
         let public = ring::signature::UnparsedPublicKey::new(
             &ring::signature::ECDSA_P256_SHA256_FIXED,
             B64.decode(&push_key).unwrap(),
         );
         assert!(public.verify(signed.as_bytes(), &B64.decode(sig).unwrap()).is_ok(), "a valid VAPID signature");
 
-        // The "Send test alert" button.
+        // Back up: its "down" was pushed, so this is too.
+        live_at(&mut e, 13);
+        let (_, body) = pushes.recv_timeout(Duration::from_secs(20)).expect("the stream-up push");
+        assert_eq!(open(body)["tag"], "stream.up");
+        // Down again within the cooldown: screens hear it, the phone doesn't, nor of it coming back.
+        let (tx, screen) = sync_channel(64);
+        e.handle_line_from(&envelope(json!({ "type": "state.subscribe" })), Some(&Outbox::new(tx, None)));
+        e.tick_at(t(17));
+        e.tick_at(t(17) + protocol::STREAM_DOWN_AFTER);
+        live_at(&mut e, 26);
+        let kinds: Vec<Value> = alerts(&screen).iter().map(|a| a["kind"].clone()).collect();
+        assert_eq!(kinds, [json!("stream.down"), json!("stream.up")]);
+
+        // The "Send test alert" button: the next push the phone gets.
         assert_eq!(phone.send(&mut e, json!({ "type": "push.test" }))["ok"], true);
         let (_, body) = pushes.recv_timeout(Duration::from_secs(20)).expect("the test push");
         assert_eq!(open(body), json!({ "message": protocol::TEST_ALERT_MESSAGE, "tag": "test" }));
 
         // Removing the device drops its subscription, and the key stays in the data dir.
         send(&mut e, json!({ "type": "device.remove", "deviceId": device }));
-        assert!(!crate::push::Push::load(&dir).has(&device));
+        assert!(!e.push.has(&device));
         assert_eq!(crate::push::Push::load(&dir).public_key(), Some(push_key));
     }
 

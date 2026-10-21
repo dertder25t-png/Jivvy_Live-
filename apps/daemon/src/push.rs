@@ -1,17 +1,24 @@
 //! Alerts to the tech lead by web push (RFC 8030, payload encrypted per RFC 8291, signed with
 //! VAPID per RFC 8292), so they arrive even with no Jivvy screen open.
 //!
-//! The church computer sends the push itself. It needs the internet only to deliver it: each
-//! push goes out on its own thread, is retried a few times, and a failure is logged and
-//! dropped. Nothing here ever holds up the service.
+//! The church computer sends the push itself. It needs the internet only to deliver it: one
+//! worker thread delivers from a bounded queue, retries a few times, and a failure is logged
+//! and dropped. Nothing here ever holds up the service: the engine only queues, and saving
+//! the subscriptions (flushed to disk) happens on the worker too, off the engine's lock.
 //!
 //! The VAPID key is made once and kept in the data dir (`vapid-key.p8`), like the daemon id;
-//! it never goes in a log. Subscriptions are kept per paired device (`push.json`); removing
-//! the device drops its subscription. A push carries only the alert's words and a tag.
+//! it never goes in a log. Subscriptions are kept per paired device (`push.json`), one each and
+//! `MAX_SUBSCRIPTIONS` in all; removing the device drops its subscription, and so does the push
+//! service saying it is gone. Pushes only go to the known push services' hosts
+//! (`protocol::is_push_endpoint`), checked when subscribing and again when sending. A push
+//! carries only the alert's words and a tag.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -20,10 +27,18 @@ use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use web_push_native::{Auth, WebPushBuilder, p256};
 
+use crate::protocol::is_push_endpoint;
+
+/// Most devices that can get alerts.
+pub const MAX_SUBSCRIPTIONS: usize = 20;
+/// Pushes waiting for the worker (new and retrying); more are dropped and logged.
+const QUEUE: usize = 64;
 /// How long a push service keeps trying to reach the phone: an alert hours late is noise.
 const TTL: Duration = Duration::from_secs(15 * 60);
 /// Waits before each retry of a push that didn't go through.
 const RETRY_AFTER: [Duration; 3] = [Duration::from_secs(2), Duration::from_secs(10), Duration::from_secs(30)];
+/// How soon a failed save of `push.json` is tried again.
+const SAVE_RETRY: Duration = Duration::from_secs(5);
 /// Who sends these pushes, for the push services (VAPID `sub`).
 const CONTACT: &str = "https://live.jivvy.org";
 
@@ -49,17 +64,73 @@ struct Payload<'a> {
     tag: &'a str,
 }
 
-pub struct Push {
+/// One push to deliver.
+struct Job {
+    sub: Subscription,
+    payload: Vec<u8>,
+    /// Where the request goes: the subscription's endpoint, except in tests.
+    target: String,
+    attempt: usize,
+}
+
+enum Msg {
+    Deliver(Job),
+    Save,
+}
+
+/// What the engine and the worker share.
+struct Shared {
     path: PathBuf,
-    subscriptions: Vec<Subscription>,
+    subscriptions: Mutex<Vec<Subscription>>,
+    /// Set when the list changed; the worker saves it.
+    dirty: AtomicBool,
+}
+
+impl Shared {
+    fn list(&self) -> std::sync::MutexGuard<'_, Vec<Subscription>> {
+        self.subscriptions.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Saves the list if it changed (temp file, flush, rename). On the worker, never the engine.
+    fn save_if_dirty(&self) {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let list = self.list().clone();
+        let saved = serde_json::to_vec_pretty(&PushFile { version: 1, subscriptions: list })
+            .map_err(std::io::Error::other)
+            .and_then(|b| crate::devices::save_durably(&self.path, &b));
+        if let Err(e) = saved {
+            // The list in memory is already right (a removed device gets nothing); the file
+            // catches up on the next try.
+            crate::log("engine", format!("push.json save failed: {e}; trying again shortly"));
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+}
+
+pub struct Push {
+    shared: Arc<Shared>,
     /// None if the key couldn't be made or saved: pushes are then unavailable, nothing else.
-    vapid: Option<std::sync::Arc<EcdsaKeyPair>>,
+    vapid: Option<Arc<EcdsaKeyPair>>,
+    worker: SyncSender<Msg>,
     /// Tests send every push here instead of to the push service.
     deliver_to: Option<String>,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum SubscribeError {
+    /// The browser's key isn't a P-256 key.
+    BadKey,
+    /// Not a known push service.
+    BadEndpoint,
+    /// `MAX_SUBSCRIPTIONS` devices already get alerts.
+    Full,
+}
+
 impl Push {
-    /// Reads the subscriptions and the VAPID key in `dir`, making the key the first time.
+    /// Reads the subscriptions and the VAPID key in `dir`, making the key the first time, and
+    /// starts the delivery worker.
     pub fn load(dir: &Path) -> Push {
         let path = dir.join("push.json");
         let subscriptions = fs::read(&path)
@@ -71,8 +142,12 @@ impl Push {
         let vapid = vapid_key(dir)
             .map_err(|e| crate::log("engine", format!("alerts by push are off: no VAPID key ({e})")))
             .ok()
-            .map(std::sync::Arc::new);
-        Push { path, subscriptions, vapid, deliver_to: None }
+            .map(Arc::new);
+        let shared = Arc::new(Shared { path, subscriptions: Mutex::new(subscriptions), dirty: AtomicBool::new(false) });
+        let (worker, rx) = sync_channel(QUEUE);
+        let (s, key) = (shared.clone(), vapid.clone());
+        std::thread::spawn(move || work(&s, key.as_deref(), rx));
+        Push { shared, vapid, worker, deliver_to: None }
     }
 
     /// The VAPID public key browsers subscribe with: raw P-256, base64url.
@@ -80,47 +155,71 @@ impl Push {
         self.vapid.as_ref().map(|k| B64.encode(k.public_key().as_ref()))
     }
 
-    /// Keeps `device`'s subscription, replacing any it had. Saved before it counts.
-    pub fn subscribe(&mut self, device: &str, endpoint: &str, p256dh: &str, auth: &str) -> std::io::Result<()> {
-        if user_agent_key(p256dh).is_none() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a P-256 key"));
+    /// Keeps `device`'s subscription, replacing any it had; saved by the worker.
+    pub fn subscribe(&mut self, device: &str, endpoint: &str, p256dh: &str, auth: &str) -> Result<(), SubscribeError> {
+        if !is_push_endpoint(endpoint) {
+            return Err(SubscribeError::BadEndpoint);
         }
-        let mut next: Vec<Subscription> =
-            self.subscriptions.iter().filter(|s| s.device_id != device).cloned().collect();
-        next.push(Subscription {
+        if user_agent_key(p256dh).is_none() {
+            return Err(SubscribeError::BadKey);
+        }
+        let mut list = self.shared.list();
+        list.retain(|s| s.device_id != device);
+        if list.len() >= MAX_SUBSCRIPTIONS {
+            return Err(SubscribeError::Full);
+        }
+        list.push(Subscription {
             device_id: device.into(),
             endpoint: endpoint.into(),
             p256dh: p256dh.into(),
             auth: auth.into(),
         });
-        self.save(next)
+        drop(list);
+        self.changed();
+        Ok(())
     }
 
     /// Drops `device`'s subscription (the device was removed).
     pub fn forget(&mut self, device: &str) {
-        if !self.has(device) {
-            return;
+        let mut list = self.shared.list();
+        let before = list.len();
+        list.retain(|s| s.device_id != device);
+        let changed = list.len() != before;
+        drop(list);
+        if changed {
+            self.changed();
         }
-        let next = self.subscriptions.iter().filter(|s| s.device_id != device).cloned().collect();
-        if let Err(e) = self.save(next) {
-            crate::log("engine", format!("push.json save failed: {e}"));
+    }
+
+    /// Keeps only the subscriptions whose device `paired` says is still paired: one removed
+    /// while `push.json` couldn't be saved never gets alerts again, even after a restart.
+    pub fn keep_only(&mut self, paired: impl Fn(&str) -> bool) {
+        let mut list = self.shared.list();
+        let before = list.len();
+        list.retain(|s| paired(&s.device_id));
+        let changed = list.len() != before;
+        drop(list);
+        if changed {
+            self.changed();
         }
     }
 
     pub fn has(&self, device: &str) -> bool {
-        self.subscriptions.iter().any(|s| s.device_id == device)
+        self.shared.list().iter().any(|s| s.device_id == device)
     }
 
-    /// Pushes an alert to every subscribed device.
+    /// Queues an alert for every subscribed device.
     pub fn alert(&self, message: &str, tag: &str) {
-        for s in &self.subscriptions {
+        let subs = self.shared.list().clone();
+        for s in subs {
             self.send(s, message, tag);
         }
     }
 
-    /// Pushes the test alert to `device`; false if it has no subscription.
+    /// Queues the test alert for `device`; false if it has no subscription.
     pub fn test(&self, device: &str) -> bool {
-        let Some(s) = self.subscriptions.iter().find(|s| s.device_id == device) else { return false };
+        let found = self.shared.list().iter().find(|s| s.device_id == device).cloned();
+        let Some(s) = found else { return false };
         self.send(s, crate::protocol::TEST_ALERT_MESSAGE, "test");
         true
     }
@@ -130,65 +229,121 @@ impl Push {
         self.deliver_to = Some(url.into());
     }
 
-    fn save(&mut self, next: Vec<Subscription>) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(&PushFile { version: 1, subscriptions: next.clone() })?;
-        crate::devices::save_durably(&self.path, &bytes)?;
-        self.subscriptions = next;
-        Ok(())
+    fn changed(&self) {
+        self.shared.dirty.store(true, Ordering::Release);
+        // A full queue still wakes the worker, which saves after whatever it handles next.
+        let _ = self.worker.try_send(Msg::Save);
     }
 
-    /// Delivers one push on its own thread, retrying a few times; never blocks the caller.
-    fn send(&self, s: &Subscription, message: &str, tag: &str) {
-        let Some(key) = self.vapid.clone() else { return };
+    fn send(&self, sub: Subscription, message: &str, tag: &str) {
+        if self.vapid.is_none() {
+            return;
+        }
         let Ok(payload) = serde_json::to_vec(&Payload { message, tag }) else { return };
-        let s = s.clone();
-        let target = self.deliver_to.clone().unwrap_or_else(|| s.endpoint.clone());
-        std::thread::spawn(move || deliver(&key, &s, &payload, &target));
+        let target = self.deliver_to.clone().unwrap_or_else(|| sub.endpoint.clone());
+        let to = host(&sub.endpoint).to_string();
+        match self.worker.try_send(Msg::Deliver(Job { sub, payload, target, attempt: 0 })) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => crate::log("engine", format!("push to {to} dropped: too many waiting")),
+            Err(TrySendError::Disconnected(_)) => crate::log("engine", format!("push to {to} dropped: no worker")),
+        }
+    }
+}
+
+/// The delivery worker: one push at a time, retries waiting their turn in a bounded list.
+fn work(shared: &Shared, key: Option<&EcdsaKeyPair>, rx: Receiver<Msg>) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(Duration::from_secs(15)))
+        .user_agent(format!("Jivvy / Jivvy Live / {}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    let mut retries: Vec<(Instant, Job)> = Vec::new();
+    loop {
+        let save_retry = shared.dirty.load(Ordering::Acquire).then_some(SAVE_RETRY);
+        let wait = retries.iter().map(|(due, _)| due.saturating_duration_since(Instant::now())).chain(save_retry).min();
+        let msg = match wait {
+            Some(w) => rx.recv_timeout(w),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match msg {
+            Ok(Msg::Deliver(job)) => retries.push((Instant::now(), job)),
+            Ok(Msg::Save) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                shared.save_if_dirty();
+                return;
+            }
+        }
+        let now = Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = retries.drain(..).partition(|(at, _)| *at <= now);
+        retries = later;
+        for (_, job) in due {
+            let Some(key) = key else { continue };
+            if let Some(next) = deliver(&agent, key, shared, job) {
+                if retries.len() >= QUEUE {
+                    crate::log("engine", format!("push to {} dropped: too many waiting", host(&next.sub.endpoint)));
+                    continue;
+                }
+                retries.push((Instant::now() + RETRY_AFTER[next.attempt - 1], next));
+            }
+        }
+        shared.save_if_dirty();
     }
 }
 
 /// The push service's host, for logs: the rest of an endpoint is the phone's address.
 fn host(endpoint: &str) -> &str {
     let rest = endpoint.split_once("://").map_or(endpoint, |(_, r)| r);
-    rest.split(['/', '?']).next().unwrap_or("")
+    rest.split(['/', '?', '#']).next().unwrap_or("")
 }
 
-fn deliver(key: &EcdsaKeyPair, s: &Subscription, payload: &[u8], target: &str) {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(15)))
-        .user_agent(format!("Jivvy / Jivvy Live / {}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
-    let to = host(&s.endpoint);
-    for attempt in 0..=RETRY_AFTER.len() {
-        if attempt > 0 {
-            std::thread::sleep(RETRY_AFTER[attempt - 1]);
-        }
-        // Built afresh each time: new encryption keys and a fresh VAPID signature.
-        let request = match request(key, s, payload, target) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::log("engine", format!("push to {to} not sent: {e}"));
-                return;
-            }
-        };
-        match agent.run(request) {
-            Ok(r) if r.status().is_success() => return,
-            // The phone unsubscribed or the subscription expired: retrying can't help.
-            Ok(r) if matches!(r.status().as_u16(), 404 | 410) => {
-                crate::log("engine", format!("push to {to}: subscription gone; turn alerts on again on that device"));
-                return;
-            }
-            Ok(r) if r.status().is_client_error() && r.status().as_u16() != 429 => {
-                crate::log("engine", format!("push to {to} refused ({})", r.status().as_u16()));
-                return;
-            }
-            Ok(r) => crate::log("engine", format!("push to {to} failed ({}); will retry", r.status().as_u16())),
-            Err(e) => crate::log("engine", format!("push to {to} failed ({e}); will retry")),
-        }
+/// Sends one push; the job back if it should be tried again.
+fn deliver(agent: &ureq::Agent, key: &EcdsaKeyPair, shared: &Shared, mut job: Job) -> Option<Job> {
+    let to = host(&job.sub.endpoint).to_string();
+    // Checked again here: push.json is a file, and only push services get our requests.
+    if !is_push_endpoint(&job.sub.endpoint) {
+        crate::log("engine", format!("push to {to} not sent: not a known push service"));
+        return None;
     }
-    crate::log("engine", format!("push to {to} given up"));
+    // Built afresh each time: new encryption keys and a fresh VAPID signature.
+    let request = match request(key, &job.sub, &job.payload, &job.target) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log("engine", format!("push to {to} not sent: {e}"));
+            return None;
+        }
+    };
+    let failed = match agent.run(request) {
+        Ok(r) if r.status().is_success() => return None,
+        // The phone unsubscribed or the subscription expired: retrying can't help.
+        Ok(r) if matches!(r.status().as_u16(), 404 | 410) => {
+            crate::log(
+                "engine",
+                format!("push to {to}: subscription gone; dropped (turn alerts on again on that device)"),
+            );
+            let mut list = shared.list();
+            let before = list.len();
+            list.retain(|s| s.endpoint != job.sub.endpoint);
+            if list.len() != before {
+                shared.dirty.store(true, Ordering::Release);
+            }
+            return None;
+        }
+        Ok(r) if r.status().is_client_error() && r.status().as_u16() != 429 => {
+            crate::log("engine", format!("push to {to} refused ({})", r.status().as_u16()));
+            return None;
+        }
+        Ok(r) => r.status().as_u16().to_string(),
+        Err(e) => e.to_string(),
+    };
+    job.attempt += 1;
+    if job.attempt > RETRY_AFTER.len() {
+        crate::log("engine", format!("push to {to} failed ({failed}); given up"));
+        return None;
+    }
+    crate::log("engine", format!("push to {to} failed ({failed}); will retry"));
+    Some(job)
 }
 
 fn user_agent_key(p256dh: &str) -> Option<p256::PublicKey> {
@@ -221,10 +376,7 @@ fn request(
 fn vapid_header(key: &EcdsaKeyPair, endpoint: &str) -> Result<String, String> {
     let uri: ureq::http::Uri = endpoint.parse().map_err(|_| "bad endpoint")?;
     let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else { return Err("bad endpoint".into()) };
-    let aud = match uri.port_u16() {
-        Some(p) => format!("{scheme}://{host}:{p}"),
-        None => format!("{scheme}://{host}"),
-    };
+    let aud = format!("{scheme}://{host}");
     let exp = crate::now_ms() / 1000 + 12 * 60 * 60;
     let header = B64.encode(br#"{"typ":"JWT","alg":"ES256"}"#);
     let claims = B64.encode(serde_json::json!({ "aud": aud, "exp": exp, "sub": CONTACT }).to_string());

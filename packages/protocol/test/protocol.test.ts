@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ALERT_AFTER_MS, PROTOCOL_VERSION, SILENCE_DB, TEST_ALERT_MESSAGE, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, serviceAlert, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type ServiceAlertKind, type StreamDestination, type StateSnapshot } from "../src/index";
+import { PROTOCOL_VERSION, SILENCE_AFTER_MS, SILENCE_DB, STREAM_DOWN_AFTER_MS, TEST_ALERT_MESSAGE, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, serviceAlert, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type ServiceAlertKind, type StreamDestination, type StateSnapshot } from "../src/index";
 import serviceAlertFixtures from "../fixtures/service-alerts.json";
 import fixtures from "../fixtures/parse-cases.json";
 import alertFixtures from "../fixtures/stream-alerts.json";
@@ -32,7 +32,8 @@ describe("whole-stream alerts and the test push (the same fixture is read by the
   it("say exactly the fixture's words", () => {
     expect(serviceAlertFixtures.alerts.map((a) => serviceAlert(a.kind as ServiceAlertKind))).toEqual(serviceAlertFixtures.alerts);
     expect(TEST_ALERT_MESSAGE).toBe(serviceAlertFixtures.test.message);
-    expect([ALERT_AFTER_MS, SILENCE_DB]).toEqual([serviceAlertFixtures.afterMs, serviceAlertFixtures.silenceDb]);
+    expect([STREAM_DOWN_AFTER_MS, SILENCE_AFTER_MS, SILENCE_DB])
+      .toEqual([serviceAlertFixtures.streamDownAfterMs, serviceAlertFixtures.silenceAfterMs, serviceAlertFixtures.silenceDb]);
   });
 });
 

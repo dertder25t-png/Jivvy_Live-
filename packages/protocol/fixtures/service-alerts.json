@@ -7,6 +7,7 @@
     {"kind": "audio.back", "destinationId": "", "name": "", "quality": "", "message": "Sound is back on the stream."}
   ],
   "test": {"message": "Test alert from Jivvy Live: alerts reach this device.", "tag": "test"},
-  "afterMs": 10000,
+  "streamDownAfterMs": 7000,
+  "silenceAfterMs": 10000,
   "silenceDb": -60
 }

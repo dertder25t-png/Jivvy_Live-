@@ -134,11 +134,28 @@ pub enum Command {
     PushTest,
 }
 
-/// A push service endpoint: https, printable ASCII, as the TypeScript `PUSH_ENDPOINT`.
+/// The push services pushes may go to: these hosts, or any host under them.
+pub const PUSH_HOSTS: [&str; 4] =
+    ["fcm.googleapis.com", "push.services.mozilla.com", "notify.windows.com", "push.apple.com"];
+
+/// A known push service's endpoint, as the TypeScript `isPushEndpoint`: https, printable ASCII,
+/// a host in `PUSH_HOSTS` (exact or under it) with no user info, port or IP literal.
+pub fn is_push_endpoint(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("https://") else { return false };
+    if rest.is_empty() || rest.len() > 2040 || !rest.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains(['@', ':', '[', ']']) {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    PUSH_HOSTS.iter().any(|h| host == *h || host.strip_suffix(h).is_some_and(|p| p.ends_with('.') && p.len() > 1))
+}
+
 fn push_endpoint(v: Option<&Value>) -> Option<String> {
     let s = v?.as_str()?;
-    let rest = s.strip_prefix("https://")?;
-    (!rest.is_empty() && rest.len() <= 2040 && rest.bytes().all(|b| (0x21..=0x7e).contains(&b))).then(|| s.into())
+    is_push_endpoint(s).then(|| s.into())
 }
 
 /// A push subscription's 16-byte auth secret, base64url without padding.
@@ -435,8 +452,12 @@ pub fn alert_event(alert: &Alert) -> AlertEvent<'_> {
     AlertEvent { v: PROTOCOL_VERSION, event: "alert", alert }
 }
 
-/// How long the stream is down, or silent, before it is an alert (`ALERT_AFTER_MS`).
-pub const ALERT_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the wanted stream isn't live before it is an alert (`STREAM_DOWN_AFTER_MS`). With
+/// a report going stale after 3 s and a tick every 250 ms, that is about 10.5 s at worst from
+/// the stream stopping to the push leaving: inside the plan's 15 s.
+pub const STREAM_DOWN_AFTER: std::time::Duration = std::time::Duration::from_secs(7);
+/// How long the live stream is silent before it is an alert (`SILENCE_AFTER_MS`).
+pub const SILENCE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 /// Below this peak level (dBFS) on every channel, the stream counts as silent (`SILENCE_DB`).
 pub const SILENCE_DB: f64 = -60.0;
 /// What the "Send test alert" button pushes, with the tag "test" (`TEST_ALERT_MESSAGE`).
@@ -1178,7 +1199,8 @@ mod tests {
             .collect();
         assert_eq!(Value::Array(got), doc["alerts"]);
         assert_eq!(doc["test"]["message"], TEST_ALERT_MESSAGE);
-        assert_eq!(doc["afterMs"], ALERT_AFTER.as_millis() as u64);
+        assert_eq!(doc["streamDownAfterMs"], STREAM_DOWN_AFTER.as_millis() as u64);
+        assert_eq!(doc["silenceAfterMs"], SILENCE_AFTER.as_millis() as u64);
         assert_eq!(doc["silenceDb"].as_f64(), Some(SILENCE_DB));
     }
 

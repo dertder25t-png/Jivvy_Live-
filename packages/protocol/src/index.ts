@@ -205,6 +205,19 @@ function destinationList(x: unknown): StreamDestination[] | null {
 const PUBLIC_KEY = /^B[A-Za-z0-9_-]{86}$/;
 /** A push service endpoint: an https URL of printable ASCII. */
 const PUSH_ENDPOINT = /^https:\/\/[\x21-\x7e]{1,2040}$/;
+/** The push services pushes may go to: these hosts, or any host under them. */
+export const PUSH_HOSTS = ["fcm.googleapis.com", "push.services.mozilla.com", "notify.windows.com", "push.apple.com"];
+/**
+ * A known push service's endpoint: https, printable ASCII, a host in PUSH_HOSTS (exact or under
+ * it), with no user info, port or IP literal. The church computer sends pushes nowhere else.
+ */
+export function isPushEndpoint(s: string): boolean {
+  if (!PUSH_ENDPOINT.test(s)) return false;
+  const authority = s.slice("https://".length).split(/[/?#]/)[0];
+  if (/[@:[\]]/.test(authority)) return false;
+  const host = authority.toLowerCase();
+  return PUSH_HOSTS.some((h) => host === h || (host.endsWith(`.${h}`) && host.length > h.length + 1));
+}
 /** A push subscription's 16-byte auth secret, base64url without padding. */
 const PUSH_AUTH = /^[A-Za-z0-9_-]{22}$/;
 /** A 64-byte ECDSA signature (r || s), base64url without padding. */
@@ -378,9 +391,9 @@ function parseCommand(raw: unknown): CommandResult {
       return { ok: true, command: { type: raw.type } };
     case "push.subscribe": {
       const { endpoint, p256dh, auth } = raw;
-      if (typeof endpoint !== "string" || !PUSH_ENDPOINT.test(endpoint) || typeof p256dh !== "string"
+      if (typeof endpoint !== "string" || !isPushEndpoint(endpoint) || typeof p256dh !== "string"
         || !PUBLIC_KEY.test(p256dh) || typeof auth !== "string" || !PUSH_AUTH.test(auth))
-        return { ok: false, code: "bad_arguments", message: "push.subscribe needs an https endpoint, a P-256 p256dh key and a 16-byte auth (base64url)" };
+        return { ok: false, code: "bad_arguments", message: "push.subscribe needs a known push service's https endpoint, a P-256 p256dh key and a 16-byte auth (base64url)" };
       return { ok: true, command: { type: "push.subscribe", endpoint, p256dh, auth } };
     }
     case "media.put": {
@@ -771,8 +784,13 @@ export type DaemonEvent =
 export type AlertKind = "stream.lowered" | "stream.paused" | "stream.resumed" | ServiceAlertKind;
 export type ServiceAlertKind = "stream.down" | "stream.up" | "audio.silent" | "audio.back";
 
-/** How long the stream is down, or silent, before it is an alert. */
-export const ALERT_AFTER_MS = 10_000;
+/**
+ * How long the wanted stream isn't live before it is an alert. With a report going stale after
+ * 3 s and the daemon's 250 ms tick, about 10.5 s at worst: inside the plan's 15 s.
+ */
+export const STREAM_DOWN_AFTER_MS = 7_000;
+/** How long the live stream is silent (or sends no levels) before it is an alert. */
+export const SILENCE_AFTER_MS = 10_000;
 /** Below this peak level (dBFS) on every channel, the stream counts as silent. */
 export const SILENCE_DB = -60;
 

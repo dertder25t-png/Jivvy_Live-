@@ -28,6 +28,8 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 const OUTBOX_CAPACITY: usize = 256;
 /// A stream report older than this means the video process isn't reporting (crashed or
 /// restarting): screens see "reconnecting", never a stale "live".
+/// How long a picture a device just sent stays even if nothing names it yet.
+const RECENT_PICTURES: Duration = Duration::from_secs(600);
 pub const STREAM_REPORT_STALE: Duration = Duration::from_secs(3);
 /// The same for the recording: a silent video process is never shown as recording.
 pub const RECORDING_REPORT_STALE: Duration = Duration::from_secs(3);
@@ -130,6 +132,12 @@ pub struct Engine {
     /// sent, asked about or named since. Each clean-up checks it just before each delete, so
     /// an older one still running can never remove an image a newer run sheet shows.
     protected: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Pictures a device uploaded or asked about recently, and when: kept for `RECENT_PICTURES`
+    /// even if no saved document names them yet (the device saves right after uploading).
+    recent_pictures: Vec<(String, Instant)>,
+    recent_for: Duration,
+    /// What the library named at the last clean-up; kept until the next one finishes its scan.
+    library_pictures: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The slide on screen and since when, for items that move on by themselves.
     shown_since: Option<(u64, Instant)>,
     /// When an operator command last changed what is shown (slide, black, run sheet); the
@@ -202,6 +210,9 @@ impl Engine {
             uploads: Default::default(),
             pruning: None,
             protected: Default::default(),
+            recent_pictures: Vec::new(),
+            recent_for: RECENT_PICTURES,
+            library_pictures: Default::default(),
             shown_since: None,
             last_shown_change: Instant::now(),
             library,
@@ -447,6 +458,7 @@ impl Engine {
             Command::MediaHas { ids } => {
                 // A device skips sending what is here, so it has to stay until the run sheet.
                 self.protect(ids.iter().cloned());
+                self.recent_pictures.extend(ids.iter().map(|i| (i.clone(), Instant::now())));
                 let missing = ids.into_iter().filter(|m| !crate::images::has(self.store.dir(), m)).collect();
                 return protocol::ack_with(id, None, AckExtras { missing: Some(missing), ..Default::default() });
             }
@@ -626,6 +638,7 @@ impl Engine {
         match crate::images::put(&mut self.uploads, self.store.dir(), media, offset, &bytes, last) {
             Ok(progress) => {
                 if progress.complete && last {
+                    self.recent_pictures.push((media.to_string(), Instant::now()));
                     crate::log("engine", format!("image {} received ({} bytes)", &media[..12], progress.received));
                 }
                 protocol::ack_with(id, None, AckExtras { media: Some(progress), ..Default::default() })
@@ -701,21 +714,32 @@ impl Engine {
     fn prune_images(&mut self) {
         let mut keep: std::collections::HashSet<String> =
             self.run_sheet.iter().flat_map(|s| s.run_sheet.slides()).filter_map(|s| s.image.clone()).collect();
-        // Pictures that saved plans and themes use stay too, so every device can load them.
-        match self.library.as_ref().map(|l| l.media_ids()) {
-            Some(Ok(ids)) => keep.extend(ids),
-            Some(Err(e)) => {
-                // Can't tell what the library uses: keep everything this round.
-                crate::log("engine", format!("library: can't list its pictures, not pruning: {e:?}"));
-                return;
-            }
-            None => {}
-        }
+        // A picture a device just sent stays a while: it saves its plan or theme right after.
+        let window = self.recent_for;
+        self.recent_pictures.retain(|(_, at)| at.elapsed() < window);
+        keep.extend(self.recent_pictures.iter().map(|(id, _)| id.clone()));
+        // Pictures saved plans and themes use stay too (as of the last scan until this one ends).
+        keep.extend(self.library_pictures.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned());
         let (dir, arriving) = (self.store.dir().to_path_buf(), self.uploads.ids());
         // From now on only these are protected, plus whatever devices send or name next.
         *self.protected.lock().unwrap_or_else(|p| p.into_inner()) = keep.union(&arriving).cloned().collect();
         let protected = self.protected.clone();
+        let (has_library, library_pictures) = (self.library.is_some(), self.library_pictures.clone());
         self.pruning = Some(std::thread::spawn(move || {
+            // Read the library here, not under the engine's lock.
+            if has_library {
+                match crate::library::Library::open(&dir).and_then(|l| l.media_ids()) {
+                    Ok(ids) => {
+                        protected.lock().unwrap_or_else(|p| p.into_inner()).extend(ids.iter().cloned());
+                        *library_pictures.lock().unwrap_or_else(|p| p.into_inner()) = ids;
+                    }
+                    Err(e) => {
+                        // Can't tell what the library uses: keep everything this round.
+                        crate::log("engine", format!("library: can't list its pictures, not pruning: {e:?}"));
+                        return;
+                    }
+                }
+            }
             let removed = crate::images::prune(&dir, &protected, &arriving);
             if removed > 0 {
                 crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
@@ -1215,11 +1239,12 @@ impl WsAccess {
 /// With `tls`, every connection is `wss://` with the church's certificate; there is no plain
 /// fallback.
 pub fn serve_ws(listener: TcpListener, engine: Arc<Mutex<Engine>>, access: Arc<WsAccess>, tls: Option<Arc<TlsFiles>>) {
+    let data_dir = engine.lock().unwrap_or_else(|p| p.into_inner()).data_dir();
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
-        let (engine, access, tls) = (engine.clone(), access.clone(), tls.clone());
+        let (engine, access, tls, data_dir) = (engine.clone(), access.clone(), tls.clone(), data_dir.clone());
         std::thread::spawn(move || {
-            let _ = serve_ws_connection(stream, &engine, &access, tls.as_deref());
+            let _ = serve_ws_connection(stream, &engine, &access, &data_dir, tls.as_deref());
         });
     }
 }
@@ -1228,6 +1253,7 @@ fn serve_ws_connection(
     stream: TcpStream,
     engine: &Mutex<Engine>,
     access: &WsAccess,
+    data_dir: &std::path::Path,
     tls: Option<&TlsFiles>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
@@ -1235,12 +1261,20 @@ fn serve_ws_connection(
     let shared = Arc::new(stream.try_clone()?);
     let mut session = Session::device();
     let result = match tls {
-        None => ws_session(stream, &shared, engine, access, &mut session, false),
+        None => ws_session(stream, &shared, engine, access, data_dir, &mut session, false),
         // No good certificate yet: refuse rather than serve in plain text.
         Some(tls) => match tls.config() {
             Some(config) => {
                 let conn = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
-                ws_session(rustls::StreamOwned::new(conn, stream), &shared, engine, access, &mut session, true)
+                ws_session(
+                    rustls::StreamOwned::new(conn, stream),
+                    &shared,
+                    engine,
+                    access,
+                    data_dir,
+                    &mut session,
+                    true,
+                )
             }
             None => Ok(()),
         },
@@ -1280,6 +1314,7 @@ fn ws_session<S: OverTcp>(
     socket: &Arc<TcpStream>,
     engine: &Mutex<Engine>,
     access: &WsAccess,
+    data_dir: &std::path::Path,
     session: &mut Session,
     secure: bool,
 ) -> std::io::Result<()> {
@@ -1292,8 +1327,7 @@ fn ws_session<S: OverTcp>(
     if !head.upgrade {
         // A picture by id (`/media/<id>`), for devices showing a plan or theme that uses it.
         if let Some(id) = head.path.strip_prefix("/media/") {
-            let dir = engine.lock().unwrap_or_else(|p| p.into_inner()).data_dir();
-            return crate::web::respond_image(&mut stream, &dir, id, &head);
+            return crate::web::respond_image(&mut stream, data_dir, id, &head);
         }
         return crate::web::respond(&mut stream, access.web_dir.as_deref(), &head);
     }
@@ -1457,7 +1491,17 @@ mod tests {
         e.wait_for_pruning();
         assert!(crate::images::has(&dir, &used) && !crate::images::has(&dir, &unused));
         let (kind, bytes) = crate::images::serve(&dir, &used).unwrap();
-        assert_eq!((kind, bytes), ("image/png", png));
+        assert_eq!((kind, bytes), ("image/png", png.clone()));
+
+        // A picture uploaded but not yet named by a saved document survives a run sheet change.
+        use base64::Engine as _;
+        let fresh: String =
+            ring::digest::digest(&ring::digest::SHA256, &png).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        send(&mut e, json!({ "type": "media.put", "id": fresh, "offset": 0, "data": data, "last": true }));
+        send(&mut e, json!({ "type": "runsheet.set", "runSheet": { "id": "y", "title": "", "items": [] } }));
+        e.wait_for_pruning();
+        assert!(crate::images::has(&dir, &fresh), "kept until a document names it");
     }
 
     #[test]
@@ -1614,7 +1658,9 @@ mod tests {
         assert_eq!(crate::images::prune(&dir, &e.protected, &Default::default()), 0);
         assert!(crate::images::has(&dir, &id));
 
-        // The next run sheet doesn't show it: the church computer doesn't keep it.
+        // The next run sheet doesn't show it: the church computer doesn't keep it (once it is
+        // no longer a picture a device just sent).
+        e.recent_for = Duration::ZERO;
         let next = json!({ "id": "next", "title": "", "items": [] });
         send(&mut e, json!({ "type": "runsheet.set", "runSheet": next }));
         e.wait_for_pruning();

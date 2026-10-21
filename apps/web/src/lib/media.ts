@@ -69,9 +69,11 @@ export async function loadImage(id: string, fetcher: typeof fetch = fetch): Prom
   const local = await getImage(id).catch(() => undefined);
   if (local || !mediaBase) return local;
   try {
-    const res = await fetcher(`${mediaBase}/media/${id}`);
+    const res = await fetcher(`${mediaBase}/media/${id}`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) return undefined;
     const blob = await res.blob();
+    // The id is the hash of the bytes: anything else isn't this picture.
+    if (hex(await crypto.subtle.digest("SHA-256", await blob.arrayBuffer())) !== id) return undefined;
     await run(await open(), "media", "readwrite", (s) => s.put(blob, id)).catch(() => undefined);
     return blob;
   } catch {
@@ -82,7 +84,14 @@ export async function loadImage(id: string, fetcher: typeof fetch = fetch): Prom
 /** Object URLs for previews, one per image for the life of the page. */
 const urls = new Map<string, Promise<string | null>>();
 export function previewUrl(id: string): Promise<string | null> {
-  if (!urls.has(id)) urls.set(id, loadImage(id).then((b) => (b ? URL.createObjectURL(b) : null)));
+  if (!urls.has(id)) {
+    const found = loadImage(id).then((b) => {
+      if (b) return URL.createObjectURL(b);
+      if (urls.get(id) === found) urls.delete(id); // not found now: the next render tries again
+      return null;
+    });
+    urls.set(id, found);
+  }
   return urls.get(id)!;
 }
 

@@ -123,7 +123,7 @@ pub fn respond<W: Write>(w: &mut W, root: Option<&Path>, head: &Head) -> std::io
 /// picture. Ids are SHA-256 hashes of the bytes; anything else is a 404.
 pub fn respond_image<W: Write>(w: &mut W, data_dir: &Path, id: &str, head: &Head) -> std::io::Result<()> {
     match crate::images::serve(data_dir, id) {
-        Some((kind, body)) => reply(w, head, "200 OK", kind, "public, max-age=31536000, immutable", &body),
+        Some((kind, body)) => reply(w, head, "200 OK", kind, "private, max-age=31536000, immutable", &body),
         None => reply(w, head, "404 Not Found", "text/plain; charset=utf-8", "", b"not found\n"),
     }
 }
@@ -131,7 +131,7 @@ pub fn respond_image<W: Write>(w: &mut W, data_dir: &Path, id: &str, head: &Head
 /// On every response. A page framed by another site would still be this origin, with this
 /// device's key and the channel open to it, so a click there could press Next or Black:
 /// never let it be framed (`frame-ancestors`, and `X-Frame-Options` for older browsers).
-const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n";
+const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\n";
 
 fn reply<W: Write>(w: &mut W, head: &Head, status: &str, kind: &str, cache: &str, body: &[u8]) -> std::io::Result<()> {
     let mut out = format!(

@@ -50,7 +50,8 @@ export const FONT_STACKS: Record<Font, string> = {
   mono: 'ui-monospace, Consolas, "Courier New", monospace',
 };
 
-/** Built in, always there; saved themes are added to these. Ids are fixed. */
+/** Built in, always there; saved themes are added to these. Ids are fixed. Never saved as documents: the
+ *  engine keeps its own copy (`built_in_theme` in apps/daemon/src/engine.rs) and sends Black as no theme. */
 export const BUILT_IN: { id: string; title: string; theme: Theme }[] = [
   {
     id: "jivvy-black",

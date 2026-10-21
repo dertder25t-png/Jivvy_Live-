@@ -42,6 +42,9 @@ pub enum Command {
     RecordingStart,
     #[serde(rename = "recording.stop")]
     RecordingStop,
+    /// The recorded sets, newest first (`recordings` on the ack).
+    #[serde(rename = "recording.list")]
+    RecordingList,
     #[serde(rename = "recording.report")]
     RecordingReport {
         status: RecordingStatus,
@@ -82,6 +85,12 @@ pub enum Command {
     /// Measure the upload and say what each platform will get; never while streaming.
     #[serde(rename = "stream.preflight")]
     StreamPreflight,
+    /// The streaming destinations and settings, without their keys.
+    #[serde(rename = "stream.config.get")]
+    StreamConfigGet,
+    /// Replace the streaming destinations and settings (`stream.json`). Carries stream keys.
+    #[serde(rename = "stream.config.set")]
+    StreamConfigSet { config: SecretConfig },
     #[serde(rename = "device.remove")]
     DeviceRemove {
         #[serde(rename = "deviceId")]
@@ -152,6 +161,18 @@ pub fn is_license_key_shape(key: &str) -> bool {
     let Some(rest) = key.strip_prefix("JL1.") else { return false };
     let Some((payload, sig)) = rest.split_once('.') else { return false };
     key.len() <= MAX_LICENSE_KEY && (1..=900).contains(&payload.len()) && b64(payload) && sig.len() == 86 && b64(sig)
+}
+
+/// The `config` of `stream.config.set`, kept as given (the engine checks it). It can hold
+/// stream keys, so it never shows its contents when printed.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SecretConfig(pub Map<String, Value>);
+
+impl std::fmt::Debug for SecretConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretConfig(<hidden>)")
+    }
 }
 
 /// Largest document body (as JSON), the same as the TypeScript `MAX_DOC_BYTES`.
@@ -682,6 +703,9 @@ pub struct AckExtras {
     pub devices: Option<Vec<DeviceInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preflight: Option<Preflight>,
+    /// stream.config.get, stream.config.set: never holds a key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_config: Option<Value>,
     /// runsheet.get
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_sheet: Option<RunSheet>,
@@ -703,6 +727,12 @@ pub struct AckExtras {
     /// license.get, license.set
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<crate::license::LicenseStatus>,
+    /// recording.list
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recordings: Option<Vec<crate::recording::SetInfo>>,
+    /// recording.list: where recordings are kept, as configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recordings_folder: Option<String>,
 }
 
 /// How much of an image the church computer has.
@@ -925,6 +955,23 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "pair.close" => Command::PairClose,
         "device.list" => Command::DeviceList,
         "stream.preflight" => Command::StreamPreflight,
+        "stream.config.get" => Command::StreamConfigGet,
+        "stream.config.set" => {
+            let config = obj.get("config").and_then(Value::as_object).filter(|c| {
+                c.get("destinations")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.len() <= MAX_DESTINATIONS && a.iter().all(|d| id_field(d.get("id")).is_some()))
+            });
+            match config {
+                Some(c) => Command::StreamConfigSet { config: SecretConfig(c.clone()) },
+                None => {
+                    return Err((
+                        ErrorCode::BadArguments,
+                        "stream.config.set needs config.destinations: up to 16, each with an id",
+                    ));
+                }
+            }
+        }
         "runsheet.get" => Command::RunSheetGet,
         "license.get" => Command::LicenseGet,
         "license.set" => match obj.get("key").and_then(Value::as_str).map(str::trim) {
@@ -1020,6 +1067,7 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         },
         "recording.start" => Command::RecordingStart,
         "recording.stop" => Command::RecordingStop,
+        "recording.list" => Command::RecordingList,
         "recording.report" => {
             let status = match obj.get("status").and_then(Value::as_str) {
                 Some("off") => RecordingStatus::Off,

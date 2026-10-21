@@ -47,6 +47,12 @@ export type Command =
   | { type: "recording.start" }
   | { type: "recording.stop" }
   /**
+   * Added in v1 without a version bump. The recorded sets on the church computer, newest
+   * first (`recordings` on the ack): read-only, folder names only, never paths. Older daemons
+   * answer unknown_command.
+   */
+  | { type: "recording.list" }
+  /**
    * Added in v1 without a version bump. The daemon's video process reports whether the
    * recording it was asked for is actually being written, and whether the disk is running
    * low, about once a second. UIs read the result as `recording` and `recordingLowDisk` in
@@ -79,6 +85,22 @@ export type Command =
    * Never while streaming (`unavailable`): the test would take the stream's bandwidth.
    */
   | { type: "stream.preflight" }
+  /**
+   * Added in v1 without a version bump. The streaming destinations and advanced settings from
+   * `stream.json`, as `streamConfig` on the ack. Stream keys are never sent back: each
+   * destination says only `hasKey`. Older daemons answer unknown_command.
+   */
+  | { type: "stream.config.get" }
+  /**
+   * Added in v1 without a version bump. Replaces the destinations (in the order given: the first
+   * is the main platform) and advanced settings in `stream.json`. Church computer only. Write-only
+   * keys: a `key` sets one; leaving it out keeps the saved one, but only while the address shown
+   * by `stream.config.get` is unchanged (another server needs the key typed again). Checked with the same rules the daemon uses to
+   * start a stream, saved atomically, and answered with the new `streamConfig`. Refused with
+   * `unavailable` while streaming (the video process would reconnect changed destinations
+   * mid-service) and with `bad_arguments` and a plain message when something is wrong.
+   */
+  | { type: "stream.config.set"; config: StreamConfigInput }
   /** Church computer only. */
   | { type: "device.list" }
   /** Church computer only. Removing a device ends its open connections at once. */
@@ -123,7 +145,8 @@ export type Command =
   | { type: "doc.delete"; kind: string; id: string; baseRev?: number }
   // ---- License (added in v1 without a version bump; older daemons answer unknown_command) ----
   // Checked on the church computer, offline (see license.ts). It never stops a service.
-  // Church computer only, like pairing: a paired device gets `unauthorized`.
+  // Church computer only: its local channel, or a paired connection from the church computer
+  // itself (its own browser). Any other device gets `unauthorized`.
   /** The license and trial (`license` on the ack). */
   | { type: "license.get" }
   /**
@@ -198,6 +221,45 @@ function destinationList(x: unknown): StreamDestination[] | null {
     out.push({ id: d.id, name: d.name, state: d.state as DestinationState, quality: d.quality, ...top });
   }
   return out;
+}
+
+/** One destination as `stream.config.set` takes it. `key` is write-only. */
+export interface StreamConfigDestinationInput {
+  id: string;
+  name?: string;
+  /** Server address without the key, e.g. rtmps://a.rtmps.youtube.com:443/live2 */
+  url: string;
+  /** Set or replace the stream key; left out or empty keeps the saved one. Never sent back. */
+  key?: string;
+  enabled?: boolean;
+  /** Advanced bandwidth mode only: "1080p", "720p", "480p" or "360p". */
+  maxQuality?: string;
+  /** Advanced bandwidth mode only: "lower", "audioOnly" or "pause". */
+  whenShort?: string;
+}
+
+export interface StreamConfigInput {
+  destinations: StreamConfigDestinationInput[];
+  bandwidth?: { mode?: "auto" | "advanced" };
+}
+
+/** A destination as `stream.config.get` shows it: everything except the key. */
+export interface StreamConfigDestination {
+  id: string;
+  name: string;
+  /** Scheme and host (and the app when the key is a field of its own); never anything that could be a key. */
+  url: string;
+  enabled: boolean;
+  hasKey: boolean;
+  maxQuality?: string;
+  whenShort?: string;
+}
+
+export interface StreamConfigView {
+  destinations: StreamConfigDestination[];
+  bandwidth?: { mode?: string };
+  /** Whether this connection may change them: only the church computer's own screen may. */
+  canEdit?: boolean;
 }
 
 /** A P-256 public key, raw uncompressed (0x04 || x || y, 65 bytes), base64url without padding. */
@@ -369,6 +431,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "stream.preflight":
     case "runsheet.get":
     case "license.get":
+    case "recording.list":
       return { ok: true, command: { type: raw.type } };
     case "license.set": {
       const key = typeof raw.key === "string" ? raw.key.trim() : null;
@@ -462,6 +525,15 @@ function parseCommand(raw: unknown): CommandResult {
       if (raw.status !== "off" && raw.status !== "recording" && raw.status !== "waiting")
         return { ok: false, code: "bad_arguments", message: "recording.report needs status off, recording or waiting" };
       return { ok: true, command: { type: "recording.report", status: raw.status, lowDisk: raw.lowDisk === true } };
+    case "stream.config.get":
+      return { ok: true, command: { type: "stream.config.get" } };
+    case "stream.config.set": {
+      const c = raw.config;
+      if (!isObj(c) || !Array.isArray(c.destinations) || c.destinations.length > MAX_DESTINATIONS
+        || !c.destinations.every((d) => isObj(d) && isId(d.id)))
+        return { ok: false, code: "bad_arguments", message: `stream.config.set needs config.destinations: up to ${MAX_DESTINATIONS}, each with an id` };
+      return { ok: true, command: { type: "stream.config.set", config: c as unknown as StreamConfigInput } };
+    }
     case "output.black":
       if (typeof raw.on !== "boolean")
         return { ok: false, code: "bad_arguments", message: "output.black needs boolean on" };
@@ -692,6 +764,8 @@ export interface AckExtras {
   devices?: DeviceInfo[];
   /** stream.preflight: `measuring`; the result follows as a `preflight` event. */
   preflight?: Preflight;
+  /** stream.config.get, stream.config.set: the saved destinations, without their keys. */
+  streamConfig?: StreamConfigView;
   /** runsheet.get: the run sheet, if one is set. */
   runSheet?: RunSheet;
   /** media.put: how much of the image the church computer has, and whether it is complete. */
@@ -706,6 +780,27 @@ export interface AckExtras {
   saved?: DocInfo;
   /** license.get, license.set */
   license?: LicenseStatus;
+  /** recording.list: newest first. */
+  recordings?: RecordingSet[];
+  /** recording.list: where recordings are kept on the church computer, as configured. */
+  recordingsFolder?: string;
+}
+
+/** One recorded set (a folder of video parts) on the church computer. */
+export interface RecordingSet {
+  /** The set's folder name inside the recordings folder; named by its UTC start. */
+  folder: string;
+  /** When it started, ms since epoch. */
+  startedMs: number;
+  /** Start to the last file written, in seconds; left out if nothing was written. */
+  durationSecs?: number;
+  /** Everything in the set. */
+  bytes: number;
+  /** recording: being recorded now; waiting: not converted yet; converting: some parts are; ready; none: no video. */
+  mp4: "recording" | "waiting" | "converting" | "ready" | "none";
+  /** The plan that was live when it started, and its title. Older sets have neither. */
+  planId?: string;
+  label?: string;
 }
 
 /** A document in the church computer's library, without its body. */

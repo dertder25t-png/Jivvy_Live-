@@ -64,6 +64,9 @@ pub struct Session {
     device_id: Option<String>,
     /// The key and challenge from the last `auth.hello`; one proof per challenge.
     hello: Option<(String, String)>,
+    /// A device connecting from the church computer itself (its own browser): once paired and
+    /// proven, it may also do what `this_computer_may` allows, which no phone may.
+    on_this_computer: bool,
 }
 
 impl Session {
@@ -75,10 +78,30 @@ impl Session {
         Session::new(false)
     }
 
+    /// A WebSocket connection: from this computer when the peer is a loopback address or the
+    /// address it connected to (a browser on the church computer using its own LAN name).
+    pub fn device_from(peer: Option<std::net::IpAddr>, ours: Option<std::net::IpAddr>) -> Session {
+        let mut s = Session::new(false);
+        s.on_this_computer = peer.is_some_and(|p| p.is_loopback() || Some(p) == ours);
+        s
+    }
+
     fn new(local: bool) -> Session {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Session { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), local, device_id: None, hello: None }
+        Session {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            local,
+            device_id: None,
+            hello: None,
+            on_this_computer: false,
+        }
     }
+}
+
+/// What a paired device on the church computer itself may do besides running the service:
+/// the license panel. Pairing and devices stay with the local channel.
+fn this_computer_may(command: &Command) -> bool {
+    matches!(command, Command::LicenseGet | Command::LicenseSet { .. })
 }
 
 /// What a paired device may do: run the service. Pairing, devices and the video process's
@@ -94,9 +117,11 @@ fn device_may(command: &Command) -> bool {
             | Command::StreamStop
             | Command::RecordingStart
             | Command::RecordingStop
+            | Command::RecordingList
             | Command::StateGet
             | Command::StateSubscribe
             | Command::StreamPreflight
+            | Command::StreamConfigGet
             | Command::RunSheetSet { .. }
             | Command::RunSheetGet
             | Command::MediaPut { .. }
@@ -399,7 +424,8 @@ impl Engine {
             let Some(device) = session.device_id.as_deref().filter(|d| self.devices.contains_id(d)) else {
                 return protocol::nack(id, ErrorCode::Unauthorized, "pair this device first");
             };
-            if !device_may(&env.command) {
+            let allowed = device_may(&env.command) || (session.on_this_computer && this_computer_may(&env.command));
+            if !allowed {
                 crate::log("engine", format!("refused {} from device {device}", command_name(&env.command)));
                 return protocol::nack(id, ErrorCode::Unauthorized, "only the church computer can do that");
             }
@@ -448,6 +474,8 @@ impl Engine {
                 }
                 return self.start_preflight(id, outbox);
             }
+            Command::StreamConfigGet => return self.stream_config(id, None, session.local),
+            Command::StreamConfigSet { config } => return self.stream_config(id, Some(config.0), session.local),
             Command::PairRequest { .. } | Command::AuthHello { .. } | Command::AuthProve { .. } => {
                 return protocol::nack(id, ErrorCode::BadArguments, "the church computer doesn't need to pair");
             }
@@ -548,8 +576,51 @@ impl Engine {
                 return protocol::ack(id, None);
             }
             // Saved like the stream: a crash mid-service resumes the recording by itself.
-            Command::RecordingStart => next.recording_wanted = true,
-            Command::RecordingStop => next.recording_wanted = false,
+            Command::RecordingStart => {
+                // The plan live now goes on the set the video process starts (a resumed set keeps its own).
+                if !self.state.recording_wanted {
+                    let plan = self.run_sheet.as_ref().map(|s| (s.run_sheet.id.as_str(), s.run_sheet.title.as_str()));
+                    crate::recording::note_plan(self.store.dir(), plan);
+                }
+                next.recording_wanted = true
+            }
+            Command::RecordingList => {
+                let dir = self.store.dir();
+                let folder = match crate::recording::load_config(dir) {
+                    Ok(c) => c.folder(dir),
+                    // recording.json is broken: the recorder keeps its last good folder.
+                    Err(_) => match crate::recording::last_good_folder(dir) {
+                        Some(f) => f,
+                        None => {
+                            return protocol::nack(
+                                id,
+                                ErrorCode::Unavailable,
+                                "Can't read the recording settings (recording.json).",
+                            );
+                        }
+                    },
+                };
+                return match crate::recording::list(dir, &folder) {
+                    Ok(recordings) => protocol::ack_with(
+                        id,
+                        None,
+                        AckExtras {
+                            recordings: Some(recordings),
+                            recordings_folder: Some(folder.display().to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    Err(m) => protocol::nack(id, ErrorCode::Unavailable, &m),
+                };
+            }
+            Command::RecordingStop => {
+                if self.state.recording_wanted
+                    && let Ok(config) = crate::recording::load_config(self.store.dir())
+                {
+                    crate::recording::note_end(self.store.dir(), &config.folder(self.store.dir()), crate::now_ms());
+                }
+                next.recording_wanted = false
+            }
             Command::RecordingReport { status, low_disk } => {
                 self.recording_report = Some((status, low_disk, Instant::now()));
                 self.tick();
@@ -779,6 +850,60 @@ impl Engine {
                 crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
             }
         }));
+    }
+
+    /// `stream.config.get` (`set` is None) and `stream.config.set`: the destinations in
+    /// `stream.json`. The answer never holds a key, and nothing here logs one.
+    ///
+    /// A save is refused while streaming rather than applied later: the video process re-reads
+    /// `stream.json` every second and reconnects any destination whose address, key or name
+    /// changed, which would drop that platform mid-service. Refusing is also simpler to
+    /// explain than a change that waits for the next start.
+    fn stream_config(&mut self, id: &str, set: Option<serde_json::Map<String, serde_json::Value>>, local: bool) -> Ack {
+        use crate::stream;
+        let dir = self.store.dir().to_path_buf();
+        let saved = match stream::load_config(&dir) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log("engine", format!("stream settings: {e}"));
+                return protocol::nack(
+                    id,
+                    ErrorCode::Unavailable,
+                    format!("{e}. Fix or remove the file, then try again."),
+                );
+            }
+        };
+        let config = match set {
+            None => saved,
+            Some(input) => {
+                if self.state.stream_wanted {
+                    return protocol::nack(
+                        id,
+                        ErrorCode::Unavailable,
+                        "Stop the stream before changing streaming settings. Saving now would reconnect and could drop it.",
+                    );
+                }
+                let next = match stream::config_from_input(&saved, &input) {
+                    Ok(c) => c,
+                    Err(e) => return protocol::nack(id, ErrorCode::BadArguments, e),
+                };
+                if let Err(e) = stream::save_config(&dir, &next) {
+                    crate::log("engine", format!("stream.json save failed: {}", e.kind()));
+                    return protocol::nack(
+                        id,
+                        ErrorCode::Unavailable,
+                        "Couldn't save the streaming settings; try again.",
+                    );
+                }
+                crate::log("engine", format!("streaming settings saved ({} destinations)", next.destinations.len()));
+                next
+            }
+        };
+        let mut view = stream::config_view(&config);
+        // Changing them is the church computer's alone (until roles exist); a phone shows them read-only.
+        view["canEdit"] = serde_json::Value::Bool(local);
+        let extras = AckExtras { stream_config: Some(view), ..Default::default() };
+        protocol::ack_with(id, None, extras)
     }
 
     /// The folder the images and the library live in.
@@ -1306,7 +1431,8 @@ fn serve_ws_connection(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(WS_HANDSHAKE_TIMEOUT))?;
     let shared = Arc::new(stream.try_clone()?);
-    let mut session = Session::device();
+    let mut session =
+        Session::device_from(stream.peer_addr().ok().map(|a| a.ip()), stream.local_addr().ok().map(|a| a.ip()));
     let result = match tls {
         None => ws_session(stream, &shared, engine, access, data_dir, &mut session, false),
         // No good certificate yet: refuse rather than serve in plain text.
@@ -1472,6 +1598,91 @@ mod tests {
     fn send(e: &mut Engine, command: Value) -> Value {
         let msg = json!({ "v": 1, "id": "t", "ts": 1, "command": command }).to_string();
         serde_json::to_value(e.handle_line(&msg)).unwrap()
+    }
+
+    #[test]
+    fn streaming_settings_save_and_read_back_without_the_key_and_wait_while_streaming() {
+        const SECRET: &str = "abcd-efgh-ijkl-mnop";
+        let (mut e, dir) = engine("stream-settings", 3);
+        let set = |name: &str, key: Option<&str>| {
+            let mut yt = json!({ "id": "youtube", "name": name, "url": "rtmps://a.rtmps.youtube.com:443/live2" });
+            if let Some(k) = key {
+                yt["key"] = json!(k);
+            }
+            json!({ "type": "stream.config.set", "config": { "destinations": [
+                yt, { "id": "fb", "name": "Facebook", "url": "rtmps://live-api-s.facebook.com:443/rtmp/", "key": "fbkey-1234", "enabled": false }
+            ] } })
+        };
+        let saved = send(&mut e, set("YouTube", Some(SECRET)));
+        assert_eq!(saved["ok"], true, "{saved}");
+        let got = send(&mut e, json!({ "type": "stream.config.get" }));
+        assert_eq!(got["streamConfig"]["destinations"][0]["id"], "youtube");
+        assert_eq!(got["streamConfig"]["destinations"][0]["hasKey"], true);
+        assert_eq!(got["streamConfig"]["destinations"][1]["enabled"], false);
+        assert!(!got.to_string().contains(SECRET) && !got.to_string().contains("fbkey"), "a key came back: {got}");
+        // Saved on disk for the video process, key included, and no temp file left behind.
+        let file = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        assert!(file.contains(SECRET));
+        assert!(!dir.join("stream.json.tmp").exists());
+        // Editing without a key keeps the saved one.
+        assert_eq!(send(&mut e, set("YouTube Live", None))["ok"], true);
+        let file = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        assert!(file.contains(SECRET) && file.contains("YouTube Live"));
+        // A mistake is refused in plain words and the saved file is untouched.
+        let bad = send(
+            &mut e,
+            json!({ "type": "stream.config.set", "config": { "destinations": [
+            { "id": "x", "name": "Church", "url": "ftp://nope" }] } }),
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["message"].as_str().unwrap().starts_with("Church: the server address must start with"));
+        assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        // The saved key never follows an address to another server, and a key can't carry options.
+        let try_set = |e: &mut Engine, yt: Value| {
+            send(e, json!({ "type": "stream.config.set", "config": { "destinations": [yt] } }))
+        };
+        let moved =
+            try_set(&mut e, json!({ "id": "youtube", "name": "YouTube", "url": "rtmps://evil.example:443/live2" }));
+        assert_eq!(moved["ok"], false);
+        assert!(moved["message"].as_str().unwrap().contains("enter the stream key again"), "{moved}");
+        let spaced = try_set(
+            &mut e,
+            json!({ "id": "youtube", "name": "YouTube", "url": "rtmps://a.rtmps.youtube.com:443/live2", "key": "abc socks=evil" }),
+        );
+        assert_eq!(spaced["ok"], false, "{spaced}");
+        assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        // An address whose only path part could be a key is not shown back, in a get or a set ack.
+        let odd = try_set(
+            &mut e,
+            json!({ "id": "odd", "name": "Odd", "url": "rtmp://host.example/KEYONLY1234", "enabled": false }),
+        );
+        assert_eq!(odd["ok"], true, "{odd}");
+        assert!(!odd.to_string().contains("KEYONLY1234"), "{odd}");
+        let got = send(&mut e, json!({ "type": "stream.config.get" }));
+        assert!(!got.to_string().contains("KEYONLY1234"), "{got}");
+        assert_eq!(got["streamConfig"]["destinations"][0]["url"], "rtmp://host.example");
+        assert_eq!(got["streamConfig"]["canEdit"], true);
+        // A new key for an HLS address keeps its other settings (copy=1) and drops the old cid.
+        std::fs::write(
+            dir.join("stream.json"),
+            r#"{"version":1,"destinations":[{"id":"h","name":"YT","url":"https://a.upload.youtube.com/http_upload_hls?cid=OLDCID1&copy=1"}]}"#,
+        )
+        .unwrap();
+        let hls = try_set(
+            &mut e,
+            json!({ "id": "h", "name": "YT", "url": "https://a.upload.youtube.com/http_upload_hls", "key": "NEWCID2" }),
+        );
+        assert_eq!(hls["ok"], true, "{hls}");
+        let on_disk = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        assert!(on_disk.contains("copy=1") && on_disk.contains("NEWCID2") && !on_disk.contains("OLDCID1"), "{on_disk}");
+        // Put the two-platform setup back for the checks below.
+        send(&mut e, set("YouTube Live", Some(SECRET)));
+        let file = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        // While streaming a save is refused, a read is not.
+        send(&mut e, json!({ "type": "stream.start" }));
+        assert_eq!(send(&mut e, set("Renamed", None))["code"], "unavailable");
+        assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        assert_eq!(send(&mut e, json!({ "type": "stream.config.get" }))["ok"], true);
     }
 
     #[test]
@@ -2613,6 +2824,22 @@ mod tests {
             json!({ "type": "license.set", "key": format!("JL1.eyJ9.{}", "A".repeat(86)) }),
         ] {
             assert_eq!(phone.send(&mut e, command.clone())["code"], "unauthorized", "{command}");
+        }
+
+        // The church computer's own browser, paired like any device, has the license panel too
+        // (loopback, or the computer's own LAN address); pairing stays with the local channel.
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        for (peer, ours, here) in [("127.0.0.1", lan, true), ("192.168.1.20", lan, true), ("192.168.1.30", lan, false)]
+        {
+            let mut browser = Phone::new();
+            browser.session = Session::device_from(peer.parse().ok(), Some(ours));
+            browser.prove(&mut e, &key);
+            let got = browser.send(&mut e, json!({ "type": "license.get" }));
+            assert_eq!(got["ok"] == true, here, "{peer}: {got}");
+            if here {
+                assert_eq!(got["license"]["keyPresent"], false);
+                assert_eq!(browser.send(&mut e, json!({ "type": "pair.open" }))["code"], "unauthorized");
+            }
         }
     }
 

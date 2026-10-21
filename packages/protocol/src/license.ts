@@ -95,7 +95,8 @@ export type LicenseState = "trial" | "trial_ended" | "licensed";
 
 /**
  * What the church computer says about its license (license.get, license.set). Both commands
- * are the church computer's alone (`unauthorized` from a paired device), like pairing. A key
+ * are the church computer's alone (its local channel or its own browser; `unauthorized` from
+ * any other device). A key
  * issued before the saved one is refused (`bad_arguments`); a build with no license public
  * key answers license.set with `unavailable`.
  */

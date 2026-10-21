@@ -5,8 +5,8 @@
   /**
    * The license panel for the tech lead: the trial or license on the church computer, and a box
    * to paste a key from live.jivvy.org. The church computer checks the key offline; nothing here
-   * ever stops a service. License commands are the church computer's alone, so a paired device
-   * is told where to do it instead. Not shown in volunteer mode.
+   * ever stops a service. License commands are the church computer's alone (its own browser
+   * works), so a phone or other device is told where to do it instead. Not shown in volunteer mode.
    */
   let {
     ready,
@@ -64,10 +64,7 @@
     {#if !ready}
       <p>Connect to the church computer to see its license.</p>
     {:else if churchOnly}
-      <p>
-        The license is set on the church computer itself. There, run <code>jivvy-ctl license</code> to see it, or
-        <code>jivvy-ctl license set</code> followed by the key from live.jivvy.org.
-      </p>
+      <p>The license is set on the church computer itself: open Jivvy Live in its browser and use this panel there.</p>
     {:else}
       {#if status}
         {#if status.state === "licensed" && status.license}

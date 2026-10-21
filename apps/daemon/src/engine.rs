@@ -1474,6 +1474,9 @@ mod tests {
     #[test]
     fn pictures_in_saved_plans_and_themes_are_kept_and_served_by_id() {
         let (mut e, dir) = engine("library-media", 10);
+        // The clean-up the engine starts at boot must be done before files appear without going
+        // through an upload (it protects nothing else), or it may sweep them.
+        e.wait_for_pruning();
         let (used, unused) = ("a".repeat(64), "b".repeat(64));
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         png.extend([1u8; 16]);
@@ -1489,7 +1492,8 @@ mod tests {
         // Any run sheet change prunes: the picture the plan uses stays, the other goes.
         send(&mut e, json!({ "type": "runsheet.set", "runSheet": { "id": "x", "title": "", "items": [] } }));
         e.wait_for_pruning();
-        assert!(crate::images::has(&dir, &used) && !crate::images::has(&dir, &unused));
+        assert!(crate::images::has(&dir, &used), "the picture a saved plan uses is kept");
+        assert!(!crate::images::has(&dir, &unused), "a picture nothing uses goes");
         let (kind, bytes) = crate::images::serve(&dir, &used).unwrap();
         assert_eq!((kind, bytes), ("image/png", png.clone()));
 

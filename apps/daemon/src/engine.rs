@@ -300,14 +300,15 @@ impl Engine {
     }
 
     /// Reads the active theme from the library: the "active-theme" setting names a "theme"
-    /// document, whose body is sent to the screens as it is. None if either is missing or the
-    /// theme isn't valid; a library read that fails keeps the theme already in use.
+    /// document, whose body is sent to the screens as it is, or a built-in theme (which has no
+    /// document). None if either is missing or the theme isn't valid; a library read that fails
+    /// keeps the theme already in use.
     fn refresh_theme(&mut self) {
         let Some(lib) = self.library.as_ref() else { return };
         let read = || -> Result<Option<serde_json::Value>, crate::library::Error> {
             let Some(active) = lib.get("setting", "active-theme")? else { return Ok(None) };
             let Some(id) = active.body.get("themeId").and_then(|v| v.as_str()) else { return Ok(None) };
-            let Some(doc) = lib.get("theme", id)? else { return Ok(None) };
+            let Some(doc) = lib.get("theme", id)? else { return Ok(built_in_theme(id)) };
             Ok(valid_theme(&doc.body).then_some(serde_json::Value::Object(doc.body)))
         };
         match read() {
@@ -1012,6 +1013,19 @@ impl Engine {
 }
 
 /// One event to one connection, if it can receive events; never blocks.
+/// The built-in themes (`BUILT_IN` in apps/web/src/lib/theme.ts; keep the two the same), which
+/// the web app never saves as documents. Black is the default look, so it sends no theme and
+/// every screen draws exactly as it does with none.
+fn built_in_theme(id: &str) -> Option<serde_json::Value> {
+    let (font, bold, text, background) = match id {
+        "jivvy-navy" => ("sans", true, "#F4F1EA", "#10224F"),
+        "jivvy-paper" => ("serif", false, "#10224F", "#F4F1EA"),
+        _ => return None, // "jivvy-black", or not a built-in
+    };
+    Some(serde_json::json!({ "v": 1, "font": font, "bold": bold, "size": 7, "text": text, "shadow": false,
+        "background": { "kind": "color", "color": background } }))
+}
+
 /// The same checks as `themeFromDoc` (apps/web/src/lib/theme.ts), and a small size cap: a theme
 /// that fails them is not sent to the screens, which then draw as they always did.
 fn valid_theme(b: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -1390,6 +1404,20 @@ mod tests {
         let bad = json!({ "v": 1, "font": "serif", "bold": false, "size": 7, "text": "red", "shadow": false,
             "background": { "kind": "color", "color": "#F4F1EA" } });
         send(&mut e, json!({ "type": "doc.put", "kind": "theme", "id": "paper", "title": "Paper", "body": bad }));
+        assert_eq!(e.view().theme, None);
+        // A built-in has no document: the engine knows it. Black is the default look: no theme.
+        let pick = |e: &mut Engine, id: &str| {
+            send(
+                e,
+                json!({ "type": "doc.put", "kind": "setting", "id": "active-theme", "title": "Active theme",
+                    "body": { "v": 1, "themeId": id } }),
+            );
+        };
+        pick(&mut e, "jivvy-navy");
+        let navy = e.view().theme.expect("the built-in Navy theme is sent");
+        assert_eq!((navy["text"].as_str(), navy["background"]["color"].as_str()), (Some("#F4F1EA"), Some("#10224F")));
+        assert!(valid_theme(navy.as_object().unwrap()));
+        pick(&mut e, "jivvy-black");
         assert_eq!(e.view().theme, None);
     }
 

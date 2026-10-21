@@ -23,5 +23,24 @@
       "name": "signature changed",
       "key": "JL1.eyJjaHVyY2giOiJjaF90ZXN0IiwicGxhbiI6ImNodXJjaCIsInVwZGF0ZXNVbnRpbCI6MTg4NzE0ODgwMDAwMCwicGx1c1VudGlsIjoxODI0MDc2ODAwMDAwLCJpc3N1ZWQiOjE3OTI1NDA4MDAwMDB9.AOk6h52M1PTwuN_Aoia14vVRM99e7H-RDSvcOYSbnS1BkFSC33DXhHxMip-yB9YJ1ZgQoXW-ZnNlIOcZGPlsCQ"
     }
-  ]
+  ],
+  "olderKey": "JL1.eyJjaHVyY2giOiJjaF90ZXN0IiwicGxhbiI6ImNodXJjaCIsInVwZGF0ZXNVbnRpbCI6MTg4NzE0ODgwMDAwMCwicGx1c1VudGlsIjoxODI0MDc2ODAwMDAwLCJpc3N1ZWQiOjE3OTI0NTQ0MDAwMDB9.X50o_1JMlDvD9EkoHpfcdcbdLCFrgMiSQFY34lX0UsctUBtJYuG1SlNn0IpsilDMN6wAHKLx7OveZwGguboqAA",
+  "statusAt": 1792627200000,
+  "trialStartedAt": 1792540800000,
+  "status": {
+    "state": "licensed",
+    "trialStartedAt": 1792540800000,
+    "trialEndsAt": 1795132800000,
+    "keyPresent": true,
+    "keyHint": "JL1…lsCQ",
+    "license": {
+      "church": "ch_test",
+      "plan": "church",
+      "updatesUntil": 1887148800000,
+      "plusUntil": 1824076800000,
+      "issued": 1792540800000
+    },
+    "updatesActive": true,
+    "plusActive": true
+  }
 }

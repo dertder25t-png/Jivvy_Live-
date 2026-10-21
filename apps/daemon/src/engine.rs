@@ -105,8 +105,6 @@ fn device_may(command: &Command) -> bool {
             | Command::DocGet { .. }
             | Command::DocPut { .. }
             | Command::DocDelete { .. }
-            | Command::LicenseGet
-            | Command::LicenseSet { .. }
     )
 }
 
@@ -467,6 +465,14 @@ impl Engine {
                     Err(SetError::Invalid) => {
                         let message = "That license key isn't valid. Copy it again from live.jivvy.org, all of it.";
                         return protocol::nack(id, ErrorCode::BadArguments, message);
+                    }
+                    Err(SetError::Older) => {
+                        let message = "That key is older than the one already saved, so the saved one stays.";
+                        return protocol::nack(id, ErrorCode::BadArguments, message);
+                    }
+                    Err(SetError::NoPublicKey) => {
+                        let message = "This copy of Jivvy Live was built without a license key check, so it can't take keys. Services run as normal.";
+                        return protocol::nack(id, ErrorCode::Unavailable, message);
                     }
                     Err(SetError::Save(e)) => {
                         crate::log("engine", format!("license.key save failed: {e}"));
@@ -2603,6 +2609,8 @@ mod tests {
             json!({ "type": "stream.report", "status": "live" }),
             json!({ "type": "recording.report", "status": "recording" }),
             json!({ "type": "media.levels", "peakDb": [0], "rmsDb": [0] }),
+            json!({ "type": "license.get" }),
+            json!({ "type": "license.set", "key": format!("JL1.eyJ9.{}", "A".repeat(86)) }),
         ] {
             assert_eq!(phone.send(&mut e, command.clone())["code"], "unauthorized", "{command}");
         }

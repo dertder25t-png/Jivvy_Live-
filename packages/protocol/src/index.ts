@@ -123,6 +123,7 @@ export type Command =
   | { type: "doc.delete"; kind: string; id: string; baseRev?: number }
   // ---- License (added in v1 without a version bump; older daemons answer unknown_command) ----
   // Checked on the church computer, offline (see license.ts). It never stops a service.
+  // Church computer only, like pairing: a paired device gets `unauthorized`.
   /** The license and trial (`license` on the ack). */
   | { type: "license.get" }
   /**

@@ -25,15 +25,26 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// The trial notice starts this many days before the end.
 const TRIAL_NOTICE_DAYS: u64 = 7;
 
-/// The key that checks licenses: `JIVVY_LICENSE_PUBLIC_KEY` at build time (release builds), else
-/// the test key in debug builds. A release build without one takes no keys; it still runs every
-/// service, on the trial's terms.
+/// The key that checks licenses: `JIVVY_LICENSE_PUBLIC_KEY` at build time, else the test key in
+/// debug builds only. `build.rs` refuses a release build without a well-formed production key
+/// (or with the test key), unless the `unlicensed-release` feature says it's a CI test build;
+/// such a build takes no keys and still runs every service, on the trial's terms.
 pub fn public_key() -> Option<&'static str> {
     match option_env!("JIVVY_LICENSE_PUBLIC_KEY") {
-        Some(k) => Some(k),
-        None if cfg!(debug_assertions) => Some(TEST_PUBLIC_KEY),
-        None => None,
+        Some(k) if !k.is_empty() => Some(k),
+        _ => fallback_public_key(),
     }
+}
+
+#[cfg(debug_assertions)]
+fn fallback_public_key() -> Option<&'static str> {
+    Some(TEST_PUBLIC_KEY)
+}
+
+/// Release binaries never trust the test key.
+#[cfg(not(debug_assertions))]
+fn fallback_public_key() -> Option<&'static str> {
+    None
 }
 
 /// What a key says (the TypeScript `LicensePayload`); times are ms since the epoch.
@@ -77,8 +88,11 @@ pub struct LicenseStatus {
     pub state: &'static str,
     pub trial_started_at: u64,
     pub trial_ends_at: u64,
+    /// A key is saved. The key itself is never sent, only `key_hint`.
+    pub key_present: bool,
+    /// "JL1…" and the key's last 4 characters, to tell keys apart.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
+    pub key_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<Payload>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,8 +110,12 @@ struct Trial {
 }
 
 pub enum SetError {
-    /// The signature isn't good (or this build has no key to check it with).
+    /// The signature doesn't match (or it isn't a key at all).
     Invalid,
+    /// This build has no public key to check keys with (`unlicensed-release`).
+    NoPublicKey,
+    /// Issued before the key already saved, which stays.
+    Older,
     Save(std::io::Error),
 }
 
@@ -140,9 +158,16 @@ impl License {
         verify(key, self.public_key.as_deref()?)
     }
 
-    /// Saves `key` if its signature is good. A bad key leaves the saved one as it was.
+    /// Saves `key` if its signature is good and it isn't older than the saved one (by `issued`).
+    /// A refused key leaves the saved one as it was.
     pub fn set(&mut self, key: &str) -> Result<&Payload, SetError> {
-        let payload = self.check(key).ok_or(SetError::Invalid)?;
+        let public_key = self.public_key.as_deref().ok_or(SetError::NoPublicKey)?;
+        let payload = verify(key, public_key).ok_or(SetError::Invalid)?;
+        if let Some((_, saved)) = &self.key
+            && payload.issued < saved.issued
+        {
+            return Err(SetError::Older);
+        }
         crate::write_atomic(&self.dir.join("license.key"), key.as_bytes()).map_err(SetError::Save)?;
         crate::log("license", format!("license saved for church {} ({})", payload.church, payload.plan));
         Ok(&self.key.insert((key.to_string(), payload)).1)
@@ -155,7 +180,8 @@ impl License {
             state: "trial",
             trial_started_at: self.trial_started_at,
             trial_ends_at,
-            key: None,
+            key_present: false,
+            key_hint: None,
             license: None,
             updates_active: None,
             plus_active: None,
@@ -164,7 +190,8 @@ impl License {
         let notice = match &self.key {
             Some((key, p)) => {
                 s.state = "licensed";
-                s.key = Some(key.clone());
+                s.key_present = true;
+                s.key_hint = Some(format!("JL1…{}", &key[key.len().saturating_sub(4)..]));
                 s.license = Some(p.clone());
                 s.updates_active = Some(now_ms < p.updates_until);
                 s.plus_active = Some(now_ms < p.plus_until);
@@ -225,11 +252,17 @@ mod tests {
         assert_eq!((ended.state, ended.trial_started_at), ("trial_ended", start));
         assert!(ended.notice.is_some());
         assert_eq!(lic.status(start + 40 * DAY_MS, true).notice, None, "no notice during a service");
-        assert!(lic.set(f["bad"][0]["key"].as_str().unwrap()).is_err());
-        assert!(lic.set(f["key"].as_str().unwrap()).is_ok());
+        let key = f["key"].as_str().unwrap();
+        assert!(matches!(lic.set(f["bad"][0]["key"].as_str().unwrap()), Err(SetError::Invalid)));
+        let mut unlicensed_build = License::load(&dir, None, start);
+        assert!(matches!(unlicensed_build.set(key), Err(SetError::NoPublicKey)));
+        assert!(lic.set(key).is_ok());
+        assert!(matches!(lic.set(f["olderKey"].as_str().unwrap()), Err(SetError::Older)), "an older key never wins");
+        assert!(lic.set(key).is_ok(), "the same key again is fine");
         let lic = License::load(&dir, Some(TEST_PUBLIC_KEY), start + 40 * DAY_MS);
-        let s = lic.status(start + 40 * DAY_MS, false);
-        assert_eq!((s.state, s.plus_active, s.notice), ("licensed", Some(true), None));
+        let s = lic.status(f["statusAt"].as_u64().unwrap(), false);
+        // Exactly the fixture: a hint, never the key itself.
+        assert_eq!(serde_json::to_value(&s).unwrap(), f["status"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

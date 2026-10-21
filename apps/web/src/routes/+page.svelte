@@ -591,7 +591,7 @@
       <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
     </form>
     <Export {ready} sender={() => conn} beforeExport={savePlansNow} />
-    <License {ready} send={(c) => conn?.send(c)} />
+    <License {ready} {live} send={(c) => conn?.send(c)} />
   {/if}
   <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
     {locked ? "Unlock" : "Lock for volunteers"}

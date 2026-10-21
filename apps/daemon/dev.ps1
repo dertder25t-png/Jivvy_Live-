@@ -10,7 +10,7 @@
 #                          (release, --features video)
 #   .\dev.ps1 ctl next  -> jivvy-ctl: one-line commands to a running daemon (next, back, black, state, ...)
 #   .\dev.ps1 build     -> cargo build --release --features video
-#   .\dev.ps1 test      -> cargo test --release --features video, engine killed 100 times (Rust only)
+#   .\dev.ps1 test      -> cargo test --release --features video,unlicensed-release, engine killed 100 times (Rust only)
 #   .\dev.ps1 <args>    -> cargo <args> with GStreamer's paths set
 # PowerShell drops a bare -- from a script's arguments: quote it, e.g. .\dev.ps1 fast '--' --nocapture
 $Rest = @($args)
@@ -91,8 +91,8 @@ try {
       $skips = if ($kills -ne '100') { "the full 100 kills (JIVVY_CHAOS_ITERATIONS is $kills)" } else { $null }
       $code = Invoke-Steps 'TEST-FULL (everything)' @(
         (Step 'cargo fmt --check' { cargo fmt --check }),
-        (Step 'cargo clippy (with video)' { cargo clippy --release --all-targets --features video -q -- -D warnings }),
-        (Step "all Rust tests with video, release, engine killed $kills times" { cargo test --release --features video }),
+        (Step 'cargo clippy (with video)' { cargo clippy --release --all-targets --features video,unlicensed-release -q -- -D warnings }),
+        (Step "all Rust tests with video, release, engine killed $kills times" { cargo test --release --features video,unlicensed-release }),
         (Step 'npm run typecheck' { Invoke-Npm typecheck }),
         (Step 'npm test' { Invoke-Npm test }),
         (Step 'npm run build' { Invoke-Npm build })
@@ -113,10 +113,10 @@ try {
       Use-GStreamer
       Show-Tier 'SLOW' 'jivvy-video unit tests, then the video and streaming chaos tests (GStreamer test sources, MediaMTX, fake YouTube)' $null
       # Extra args go to the test binaries, e.g. .\dev.ps1 slow --nocapture
-      cargo test --release --features video --bin jivvy-video -- @($Rest | Select-Object -Skip 1)
+      cargo test --release --features video,unlicensed-release --bin jivvy-video -- @($Rest | Select-Object -Skip 1)
       $code = $LASTEXITCODE
       if ($code -eq 0) {
-        cargo test --release --features video --test chaos -- video:: @($Rest | Select-Object -Skip 1)
+        cargo test --release --features video,unlicensed-release --test chaos -- video:: @($Rest | Select-Object -Skip 1)
         $code = $LASTEXITCODE
       }
       Show-Tier 'SLOW' "finished, exit $code" $null
@@ -130,7 +130,7 @@ try {
       $extra = @($Rest | Select-Object -Skip 1)
       $scope = if ($extra.Count) { "only: $($extra -join ' ')" } else { 'all Rust tests (npm and lint: .\dev.ps1 test-full)' }
       Show-Tier 'FULL' "release build with video, engine killed $env:JIVVY_CHAOS_ITERATIONS times; $scope" $null
-      cargo test --release --features video @extra
+      cargo test --release --features video,unlicensed-release @extra
     }
     default { Use-GStreamer; cargo @Rest }
   }

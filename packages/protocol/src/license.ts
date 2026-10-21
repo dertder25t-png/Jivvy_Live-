@@ -93,14 +93,27 @@ export async function verifyLicenseKey(key: string, publicKey: string): Promise<
 /** `trial`: no key yet, inside the 30 days. `trial_ended`: no key, after them. `licensed`: a valid key. */
 export type LicenseState = "trial" | "trial_ended" | "licensed";
 
-/** What the church computer says about its license (license.get, license.set). */
+/**
+ * What the church computer says about its license (license.get, license.set). Both commands
+ * are the church computer's alone (`unauthorized` from a paired device), like pairing. A key
+ * issued before the saved one is refused (`bad_arguments`); a build with no license public
+ * key answers license.set with `unavailable`.
+ */
 export interface LicenseStatus {
   state: LicenseState;
   /** When this computer's trial started and ends (ms since epoch). */
   trialStartedAt: number;
   trialEndsAt: number;
-  /** The saved key and what it says; left out without one. */
+  /**
+   * @deprecated Never filled: the key itself never leaves the church computer. Kept so the
+   * type stays add-only; use `keyPresent` and `keyHint`.
+   */
   key?: string;
+  /** A key is saved. Older daemons leave it out. */
+  keyPresent?: boolean;
+  /** "JL1…" and the saved key's last 4 characters, to tell keys apart. */
+  keyHint?: string;
+  /** What the saved key says; left out without one. */
   license?: LicensePayload;
   /** New local features keep arriving (before `updatesUntil`). */
   updatesActive?: boolean;

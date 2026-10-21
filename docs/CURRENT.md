@@ -15,22 +15,15 @@ Read this file and your one item only. Do not read the whole repo or the full `d
 - A slow, nightly or flaky failure: one line in `docs/HARDENING.md`, keep building.
 - Order for new behavior: `packages/protocol` (with fixtures) → daemon → web app.
 - PR gate: `.\dev.ps1 check` in `apps/daemon` (fmt, clippy, fast tier, npm typecheck and tests).
-- Base branch for this stack: `web/local-db` (not `main`). The lead merges PRs once review and CI are done.
+- Base branch: `main`. The lead merges PRs once review and CI are done.
 
-## Remaining items
-- [x] Themes (fonts, colors, backgrounds) — PR #49 merged
-- [x] Installable PWA that keeps working offline — PR #48 merged
-- [x] Pre-flight check — PR #53 merged
-- [x] Keyboard and clicker control on the computer itself — PR #50 merged
-- [x] Blocks sleep during services — PR #51 merged (awake while streaming/recording,
-  or for 3 h after the last operator change; `in_service()` is what a future updater must check)
-- [x] Export in open formats — PR #52 merged
-- [ ] Stream lyric layer uses the active theme (`apps/daemon/src/lyrics.rs`) — branch `daemon/lyrics-theme`
-- [ ] Pictures move into the church computer's library, so plan and theme pictures show on every device — branch `web/library-media`
-- [ ] Delete songs and plans from the UI — branch `web/delete-docs`
-- [ ] Pre-flight: pending OS restart check — branch `daemon/preflight-restart`
-- [ ] More public-domain hymns in `packages/songs` — branch `songs/more-hymns`
-- Later in 1A (needs owner decisions first): no-audio and stream-down alerts (push + email), church account and Stripe, sync engine.
+## Remaining items (round 3)
+- [ ] No-audio and stream-down alerts: web push now (email follows the license item) — branch `daemon/alert-push`
+- [ ] Church account, Stripe checkout (test mode), offline-verified license key, 30-day trial — branch `site/license`
+- [ ] Streaming settings screen (destinations and keys from the web app instead of editing stream.json) — branch `web/stream-settings`
+- [ ] Recordings list labelled by service, in local time — branch `web/recordings`
+- Next: sync engine with Supabase (needs the church account first).
+- Stages 1A items 1–6 and the follow-ups are merged (#48–#58); see BUILD_PLAN.md.
 
 ## Avoiding conflicts between parallel PRs
 - `apps/web/src/routes/+page.svelte` is shared. Put new UI in a new component under `src/lib` and keep the

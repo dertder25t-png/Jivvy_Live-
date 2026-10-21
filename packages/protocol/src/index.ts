@@ -617,6 +617,30 @@ export interface Preflight {
   summary: string;
   /** Why it failed or fell back, in words a tech lead can act on. */
   message?: string;
+  /**
+   * Added in v1: the church computer's other checks (disk, streaming settings, video check,
+   * screens, camera and microphone). Left out while measuring, when the test was stopped, and
+   * by older daemons (fixtures/preflight-event.json).
+   */
+  checks?: PreflightCheck[];
+  /**
+   * Added in v1: the stream started during the test, which stopped it (`failed`, no checks).
+   * Nothing is wrong; run it again after the stream. Older daemons leave it out.
+   */
+  stopped?: true;
+}
+
+/** `ok` green, `warn` amber (worth a look), `bad` red (fix before the service). */
+export type PreflightLevel = "ok" | "warn" | "bad";
+
+/** One pre-flight check, in plain English, with a fix when it isn't `ok`. */
+export interface PreflightCheck {
+  /** "disk", "stream", "encoder", "screens", "camera", "microphone"; newer daemons may add others. */
+  id: string;
+  level: PreflightLevel;
+  label: string;
+  message: string;
+  fix?: string;
 }
 
 /**

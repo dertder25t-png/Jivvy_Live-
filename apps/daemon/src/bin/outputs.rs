@@ -305,6 +305,8 @@ mod ui {
                     if ticks.is_multiple_of(RESCAN_TICKS) {
                         reconcile(target, &mut model, &mut windows, &proxy);
                     }
+                    // Unchanged, it is rewritten only every STATUS_REFRESH: its age says this is alive.
+                    write_status(&mut model);
                 }
                 Event::UserEvent(UserEvent::Update(u)) => {
                     if let Some(state) = apply(&mut model, u) {

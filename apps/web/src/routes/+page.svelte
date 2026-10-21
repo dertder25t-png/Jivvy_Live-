@@ -13,6 +13,8 @@
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
+  import PreflightCheck from "$lib/Preflight.svelte";
+  import type { Preflight } from "@jivvy/protocol";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
 
@@ -62,7 +64,8 @@
   $effect(() => store(DRAFT_KEY, draft));
 
   /** Edit builds the run sheet; Operate runs the service. A locked browser only operates. */
-  let view = $state<"edit" | "operate">(stored(VIEW_KEY, "edit"));
+  let view = $state<"edit" | "operate" | "preflight">(stored(VIEW_KEY, "edit"));
+  let preflight = $state<Preflight | null>(null);
   $effect(() => store(VIEW_KEY, view));
   let locked = $state(isLocked());
   /** Locked or unlocked in another tab of this browser: follow it at once. */
@@ -115,6 +118,7 @@
     store(ADDRESS_KEY, address);
     live = null;
     onScreens = null;
+    preflight = null;
     conn = new DaemonConnection(address.trim(), {
       status: (s) => (status = s),
       state: (s) => (live = s),
@@ -124,6 +128,7 @@
         levelsAt = Date.now();
       },
       docChanged: (d) => docChanged(d),
+      preflight: (p) => (preflight = p),
     });
     conn.connect();
   }
@@ -516,6 +521,9 @@
       <button class:active={view === "operate"} aria-pressed={view === "operate"} onclick={() => (view = "operate")}
         >Operate</button
       >
+      <button class:active={view === "preflight"} aria-pressed={view === "preflight"} onclick={() => (view = "preflight")}
+        >Pre-flight</button
+      >
     </nav>
     <form
       class="connect"
@@ -616,6 +624,9 @@
 
 {#if locked || view === "operate"}
   <Operator {theme} {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
+  {#if locked}<PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />{/if}
+{:else if view === "preflight"}
+  <PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />
 {:else}
 <main>
   <section class="plan" aria-label="Run sheet">

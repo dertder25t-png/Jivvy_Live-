@@ -243,6 +243,12 @@ Thou my great Father, I Thy true son;
 Thou in me dwelling, and I with Thee one.
 
 Verse 3
+Riches I heed not, nor man's empty praise,
+Thou mine Inheritance, now and always;
+Thou and Thou only, first in my heart,
+High King of heaven, my Treasure Thou art.
+
+Verse 4
 High King of heaven, my victory won,
 May I reach heaven's joys, O bright Heaven's Sun!
 Heart of my own heart, whatever befall,
@@ -367,7 +373,7 @@ And crown Him Lord of all.
 
 Verse 3
 Ye seed of Israel's chosen race,
-Ye ransomed of the fall,
+Ye ransomed from the fall,
 Hail Him who saves you by His grace,
 And crown Him Lord of all.
 
@@ -455,6 +461,10 @@ Breathe, O breathe Thy loving Spirit
 Into every troubled breast;
 Let us all in Thee inherit,
 Let us find that second rest.
+Take away our bent to sinning;
+Alpha and Omega be;
+End of faith, as its beginning,
+Set our hearts at liberty.
 
 Verse 3
 Finish, then, Thy new creation;
@@ -493,7 +503,7 @@ Verse 3
 I need Thee every hour,
 In joy or pain;
 Come quickly and abide,
-Or life is in vain.`,
+Or life is vain.`,
   },
   {
     id: "be-still-my-soul",
@@ -512,7 +522,17 @@ Verse 2
 Be still, my soul: thy God doth undertake
 To guide the future as He has the past;
 Thy hope, thy confidence let nothing shake;
-All now mysterious shall be bright at last.`,
+All now mysterious shall be bright at last.
+Be still, my soul: the waves and winds still know
+His voice who ruled them while He dwelt below.
+
+Verse 3
+Be still, my soul: the hour is hastening on
+When we shall be forever with the Lord,
+When disappointment, grief, and fear are gone,
+Sorrow forgot, love's purest joys restored.
+Be still, my soul: when change and tears are past,
+All safe and blessed we shall meet at last.`,
   },
   {
     id: "guide-me",
@@ -524,16 +544,24 @@ Guide me, O Thou great Jehovah,
 Pilgrim through this barren land;
 I am weak, but Thou art mighty;
 Hold me with Thy powerful hand.
-
-Refrain
-Bread of heaven,
+Bread of heaven, Bread of heaven,
 Feed me till I want no more.
 
 Verse 2
 Open now the crystal fountain,
 Whence the healing stream doth flow;
 Let the fiery, cloudy pillar
-Lead me all my journey through.`,
+Lead me all my journey through.
+Strong Deliverer, strong Deliverer,
+Be Thou still my Strength and Shield.
+
+Verse 3
+When I tread the verge of Jordan,
+Bid my anxious fears subside;
+Death of death, and hell's Destruction,
+Land me safe on Canaan's side.
+Songs of praises, songs of praises,
+I will ever give to Thee.`,
   },
   {
     id: "for-the-beauty-of-the-earth",

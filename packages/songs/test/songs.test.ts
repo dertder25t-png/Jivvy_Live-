@@ -30,6 +30,9 @@ describe("songs", () => {
       const song = hymnSong(hymn);
       expect(song.sections.length).toBeGreaterThan(0);
       expect(song.arrangement.length).toBeGreaterThan(0);
+      // Every verse of a hymn has the same number of lines: none is cut short.
+      const counts = song.sections.filter((x) => /^Verse/.test(x.label)).map((x) => x.text.split("\n").filter(Boolean).length);
+      expect(new Set(counts).size, hymn.id).toBe(1);
     }
     const hymn = HYMNS.find((h) => h.id === "blessed-assurance");
     const song = hymnSong(hymn!);

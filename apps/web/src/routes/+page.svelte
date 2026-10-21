@@ -6,7 +6,7 @@
   import { addPdf } from "$lib/pdf";
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
-  import { getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
+  import { deleteDoc, getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
   import { ACTIVE_THEME_ID, BUILT_IN, DEFAULT_THEME_ID, activeBody, activeFromDoc, newThemeId, themeBody, themeFromDoc, type Theme } from "$lib/theme";
   import SlideView from "$lib/SlideView.svelte";
   import ThemePicker from "$lib/ThemePicker.svelte";
@@ -318,6 +318,18 @@
         : result.message;
     }
   }
+  /** Removes a song from the church computer's library; this run sheet keeps its own copy. */
+  async function deleteSong(item: DraftItem) {
+    if (!conn || !item.libraryId || locked || !confirm(`Delete '${item.title}'? This can't be undone.`)) return;
+    try {
+      await deleteDoc(conn, "song", item.libraryId);
+      item.libraryId = undefined;
+      item.libraryRev = undefined;
+      songNotes[item.id] = "Deleted from the church computer's library.";
+    } catch (e) {
+      songNotes[item.id] = e instanceof Error ? e.message : String(e);
+    }
+  }
 
   /**
    * Plans: this run sheet is kept on the church computer as you edit. The revision each save
@@ -415,6 +427,30 @@
       draft = plan;
       plansOpen = false;
       planNote = "";
+    } catch (e) {
+      planNote = e instanceof Error ? e.message : String(e);
+    }
+  }
+  /** Deletes a plan. Deleting the open one opens the next plan, or an empty run sheet. */
+  async function deletePlan(info: DocInfo) {
+    if (!conn || locked || !confirm(`Delete '${info.title || "Untitled plan"}'? This can't be undone.`)) return;
+    const key = planKey(info.id);
+    try {
+      planPending.delete(info.id); // no queued save may bring it back
+      if (draft.id === info.id) clearTimeout(planTimer);
+      await planRun;
+      await deleteDoc(conn, "plan", info.id);
+      delete planRevs[key];
+      if (planHeld === key) planHeld = "";
+      plans = plans.filter((p) => p.id !== info.id);
+      if (draft.id === info.id) {
+        const nextInfo = plans[0];
+        const doc = nextInfo ? await getDoc(conn, "plan", nextInfo.id) : null;
+        const next = doc ? planFromDoc(doc) : null;
+        if (doc && next) planRevs[planKey(doc.id)] = doc.rev;
+        draft = next ?? { id: newId(), title: "Sunday service", items: [] };
+      }
+      planNote = "Plan deleted.";
     } catch (e) {
       planNote = e instanceof Error ? e.message : String(e);
     }
@@ -644,6 +680,7 @@
                 <strong>{p.title || "Untitled plan"}</strong>
                 <span class="hint">saved {new Date(p.updatedAt).toLocaleString()}</span>
               </button>
+              {#if !locked}<button class="quiet" onclick={() => deletePlan(p)}>Delete</button>{/if}
             </li>
           {:else}
             <li class="hint">No plans on the church computer yet. This one is saved there as you edit.</li>
@@ -719,6 +756,7 @@
             <button class="quiet" onclick={() => saveSong(item)} disabled={!ready || songSaving[item.id]}
               >{item.libraryId ? "Save changes to the library" : "Save to the library"}</button
             >
+            {#if item.libraryId && !locked}<button class="quiet" onclick={() => deleteSong(item)} disabled={!ready}>Delete from library</button>{/if}
             {#if songNotes[item.id]}<span class="hint">{songNotes[item.id]}</span>{/if}
           </div>
         {:else if item.kind === "countdown"}

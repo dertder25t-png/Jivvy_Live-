@@ -23,6 +23,12 @@ export async function getDoc(conn: Sender, kind: string, id: string): Promise<Do
   return ack.doc;
 }
 
+/** Deletes a song or plan. The daemon keeps a delete marker, so it leaves every list and a save on the old copy is refused. */
+export async function deleteDoc(conn: Sender, kind: string, id: string): Promise<void> {
+  const ack = await conn.send({ type: "doc.delete", kind, id });
+  if (!ack.ok) throw new Error(ack.message);
+}
+
 export type Saved = { ok: true; rev: number } | { ok: false; conflict: boolean; message: string };
 
 export async function saveDoc(

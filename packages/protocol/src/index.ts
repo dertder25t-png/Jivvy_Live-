@@ -44,6 +44,12 @@ export type Command =
   | { type: "recording.start" }
   | { type: "recording.stop" }
   /**
+   * Added in v1 without a version bump. The recorded sets on the church computer, newest
+   * first (`recordings` on the ack): read-only, folder names only, never paths. Older daemons
+   * answer unknown_command.
+   */
+  | { type: "recording.list" }
+  /**
    * Added in v1 without a version bump. The daemon's video process reports whether the
    * recording it was asked for is actually being written, and whether the disk is running
    * low, about once a second. UIs read the result as `recording` and `recordingLowDisk` in
@@ -355,6 +361,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "device.list":
     case "stream.preflight":
     case "runsheet.get":
+    case "recording.list":
       return { ok: true, command: { type: raw.type } };
     case "media.put": {
       const ok = isMediaId(raw.id) && typeof raw.offset === "number" && Number.isInteger(raw.offset) && raw.offset >= 0
@@ -684,6 +691,25 @@ export interface AckExtras {
   doc?: Doc;
   /** doc.put, doc.delete: the document as saved (a delete is a revision too, so revisions never repeat). */
   saved?: DocInfo;
+  /** recording.list: newest first. */
+  recordings?: RecordingSet[];
+}
+
+/** One recorded set (a folder of video parts) on the church computer. */
+export interface RecordingSet {
+  /** The set's folder name inside the recordings folder; named by its UTC start. */
+  folder: string;
+  /** When it started, ms since epoch. */
+  startedMs: number;
+  /** Start to the last file written, in seconds; left out if nothing was written. */
+  durationSecs?: number;
+  /** Everything in the set. */
+  bytes: number;
+  /** recording: being recorded now; waiting: not converted yet; converting: some parts are; ready; none: no video. */
+  mp4: "recording" | "waiting" | "converting" | "ready" | "none";
+  /** The plan that was live when it started, and its title. Older sets have neither. */
+  planId?: string;
+  label?: string;
 }
 
 /** A document in the church computer's library, without its body. */

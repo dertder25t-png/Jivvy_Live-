@@ -522,6 +522,12 @@ export interface StateSnapshot {
   slideCount?: number;
   /** The slide at `slideIndex`, for screens that just show it. */
   slide?: Slide;
+  /**
+   * Added in v1: the body of the active theme (library kind "theme", picked by the "setting"
+   * document "active-theme"), as the web app documents it (apps/web/src/lib/theme.ts). Left out
+   * when none is picked or it can't be read; screens then draw as they always did.
+   */
+  theme?: Record<string, unknown>;
 }
 
 /** One slide as the screens show it. */

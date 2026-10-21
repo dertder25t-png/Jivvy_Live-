@@ -24,6 +24,9 @@ pub struct LiveState {
     /// The run sheet's slide on screen; engines without a run sheet (or older ones) leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slide: Option<crate::protocol::Slide>,
+    /// The active theme's body (font, size, colors, background); older engines leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,11 +183,27 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn a_state_with_a_theme_keeps_it_and_one_without_is_unchanged() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../packages/protocol/fixtures/state-theme.json")).unwrap();
+        let state = state_in(&fixture.to_string()).unwrap();
+        assert_eq!(state.theme.unwrap()["font"], "serif");
+        assert_eq!(state_in(r#"{"state":{"slideIndex":1,"black":false}}"#).unwrap().theme, None);
+    }
+
+    #[test]
     fn reads_state_from_acks_and_events_and_ignores_the_rest() {
         let s = state_in(r#"{"v":1,"event":"state","state":{"slideIndex":4,"black":true,"stream":"off"}}"#);
         assert_eq!(
             s,
-            Some(LiveState { slide_index: 4, black: true, stream_wanted: false, recording_wanted: false, slide: None })
+            Some(LiveState {
+                slide_index: 4,
+                black: true,
+                stream_wanted: false,
+                recording_wanted: false,
+                slide: None,
+                theme: None
+            })
         );
         assert!(state_in(r#"{"v":1,"id":"x","ok":true,"state":{"slideIndex":0,"black":false}}"#).is_some());
         assert_eq!(state_in(r#"{"v":1,"event":"something.new"}"#), None);
@@ -261,7 +280,8 @@ mod tests {
                 black: false,
                 stream_wanted: false,
                 recording_wanted: false,
-                slide: None
+                slide: None,
+                theme: None
             })
         );
         engine.lock().unwrap().handle_line(r#"{"v":1,"id":"r","ts":1,"command":{"type":"slide.goto","index":7}}"#);
@@ -272,7 +292,8 @@ mod tests {
                 black: false,
                 stream_wanted: false,
                 recording_wanted: false,
-                slide: None
+                slide: None,
+                theme: None
             })
         );
     }

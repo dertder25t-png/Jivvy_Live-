@@ -1,6 +1,7 @@
 <script lang="ts">
   import { runSheetSlides, type Levels, type RunSheet, type Slide, type StateSnapshot } from "@jivvy/protocol";
-  import Thumb from "./Thumb.svelte";
+  import SlideView from "./SlideView.svelte";
+  import type { Theme } from "./theme";
 
   /**
    * The operator view: what is on the screens, what comes next, the controls, the slide list
@@ -8,6 +9,7 @@
    * Read-only apart from moving the slides, so it is safe to hand a volunteer.
    */
   let {
+    theme,
     live,
     onScreens,
     ready,
@@ -17,6 +19,8 @@
     goto,
     black,
   }: {
+    /** How the screens look (picked on the run sheet screen). */
+    theme: Theme;
     live: StateSnapshot | null;
     onScreens: RunSheet | null;
     ready: boolean;
@@ -100,9 +104,7 @@
         {#if live?.black}
           <span class="note">Screens are black</span>
         {:else if live?.slide}
-          {#if live.slide.image}<Thumb id={live.slide.image} fill />{/if}
-          {#each live.slide.lines as line, i (i)}<div class="over">{line}</div>{/each}
-          {#if live.slide.countdownTo}<div class="note">Countdown</div>{/if}
+          <SlideView slide={live.slide} {theme} />
         {:else if live}
           <span class="note">Slide {current + 1}</span>
         {:else}
@@ -116,8 +118,7 @@
       </div>
       <div class="screen small">
         {#if next}
-          {#if next.slide.image}<Thumb id={next.slide.image} fill />{/if}
-          {#each next.slide.lines as line, i (i)}<div class="over">{line}</div>{/each}
+          <SlideView slide={next.slide} {theme} />
         {:else}
           <span class="note">End of the run sheet</span>
         {/if}
@@ -269,10 +270,6 @@
   }
   .screen.black {
     border-color: var(--orange);
-  }
-  .over {
-    position: relative;
-    text-shadow: 0 0 0.25em #000;
   }
   .note {
     font-size: 14px;

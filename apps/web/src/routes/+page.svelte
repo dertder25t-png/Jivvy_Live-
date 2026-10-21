@@ -7,6 +7,9 @@
   import type { Hymn } from "@jivvy/songs/hymns";
   import { build, imagesIn, newId, newItem, songOf, type Draft, type DraftItem, type ItemKind } from "$lib/runsheet";
   import { getDoc, listDocs, newSongId, planFromDoc, saveDoc, songFromDoc } from "$lib/library";
+  import { ACTIVE_THEME_ID, BUILT_IN, DEFAULT_THEME_ID, activeBody, activeFromDoc, newThemeId, themeBody, themeFromDoc, type Theme } from "$lib/theme";
+  import SlideView from "$lib/SlideView.svelte";
+  import ThemePicker from "$lib/ThemePicker.svelte";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Operator from "$lib/Operator.svelte";
   import SongEditor from "$lib/SongEditor.svelte";
@@ -404,8 +407,62 @@
       planNote = e instanceof Error ? e.message : String(e);
     }
   }
+  // ---- Themes: the look of the screens, one for the whole service ----
+
+  let savedThemes = $state<{ id: string; title: string; theme: Theme }[]>([]);
+  /** The theme in use, kept as a library setting so every device (and later the screens) share it. */
+  let themeId = $state(DEFAULT_THEME_ID);
+  let themesLoaded = $state(false);
+  async function refreshActive() {
+    if (!conn || !ready) return;
+    try {
+      const id = activeFromDoc(await getDoc(conn, "setting", ACTIVE_THEME_ID));
+      if (id) themeId = id;
+    } catch {
+      // nothing chosen yet, or an older church computer: the default
+    }
+  }
+  async function pickTheme(id: string) {
+    themeId = id;
+    if (conn) await saveDoc(conn, { kind: "setting", id: ACTIVE_THEME_ID, title: "Active theme", body: activeBody(id) });
+  }
+  // A theme that was deleted or never existed here falls back to the default.
+  $effect(() => {
+    if (themesLoaded && !themes.some((t) => t.id === themeId)) themeId = DEFAULT_THEME_ID;
+  });
+  const themes = $derived([...BUILT_IN, ...savedThemes]);
+  const theme = $derived((themes.find((t) => t.id === themeId) ?? BUILT_IN.find((t) => t.id === DEFAULT_THEME_ID)!).theme);
+  async function refreshThemes() {
+    if (!conn || !ready) return;
+    try {
+      const found = [];
+      for (const info of await listDocs(conn, "theme")) {
+        const t = themeFromDoc(await getDoc(conn, "theme", info.id));
+        if (t) found.push({ id: info.id, title: info.title, theme: t });
+      }
+      savedThemes = found;
+      themesLoaded = true;
+    } catch {
+      savedThemes = []; // an older church computer without a library: the built-in themes
+    }
+  }
+  $effect(() => {
+    if (ready) void refreshThemes().then(refreshActive);
+  });
+  async function saveTheme(title: string, t: Theme): Promise<string> {
+    if (!conn) return "Not connected.";
+    const id = newThemeId(title);
+    const result = await saveDoc(conn, { kind: "theme", id, title, body: themeBody(t) }, 0);
+    if (!result.ok) return result.message;
+    await refreshThemes();
+    themeId = id;
+    return "Saved to the church computer's library.";
+  }
+
   /** Another device saved or deleted something: open lists follow it. */
   function docChanged(doc: DocInfo) {
+    if (doc.kind === "theme") void refreshThemes();
+    if (doc.kind === "setting" && doc.id === ACTIVE_THEME_ID) void refreshActive();
     if (doc.kind === "song" && hymnsOpen) void refreshSaved();
     if (doc.kind === "plan" && plansOpen && conn) void listDocs(conn, "plan").then((p) => (plans = p), () => {});
   }
@@ -550,7 +607,7 @@
 {/if}
 
 {#if locked || view === "operate"}
-  <Operator {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
+  <Operator {theme} {live} {onScreens} {ready} {levels} {levelsAt} go={(t) => void go(t)} goto={(i) => void goto(i)} black={() => void black()} />
 {:else}
 <main>
   <section class="plan" aria-label="Run sheet">
@@ -729,13 +786,12 @@
   </section>
 
   <section class="live" aria-label="Live">
+    <ThemePicker {themes} selected={themeId} canSave={ready} pick={(id) => void pickTheme(id)} save={saveTheme} />
     <div class="screen" class:black={live?.black}>
       {#if live?.black}
         <span class="note">Screens are black</span>
       {:else if live?.slide}
-        {#if live.slide.image}<Thumb id={live.slide.image} fill />{/if}
-        {#each live.slide.lines as line, i (i)}<div class="over">{line}</div>{/each}
-        {#if live.slide.countdownTo}<div class="note">Countdown</div>{/if}
+        <SlideView slide={live.slide} {theme} />
       {:else if live}
         <span class="note">Slide {live.slideIndex + 1}</span>
       {:else}
@@ -1100,10 +1156,6 @@
   }
   .pick:focus-within {
     outline: 2px solid var(--blue);
-  }
-  .over {
-    position: relative;
-    text-shadow: 0 0 0.25em #000;
   }
   .screen {
     aspect-ratio: 16 / 9;

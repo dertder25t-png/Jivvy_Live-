@@ -42,6 +42,9 @@ pub enum Command {
     RecordingStart,
     #[serde(rename = "recording.stop")]
     RecordingStop,
+    /// The recorded sets, newest first (`recordings` on the ack).
+    #[serde(rename = "recording.list")]
+    RecordingList,
     #[serde(rename = "recording.report")]
     RecordingReport {
         status: RecordingStatus,
@@ -671,6 +674,12 @@ pub struct AckExtras {
     /// doc.put, doc.delete
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved: Option<DocInfo>,
+    /// recording.list
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recordings: Option<Vec<crate::recording::SetInfo>>,
+    /// recording.list: where recordings are kept, as configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recordings_folder: Option<String>,
 }
 
 /// How much of an image the church computer has.
@@ -983,6 +992,7 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         },
         "recording.start" => Command::RecordingStart,
         "recording.stop" => Command::RecordingStop,
+        "recording.list" => Command::RecordingList,
         "recording.report" => {
             let status = match obj.get("status").and_then(Value::as_str) {
                 Some("off") => RecordingStatus::Off,

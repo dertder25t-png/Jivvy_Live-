@@ -26,7 +26,11 @@ describe("songs", () => {
   });
 
   it("sings a hymn's refrain, printed once, after every verse", () => {
-    for (const hymn of HYMNS) expect(hymnSong(hymn).sections.length).toBeGreaterThan(0);
+    for (const hymn of HYMNS) {
+      const song = hymnSong(hymn);
+      expect(song.sections.length).toBeGreaterThan(0);
+      expect(song.arrangement.length).toBeGreaterThan(0);
+    }
     const hymn = HYMNS.find((h) => h.id === "blessed-assurance");
     const song = hymnSong(hymn!);
     expect(sung(song).map((s) => s.label)).toEqual(["Verse 1", "Refrain", "Verse 2", "Refrain", "Verse 3", "Refrain"]);

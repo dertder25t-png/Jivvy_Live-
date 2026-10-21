@@ -105,7 +105,7 @@ impl Devices {
 }
 
 /// Writes a temp file, flushes it to disk and renames it into place.
-fn save_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn save_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = File::create(&tmp)?;

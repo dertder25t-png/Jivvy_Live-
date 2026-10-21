@@ -14,6 +14,7 @@
   import Export from "$lib/Export.svelte";
   import Operator from "$lib/Operator.svelte";
   import PreflightCheck from "$lib/Preflight.svelte";
+  import AlertPush from "$lib/AlertPush.svelte";
   import type { Preflight } from "@jivvy/protocol";
   import SongEditor from "$lib/SongEditor.svelte";
   import Thumb from "$lib/Thumb.svelte";
@@ -680,6 +681,7 @@
   {#if locked}<PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />{/if}
 {:else if view === "preflight"}
   <PreflightCheck {live} {ready} result={preflight} send={(c) => conn?.send(c)} />
+  <AlertPush {ready} send={(c) => conn?.send(c)} />
 {:else}
 <main>
   <section class="plan" aria-label="Run sheet">

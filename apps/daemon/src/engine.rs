@@ -105,7 +105,15 @@ fn device_may(command: &Command) -> bool {
             | Command::DocGet { .. }
             | Command::DocPut { .. }
             | Command::DocDelete { .. }
+            | Command::PushKey
+            | Command::PushSubscribe { .. }
+            | Command::PushTest
     )
+}
+
+/// Whose push subscription a connection sets: its device, or this computer's own screen.
+fn push_owner(session: &Session) -> String {
+    session.device_id.clone().unwrap_or_else(|| "this-computer".into())
 }
 
 struct PendingPairing {
@@ -175,6 +183,12 @@ pub struct Engine {
     preflight_askers: Vec<Outbox>,
     /// The view subscribers last received, so `tick` only sends real changes.
     last_sent: Option<StateSnapshot>,
+    /// Alerts to the tech lead by web push.
+    push: crate::push::Push,
+    /// Since when the wanted stream isn't live, and whether that was alerted yet.
+    stream_down: Option<(Instant, bool)>,
+    /// Since when the live stream is silent, and whether that was alerted yet.
+    silent: Option<(Instant, bool)>,
 }
 
 impl Engine {
@@ -202,7 +216,11 @@ impl Engine {
         let library = crate::library::Library::open(store.dir())
             .map_err(|e| crate::log("engine", format!("the library can't be opened: {e:?}")))
             .ok();
+        let push = crate::push::Push::load(store.dir());
         let mut engine = Engine {
+            push,
+            stream_down: None,
+            silent: None,
             state,
             store,
             slide_count: slide_count.max(1),
@@ -336,6 +354,7 @@ impl Engine {
 
     pub fn tick_at(&mut self, now: Instant) {
         self.advance_loop(now);
+        self.watch_stream(now);
         if self.last_sent.as_ref() != Some(&self.view_at(now)) {
             self.broadcast_at(now);
         }
@@ -343,6 +362,76 @@ impl Engine {
             self.pairing_until = None;
             self.pairing_changed(now);
         }
+    }
+
+    /// The stream reaching the platforms, as screens see it.
+    fn stream_live(&self, now: Instant) -> bool {
+        self.state.stream_wanted
+            && self.stream_report.is_some_and(|(s, at)| {
+                s == StreamStatus::Live && now.saturating_duration_since(at) < STREAM_REPORT_STALE
+            })
+    }
+
+    /// The wanted stream not live for `ALERT_AFTER` is an alert, and so is it coming back.
+    fn watch_stream(&mut self, now: Instant) {
+        if !self.state.stream_wanted {
+            (self.stream_down, self.silent) = (None, None);
+            return;
+        }
+        match (self.stream_live(now), self.stream_down) {
+            (true, Some((_, alerted))) => {
+                self.stream_down = None;
+                if alerted {
+                    self.raise(&protocol::service_alert("stream.up"));
+                }
+            }
+            (true, None) => {}
+            (false, None) => self.stream_down = Some((now, false)),
+            (false, Some((since, false))) if now.saturating_duration_since(since) >= protocol::ALERT_AFTER => {
+                self.stream_down = Some((since, true));
+                self.raise(&protocol::service_alert("stream.down"));
+            }
+            (false, Some(_)) => {}
+        }
+    }
+
+    /// Every channel below `SILENCE_DB` on the live stream for `ALERT_AFTER` is an alert, and
+    /// so is the sound coming back.
+    fn watch_sound(&mut self, peak_db: &[f64], now: Instant) {
+        if !self.stream_live(now) {
+            self.silent = None;
+            return;
+        }
+        let quiet = peak_db.iter().all(|p| *p < protocol::SILENCE_DB);
+        match (quiet, self.silent) {
+            (false, Some((_, alerted))) => {
+                self.silent = None;
+                if alerted {
+                    self.raise(&protocol::service_alert("audio.back"));
+                }
+            }
+            (false, None) => {}
+            (true, None) => self.silent = Some((now, false)),
+            (true, Some((since, false))) if now.saturating_duration_since(since) >= protocol::ALERT_AFTER => {
+                self.silent = Some((since, true));
+                self.raise(&protocol::service_alert("audio.silent"));
+            }
+            (true, Some(_)) => {}
+        }
+    }
+
+    /// Tells every screen, and the tech lead's devices by web push.
+    fn raise(&mut self, alert: &protocol::Alert) {
+        crate::log("engine", format!("alert: {}", alert.message));
+        if let Ok(line) = serde_json::to_vec(&protocol::alert_event(alert)) {
+            self.send_to_subscribers(line);
+        }
+        self.push.alert(&alert.message, alert.kind);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_to(&mut self, url: &str) {
+        self.push.deliver_to(url);
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -421,6 +510,7 @@ impl Engine {
                     }
                 }
                 crate::log("engine", format!("device {device_id} removed"));
+                self.push.forget(&device_id);
                 // Its open connections end now, not at their next command.
                 self.proven.retain(|(device, _, outbox)| {
                     let removed = *device == device_id;
@@ -430,6 +520,34 @@ impl Engine {
                     !removed
                 });
                 return self.devices_ack(id);
+            }
+            Command::PushKey => {
+                return match self.push.public_key() {
+                    Some(k) => protocol::ack_with(id, None, AckExtras { push_key: Some(k), ..Default::default() }),
+                    None => protocol::nack(
+                        id,
+                        ErrorCode::Unavailable,
+                        "alerts by push aren't available on this church computer",
+                    ),
+                };
+            }
+            Command::PushSubscribe { endpoint, p256dh, auth } => {
+                return match self.push.subscribe(&push_owner(session), &endpoint, &p256dh, &auth) {
+                    Ok(()) => protocol::ack(id, None),
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        protocol::nack(id, ErrorCode::BadArguments, "p256dh isn't a valid P-256 key")
+                    }
+                    Err(e) => {
+                        crate::log("engine", format!("push.json save failed: {e}"));
+                        protocol::nack(id, ErrorCode::Unavailable, "could not save; try again")
+                    }
+                };
+            }
+            Command::PushTest => {
+                if self.push.test(&push_owner(session)) {
+                    return protocol::ack(id, None);
+                }
+                return protocol::nack(id, ErrorCode::Unavailable, "turn on alerts on this device first");
             }
             Command::StreamPreflight => {
                 // The test would take the stream's bandwidth.
@@ -497,10 +615,7 @@ impl Engine {
                         .is_some_and(|(_, at)| now.saturating_duration_since(at) < STREAM_REPORT_STALE);
                     if fresh && self.state.stream_wanted {
                         for alert in protocol::stream_alerts(&self.stream_destinations, &destinations) {
-                            crate::log("engine", format!("alert: {}", alert.message));
-                            if let Ok(line) = serde_json::to_vec(&protocol::alert_event(&alert)) {
-                                self.send_to_subscribers(line);
-                            }
+                            self.raise(&alert);
                         }
                     }
                     self.stream_destinations = destinations;
@@ -524,6 +639,7 @@ impl Engine {
             }
             Command::StateGet => {}
             Command::MediaLevels(levels) => {
+                self.watch_sound(&levels.peak_db, Instant::now());
                 // Live meter data: relayed, never saved, never a state change.
                 if let Ok(line) = serde_json::to_vec(&protocol::levels_event(&levels)) {
                     self.send_to_subscribers(line);
@@ -2463,6 +2579,101 @@ mod tests {
         let state = send(&mut e, json!({ "type": "state.get" }))["state"].clone();
         assert_eq!(state["stream"], "live");
         assert!(state.get("streamDestinations").is_none());
+    }
+
+    /// A stand-in for a push service: answers 201 and hands over each request's head and body.
+    fn fake_push_service() -> (String, std::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/push/phone", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { continue };
+                let mut out = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let mut head = String::new();
+                while !head.ends_with("\r\n\r\n") && r.read_line(&mut head).unwrap_or(0) > 0 {}
+                let lower = head.to_ascii_lowercase();
+                let len = lower
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |n| n.trim().parse::<usize>().unwrap());
+                let mut body = vec![0; len];
+                r.read_exact(&mut body).unwrap();
+                let _ = out.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = tx.send((head, body));
+            }
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn a_stream_down_alert_reaches_the_tech_leads_phone_by_web_push() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use web_push_native::p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
+
+        let (mut e, dir) = engine("push", 10);
+        let (url, pushes) = fake_push_service();
+        e.push_to(&url);
+        let key = TestKey::new();
+        let device = pair(&mut e, &key);
+        let mut phone = Phone::new();
+        phone.prove(&mut e, &key);
+
+        // The browser's side of a subscription: its own P-256 key and auth secret.
+        let mut seed = [0u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed).unwrap();
+        let browser = SecretKey::from_slice(&seed).unwrap();
+        let auth = [7u8; 16];
+        let push_key = phone.send(&mut e, json!({ "type": "push.key" }))["pushKey"].as_str().unwrap().to_string();
+        let sub = phone.send(
+            &mut e,
+            json!({ "type": "push.subscribe", "endpoint": "https://push.example/send/phone",
+                    "p256dh": B64.encode(browser.public_key().to_encoded_point(false).as_bytes()),
+                    "auth": B64.encode(auth) }),
+        );
+        assert_eq!(sub["ok"], true, "{sub}");
+        let open = |body: Vec<u8>| -> Value {
+            let plain = web_push_native::decrypt(body, &browser, &web_push_native::Auth::clone_from_slice(&auth));
+            serde_json::from_slice(&plain.unwrap()).unwrap()
+        };
+
+        // Streaming is wanted, and the video process stops reporting.
+        send(&mut e, json!({ "type": "stream.start" }));
+        let now = Instant::now();
+        e.tick_at(now);
+        e.tick_at(now + protocol::ALERT_AFTER + Duration::from_secs(1));
+        let (head, body) = pushes.recv_timeout(Duration::from_secs(20)).expect("a push");
+        let down = protocol::service_alert("stream.down");
+        assert_eq!(open(body), json!({ "message": down.message, "tag": "stream.down" }));
+        assert!(head.to_ascii_lowercase().contains("content-encoding: aes128gcm"), "{head}");
+        // Signed for the real push service with this church computer's key.
+        let vapid = head
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization: vapid t="))
+            .map(|l| &l["authorization: vapid t=".len()..])
+            .unwrap();
+        let (jwt, k) = vapid.split_once(", k=").unwrap();
+        assert_eq!(k.trim(), push_key);
+        let (signed, sig) = jwt.rsplit_once('.').unwrap();
+        let claims: Value = serde_json::from_slice(&B64.decode(signed.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        assert_eq!(claims["aud"], "https://push.example");
+        let public = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            B64.decode(&push_key).unwrap(),
+        );
+        assert!(public.verify(signed.as_bytes(), &B64.decode(sig).unwrap()).is_ok(), "a valid VAPID signature");
+
+        // The "Send test alert" button.
+        assert_eq!(phone.send(&mut e, json!({ "type": "push.test" }))["ok"], true);
+        let (_, body) = pushes.recv_timeout(Duration::from_secs(20)).expect("the test push");
+        assert_eq!(open(body), json!({ "message": protocol::TEST_ALERT_MESSAGE, "tag": "test" }));
+
+        // Removing the device drops its subscription, and the key stays in the data dir.
+        send(&mut e, json!({ "type": "device.remove", "deviceId": device }));
+        assert!(!crate::push::Push::load(&dir).has(&device));
+        assert_eq!(crate::push::Push::load(&dir).public_key(), Some(push_key));
     }
 
     /// An engine that can finish work on other threads, as the real one can.

@@ -117,7 +117,21 @@ export type Command =
    */
   | { type: "doc.put"; kind: string; id: string; title: string; body: Record<string, unknown>; baseRev?: number }
   /** Removes a document (with `baseRev`, only that revision); deleting one that's gone is fine. */
-  | { type: "doc.delete"; kind: string; id: string; baseRev?: number };
+  | { type: "doc.delete"; kind: string; id: string; baseRev?: number }
+  // ---- Alerts by web push (added in v1 without a version bump) ----
+  // The church computer sends its alerts (stream down, no sound, a platform lowered or paused)
+  // by web push (RFC 8030/8291, VAPID) to each device that asked, even with no Jivvy screen
+  // open. A push carries only the alert's words and a tag. Older daemons answer unknown_command.
+  /** The church computer's VAPID public key (`pushKey` on the ack), for `pushManager.subscribe`. */
+  | { type: "push.key" }
+  /**
+   * This device's push subscription, from `PushSubscription.toJSON()`; replaces any it had.
+   * Removing the device drops it. `endpoint`: the push service's https URL; `p256dh`: the
+   * browser's P-256 key (raw, base64url); `auth`: its 16-byte secret (base64url).
+   */
+  | { type: "push.subscribe"; endpoint: string; p256dh: string; auth: string }
+  /** Pushes a test alert to this device's subscription; `unavailable` if it has none. */
+  | { type: "push.test" };
 
 export type CommandType = Command["type"];
 
@@ -189,6 +203,10 @@ function destinationList(x: unknown): StreamDestination[] | null {
 
 /** A P-256 public key, raw uncompressed (0x04 || x || y, 65 bytes), base64url without padding. */
 const PUBLIC_KEY = /^B[A-Za-z0-9_-]{86}$/;
+/** A push service endpoint: an https URL of printable ASCII. */
+const PUSH_ENDPOINT = /^https:\/\/[\x21-\x7e]{1,2040}$/;
+/** A push subscription's 16-byte auth secret, base64url without padding. */
+const PUSH_AUTH = /^[A-Za-z0-9_-]{22}$/;
 /** A 64-byte ECDSA signature (r || s), base64url without padding. */
 const SIGNATURE = /^[A-Za-z0-9_-]{86}$/;
 /** Request and device ids. */
@@ -355,7 +373,16 @@ function parseCommand(raw: unknown): CommandResult {
     case "device.list":
     case "stream.preflight":
     case "runsheet.get":
+    case "push.key":
+    case "push.test":
       return { ok: true, command: { type: raw.type } };
+    case "push.subscribe": {
+      const { endpoint, p256dh, auth } = raw;
+      if (typeof endpoint !== "string" || !PUSH_ENDPOINT.test(endpoint) || typeof p256dh !== "string"
+        || !PUBLIC_KEY.test(p256dh) || typeof auth !== "string" || !PUSH_AUTH.test(auth))
+        return { ok: false, code: "bad_arguments", message: "push.subscribe needs an https endpoint, a P-256 p256dh key and a 16-byte auth (base64url)" };
+      return { ok: true, command: { type: "push.subscribe", endpoint, p256dh, auth } };
+    }
     case "media.put": {
       const ok = isMediaId(raw.id) && typeof raw.offset === "number" && Number.isInteger(raw.offset) && raw.offset >= 0
         && typeof raw.data === "string" && raw.data.length <= MAX_CHUNK_BASE64 && BASE64.test(raw.data);
@@ -684,6 +711,8 @@ export interface AckExtras {
   doc?: Doc;
   /** doc.put, doc.delete: the document as saved (a delete is a revision too, so revisions never repeat). */
   saved?: DocInfo;
+  /** push.key: the church computer's VAPID public key (raw P-256, base64url). */
+  pushKey?: string;
 }
 
 /** A document in the church computer's library, without its body. */
@@ -734,8 +763,38 @@ export type DaemonEvent =
  * `stream.lowered`: a platform gets a lower quality because the upload is slow.
  * `stream.paused`: a platform stopped because the upload can't carry it too.
  * `stream.resumed`: a paused platform is streaming again.
+ * Added in v1: `stream.down` / `stream.up` (the stream isn't reaching the platforms, and is
+ * again) and `audio.silent` / `audio.back` (no sound while streaming, and sound again). These
+ * are about the whole stream, so `destinationId`, `name` and `quality` are "". Screens show an
+ * alert of a kind they don't know by its `message`.
  */
-export type AlertKind = "stream.lowered" | "stream.paused" | "stream.resumed";
+export type AlertKind = "stream.lowered" | "stream.paused" | "stream.resumed" | ServiceAlertKind;
+export type ServiceAlertKind = "stream.down" | "stream.up" | "audio.silent" | "audio.back";
+
+/** How long the stream is down, or silent, before it is an alert. */
+export const ALERT_AFTER_MS = 10_000;
+/** Below this peak level (dBFS) on every channel, the stream counts as silent. */
+export const SILENCE_DB = -60;
+
+/** The words of the whole-stream alerts. Shared by both daemons (fixtures/service-alerts.json). */
+export const SERVICE_ALERT_MESSAGES: Record<ServiceAlertKind, string> = {
+  "stream.down": "The stream is down: it isn't reaching the platforms. Jivvy keeps trying by itself; check the church computer's internet.",
+  "stream.up": "The stream is live again.",
+  "audio.silent": "No sound on the stream: check the microphones and the sound desk.",
+  "audio.back": "Sound is back on the stream.",
+};
+
+export const serviceAlert = (kind: ServiceAlertKind): Alert =>
+  ({ kind, destinationId: "", name: "", quality: "", message: SERVICE_ALERT_MESSAGES[kind] });
+
+/** What the "Send test alert" button pushes, with the tag "test". */
+export const TEST_ALERT_MESSAGE = "Test alert from Jivvy Live: alerts reach this device.";
+
+/** A web push's payload (JSON, UTF-8): only the alert's words and a tag (its kind, or "test"). */
+export interface PushPayload {
+  message: string;
+  tag: string;
+}
 
 export interface Alert {
   kind: AlertKind;

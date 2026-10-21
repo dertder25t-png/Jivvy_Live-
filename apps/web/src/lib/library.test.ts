@@ -30,6 +30,7 @@ function fakeDaemon(): Sender {
         const key = `${c.kind}/${c.id}`;
         const d = docs.get(key);
         if (!d) return { ...base, ok: false, code: "bad_arguments", message: "none" };
+        if (c.baseRev !== undefined && c.baseRev !== d.rev) return { ...base, ok: false, code: "conflict", message: "changed" };
         docs.delete(key);
         return { ...base, ok: true };
       }
@@ -61,7 +62,16 @@ describe("library", () => {
     const song = { title: "Amazing Grace", sections: [{ id: "v1", label: "Verse 1", text: "Amazing grace" }], arrangement: ["v1"] };
     await saveDoc(conn, { kind: "song", id: "amazing-grace", title: "Amazing Grace", body: song });
     expect((await listDocs(conn, "song")).map((d) => d.id)).toEqual(["amazing-grace"]);
-    await deleteDoc(conn, "song", "amazing-grace");
+    // Another device saved after this one (revision 1 -> 2): a delete from the old copy is refused and nothing is lost.
+    await saveDoc(conn, { kind: "song", id: "amazing-grace", title: "Amazing Grace", body: song }, 1);
+    expect(await deleteDoc(conn, "song", "amazing-grace", 1)).toEqual({
+      ok: false,
+      conflict: true,
+      message: "changed",
+    });
+    expect((await listDocs(conn, "song")).map((d) => d.id)).toEqual(["amazing-grace"]);
+    // From the current revision it goes, and the doc leaves the list.
+    expect(await deleteDoc(conn, "song", "amazing-grace", 2)).toEqual({ ok: true });
     expect(await listDocs(conn, "song")).toEqual([]);
   });
 });

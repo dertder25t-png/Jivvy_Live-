@@ -321,8 +321,14 @@
   /** Removes a song from the church computer's library; this run sheet keeps its own copy. */
   async function deleteSong(item: DraftItem) {
     if (!conn || !item.libraryId || locked || !confirm(`Delete '${item.title}'? This can't be undone.`)) return;
+    const here = conn.daemonId ?? undefined;
+    const baseRev = item.libraryDaemon === here ? (item.libraryRev ?? 0) : 0;
     try {
-      await deleteDoc(conn, "song", item.libraryId);
+      const result = await deleteDoc(conn, "song", item.libraryId, baseRev);
+      if (!result.ok) {
+        songNotes[item.id] = result.conflict ? "Changed on another device; reload before deleting." : result.message;
+        return;
+      }
       item.libraryId = undefined;
       item.libraryRev = undefined;
       songNotes[item.id] = "Deleted from the church computer's library.";
@@ -439,7 +445,11 @@
       planPending.delete(info.id); // no queued save may bring it back
       if (draft.id === info.id) clearTimeout(planTimer);
       await planRun;
-      await deleteDoc(conn, "plan", info.id);
+      const result = await deleteDoc(conn, "plan", info.id, info.rev);
+      if (!result.ok) {
+        planNote = result.conflict ? "Changed on another device; reload before deleting." : result.message;
+        return;
+      }
       delete planRevs[key];
       if (planHeld === key) planHeld = "";
       plans = plans.filter((p) => p.id !== info.id);

@@ -693,6 +693,8 @@ export interface AckExtras {
   saved?: DocInfo;
   /** recording.list: newest first. */
   recordings?: RecordingSet[];
+  /** recording.list: where recordings are kept on the church computer, as configured. */
+  recordingsFolder?: string;
 }
 
 /** One recorded set (a folder of video parts) on the church computer. */

@@ -132,8 +132,39 @@ pub const SET_FILE: &str = "set.json";
 #[serde(rename_all = "camelCase")]
 pub struct SetNote {
     pub version: u32,
+    #[serde(default)]
     pub plan_id: String,
+    #[serde(default)]
     pub title: String,
+    /// When the recording was stopped (ms since the epoch); missing for a set still going, or
+    /// one from before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+}
+
+/// The recording was stopped: keeps the end time in the set's `set.json` (the MP4 files'
+/// times are the conversion's, not the recording's). Best effort.
+pub fn note_end(data_dir: &Path, folder: &Path, now_ms: u64) {
+    let Some(current) = load_current(data_dir) else { return };
+    let path = folder.join(&current.set).join(SET_FILE);
+    let mut note: SetNote = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(SetNote { version: 1, plan_id: String::new(), title: String::new(), ended_ms: None });
+    note.ended_ms = Some(now_ms);
+    if let Ok(bytes) = serde_json::to_vec(&note)
+        && path.parent().is_some_and(Path::is_dir)
+    {
+        let _ = crate::write_atomic(&path, &bytes);
+    }
+}
+
+/// The folder the recorder last reported using (`media-status.json`), for when `recording.json`
+/// can't be read now.
+pub fn last_good_folder(data_dir: &Path) -> Option<PathBuf> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join(crate::media::STATUS_FILE)).ok()?).ok()?;
+    v.get("recording")?.get("folder")?.as_str().filter(|f| !f.is_empty()).map(PathBuf::from)
 }
 
 /// The engine, as a recording is asked for: remembers the live plan (`None`: no run sheet set).
@@ -141,7 +172,7 @@ pub fn note_plan(data_dir: &Path, plan: Option<(&str, &str)>) {
     let path = data_dir.join(PLAN_NOTE_FILE);
     match plan {
         Some((id, title)) => {
-            let note = SetNote { version: 1, plan_id: id.into(), title: title.into() };
+            let note = SetNote { version: 1, plan_id: id.into(), title: title.into(), ended_ms: None };
             if let Ok(bytes) = serde_json::to_vec(&note) {
                 let _ = crate::write_atomic(&path, &bytes);
             }
@@ -301,51 +332,65 @@ pub struct SetInfo {
 }
 
 fn set_info(set_dir: &Path, folder: String, started_ms: u64, is_current: bool) -> SetInfo {
-    let mut bytes = 0;
-    let mut last_write = 0;
-    for e in std::fs::read_dir(set_dir).into_iter().flatten().flatten() {
-        let Ok(meta) = e.metadata() else { continue };
-        bytes += meta.len();
-        if e.file_name().to_string_lossy().starts_with("part-")
-            && let Ok(t) = meta.modified()
-            && let Ok(since) = t.duration_since(std::time::UNIX_EPOCH)
-        {
-            last_write = last_write.max(since.as_millis() as u64);
-        }
-    }
+    let bytes = std::fs::read_dir(set_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
     let mkv = parts(set_dir, "mkv");
-    let done = mkv.iter().filter(|(n, _)| set_dir.join(part_name(*n, "mp4")).exists()).count();
-    let any_mp4 = !parts(set_dir, "mp4").is_empty();
+    let mp4_parts = parts(set_dir, "mp4").len();
+    // Parts still waiting for their MP4; converted parts whose MKV is gone don't count here.
+    let pending = mkv.iter().filter(|(n, _)| !set_dir.join(part_name(*n, "mp4")).exists()).count();
     let mp4 = if is_current {
         "recording"
-    } else if mkv.is_empty() && !any_mp4 {
+    } else if mkv.is_empty() && mp4_parts == 0 {
         "none"
-    } else if done == mkv.len() {
+    } else if pending == 0 {
         "ready"
-    } else if done > 0 {
+    } else if mp4_parts > 0 {
         "converting"
     } else {
         "waiting"
     };
     let note: Option<SetNote> =
         std::fs::read(set_dir.join(SET_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    // The recorded end time; sets from before it was kept use the MKVs' times (never the MP4s':
+    // those are when the conversion ran).
+    let ended = note.as_ref().and_then(|n| n.ended_ms).or_else(|| {
+        mkv.iter()
+            .filter_map(|(_, p)| std::fs::metadata(p).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .max()
+    });
     SetInfo {
         folder,
         started_ms,
-        duration_secs: (last_write > started_ms).then(|| (last_write - started_ms) / 1000),
+        duration_secs: ended.filter(|&e| e > started_ms).map(|e| (e - started_ms) / 1000),
         bytes,
         mp4,
-        plan_id: note.as_ref().map(|n| n.plan_id.clone()),
+        plan_id: note.as_ref().map(|n| n.plan_id.clone()).filter(|t| !t.is_empty()),
         label: note.map(|n| n.title).filter(|t| !t.trim().is_empty()),
     }
 }
 
 /// Every set in the recordings folder, newest first. Folders that aren't sets are skipped.
-pub fn list(data_dir: &Path, folder: &Path) -> Vec<SetInfo> {
+/// An error when the folder can't be read (a missing folder is fine only if its parent is
+/// there: nothing recorded yet, rather than a drive that isn't plugged in).
+pub fn list(data_dir: &Path, folder: &Path) -> Result<Vec<SetInfo>, String> {
     let current = load_current(data_dir).map(|c| c.set);
-    let mut out: Vec<SetInfo> = std::fs::read_dir(folder)
-        .into_iter()
-        .flatten()
+    let entries = match std::fs::read_dir(folder) {
+        Ok(e) => e,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && folder.parent().is_none_or(|p| p.as_os_str().is_empty() || p.is_dir()) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(_) => return Err("The recordings folder isn't available (is the drive plugged in?).".into()),
+    };
+    let mut out: Vec<SetInfo> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
         .filter_map(|e| {
@@ -356,7 +401,7 @@ pub fn list(data_dir: &Path, folder: &Path) -> Vec<SetInfo> {
         })
         .collect();
     out.sort_by(|a, b| b.started_ms.cmp(&a.started_ms).then_with(|| b.folder.cmp(&a.folder)));
-    out
+    Ok(out)
 }
 
 /// `recording` in `media-status.json`: what the System screen shows.
@@ -560,9 +605,22 @@ mod tests {
         note_plan(&data, Some(("sunday", "Sunday 9:30")));
         let a = open_part(&data, &folder, 1_791_646_212_000).unwrap();
         std::fs::write(&a.file, vec![0u8; 2000]).unwrap();
+        note_end(&data, &folder, 1_791_646_212_000 + 4_320_000); // stopped 1 h 12 min later
         finish(&data);
-        let sets = list(&data, &folder);
+        // Converting later must not stretch the length (the MP4 is written long after), and a
+        // set whose MKV is gone still counts as converted.
+        std::fs::write(a.set_dir.join("part-001.mp4"), vec![0u8; 10]).unwrap();
+        std::fs::remove_file(&a.file).unwrap();
+        let sets = list(&data, &folder).unwrap();
+        assert_eq!((sets[0].duration_secs, sets[0].mp4), (Some(4320), "ready"));
+        std::fs::write(&a.file, vec![0u8; 2000]).unwrap();
+        std::fs::remove_file(a.set_dir.join("part-001.mp4")).unwrap();
+        let sets = list(&data, &folder).unwrap();
         assert_eq!(sets.len(), 2);
+        assert!(list(&data, &data.join("gone").join("recordings")).is_err(), "a missing drive is not 'no recordings'");
+        assert!(list(&data, &data.join("later")).unwrap().is_empty(), "a folder not made yet is empty");
+        std::fs::write(data.join(crate::media::STATUS_FILE), r#"{"recording":{"folder":"D:/rec"}}"#).unwrap();
+        assert_eq!(last_good_folder(&data), Some(PathBuf::from("D:/rec")));
         assert_eq!(
             (sets[0].folder.as_str(), sets[0].label.as_deref(), sets[0].plan_id.as_deref(), sets[0].mp4),
             ("2026-10-10_15-30-12Z", Some("Sunday 9:30"), Some("sunday"), "waiting")

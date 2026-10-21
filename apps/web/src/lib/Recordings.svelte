@@ -11,6 +11,7 @@
 
   let sets = $state<RecordingSet[] | null>(null);
   let error = $state("");
+  let folder = $state("");
   let loading = $state(false);
 
   async function refresh() {
@@ -21,7 +22,10 @@
     loading = false;
     if (!ack) error = "Not connected.";
     else if (!ack.ok) error = ack.code === "unknown_command" ? "This church computer is too old to list recordings." : ack.message;
-    else sets = ack.recordings ?? [];
+    else {
+      sets = ack.recordings ?? [];
+      folder = ack.recordingsFolder ?? "";
+    }
   }
   // Loads when opened and again if the connection comes back.
   $effect(() => {
@@ -34,8 +38,8 @@
     <div>
       <h2>Recordings</h2>
       <p class="hint">
-        Open the recordings folder on the church computer to watch or copy them (Jivvy Live's data folder, then
-        <code>recordings</code>). Each MP4 appears there a little while after the recording stops.
+        Open the recordings folder on the church computer to watch or copy them{#if folder}: <code>{folder}</code>{/if}.
+        Each MP4 appears there a little while after the recording stops.
       </p>
     </div>
     <button onclick={refresh} disabled={!ready || loading}>{loading ? "Loading…" : "Refresh"}</button>

@@ -525,12 +525,42 @@ impl Engine {
                 next.recording_wanted = true
             }
             Command::RecordingList => {
-                let folder =
-                    crate::recording::load_config(self.store.dir()).unwrap_or_default().folder(self.store.dir());
-                let recordings = crate::recording::list(self.store.dir(), &folder);
-                return protocol::ack_with(id, None, AckExtras { recordings: Some(recordings), ..Default::default() });
+                let dir = self.store.dir();
+                let folder = match crate::recording::load_config(dir) {
+                    Ok(c) => c.folder(dir),
+                    // recording.json is broken: the recorder keeps its last good folder.
+                    Err(_) => match crate::recording::last_good_folder(dir) {
+                        Some(f) => f,
+                        None => {
+                            return protocol::nack(
+                                id,
+                                ErrorCode::Unavailable,
+                                "Can't read the recording settings (recording.json).",
+                            );
+                        }
+                    },
+                };
+                return match crate::recording::list(dir, &folder) {
+                    Ok(recordings) => protocol::ack_with(
+                        id,
+                        None,
+                        AckExtras {
+                            recordings: Some(recordings),
+                            recordings_folder: Some(folder.display().to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                    Err(m) => protocol::nack(id, ErrorCode::Unavailable, &m),
+                };
             }
-            Command::RecordingStop => next.recording_wanted = false,
+            Command::RecordingStop => {
+                if self.state.recording_wanted
+                    && let Ok(config) = crate::recording::load_config(self.store.dir())
+                {
+                    crate::recording::note_end(self.store.dir(), &config.folder(self.store.dir()), crate::now_ms());
+                }
+                next.recording_wanted = false
+            }
             Command::RecordingReport { status, low_disk } => {
                 self.recording_report = Some((status, low_disk, Instant::now()));
                 self.tick();

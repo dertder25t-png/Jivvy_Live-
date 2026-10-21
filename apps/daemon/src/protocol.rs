@@ -677,6 +677,9 @@ pub struct AckExtras {
     /// recording.list
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recordings: Option<Vec<crate::recording::SetInfo>>,
+    /// recording.list: where recordings are kept, as configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recordings_folder: Option<String>,
 }
 
 /// How much of an image the church computer has.

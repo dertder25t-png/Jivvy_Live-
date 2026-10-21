@@ -151,9 +151,16 @@ impl Destination {
         if key.is_empty() { base.to_string() } else { format!("{base}/{key}") }
     }
 
-    /// Scheme, host and app only: safe to show and log.
+    /// The address as screens and logs may show it: scheme, host and app only, and only when
+    /// the key is a field of its own. Where the key may be part of the address (an RTMP
+    /// address with a second path part, or a single part that might be a key), just the host.
     pub fn display_server(&self) -> String {
-        redact_url(self.url.trim())
+        let Some(a) = parse_address(&self.url) else { return "<invalid url>".into() };
+        let app_is_safe = self.is_hls() || !self.key.trim().is_empty();
+        match a.segments.first() {
+            Some(app) if app_is_safe => format!("{}/{app}", a.server),
+            _ => a.server,
+        }
     }
 
     /// Removes the key (and anything after the app path) from text such as an error message.
@@ -167,6 +174,26 @@ impl Destination {
         }
         out
     }
+}
+
+/// A server address taken apart once, for everything that decides what may be shown or
+/// counts as a key: `server` is `scheme://host[:port]` (never `user:password@`), `segments`
+/// the non-empty path parts. The query and fragment are dropped (HLS keys live there).
+struct Address {
+    server: String,
+    segments: Vec<String>,
+}
+
+fn parse_address(url: &str) -> Option<Address> {
+    let url = url.trim().split(['?', '#']).next().unwrap_or("");
+    let (scheme, rest) = url.split_once("://")?;
+    let mut parts = rest.split('/');
+    let host = parts.next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    Some(Address {
+        server: format!("{scheme}://{host}"),
+        segments: parts.filter(|p| !p.is_empty()).map(String::from).collect(),
+    })
 }
 
 /// `scheme://host[:port]/app` with any further path (where RTMP keys go) and any query
@@ -189,8 +216,11 @@ pub fn validate(d: &Destination) -> Result<(), String> {
     if !(url.starts_with("rtmp://") || url.starts_with("rtmps://") || d.is_hls()) {
         return Err(format!("{}: the server address must start with rtmps://, rtmp:// or https://", d.id));
     }
-    let redacted = redact_url(url);
-    let host = redacted.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or("");
+    if url.chars().any(char::is_whitespace) {
+        return Err(format!("{}: the server address can't contain spaces", d.id));
+    }
+    let host = parse_address(url).map(|a| a.server).unwrap_or_default();
+    let host = host.split("://").nth(1).unwrap_or("");
     if host.is_empty() {
         return Err(format!("{}: the server address has no host", d.id));
     }
@@ -210,8 +240,12 @@ pub fn validate(d: &Destination) -> Result<(), String> {
         }
         return Ok(());
     }
-    if d.key.trim().is_empty() && url.trim_end_matches('/').matches('/').count() < 4 {
+    if !d.has_key() {
         return Err(format!("{}: no stream key", d.id));
+    }
+    // Spaces and / ? # would let a key add options or change the address it is appended to.
+    if d.key.chars().any(|c| c.is_whitespace() || c.is_control() || "/?#".contains(c)) {
+        return Err(format!("{}: the stream key can't contain spaces or / ? #", d.id));
     }
     Ok(())
 }
@@ -233,6 +267,180 @@ pub fn load_config(dir: &Path) -> Result<StreamConfig, String> {
         return Err(format!("{CONFIG_FILE} has version {}, expected {CONFIG_VERSION}", c.version));
     }
     Ok(c)
+}
+
+impl Destination {
+    /// The address with its `cid` (the HLS key) taken out and every other query setting kept.
+    pub fn url_without_cid(&self) -> String {
+        let url = self.url.trim();
+        let Some((base, query)) = url.split_once('?') else { return url.to_string() };
+        let rest: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("cid=")).collect();
+        if rest.is_empty() { base.to_string() } else { format!("{base}?{}", rest.join("&")) }
+    }
+
+    /// Whether a stream key is set, in the `key` field or written into the address.
+    pub fn has_key(&self) -> bool {
+        if !self.key.trim().is_empty() {
+            return true;
+        }
+        if self.is_hls() {
+            let k = self.url_param("cid");
+            !k.is_empty() && !k.starts_with('$')
+        } else {
+            parse_address(&self.url).is_some_and(|a| a.segments.len() >= 2)
+        }
+    }
+}
+
+/// The settings screen's view of `stream.json`: everything except the keys (`hasKey` only).
+/// An address that carries its key is cut back to scheme, host and app.
+pub fn config_view(config: &StreamConfig) -> serde_json::Value {
+    use serde_json::{Map, Value, json};
+    let destinations: Vec<Value> = config
+        .destinations
+        .iter()
+        .map(|d| {
+            let mut o = Map::new();
+            o.insert("id".into(), json!(d.id));
+            o.insert("name".into(), json!(d.name));
+            o.insert("url".into(), json!(d.display_server()));
+            o.insert("enabled".into(), json!(d.enabled));
+            o.insert("hasKey".into(), json!(d.has_key()));
+            if let Some(q) = &d.max_quality {
+                o.insert("maxQuality".into(), json!(q));
+            }
+            if let Some(w) = &d.when_short {
+                o.insert("whenShort".into(), json!(w));
+            }
+            Value::Object(o)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("destinations".into(), Value::Array(destinations));
+    if let Some(mode) = config.bandwidth.as_ref().and_then(|b| b.mode.as_ref()) {
+        out.insert("bandwidth".into(), json!({ "mode": mode }));
+    }
+    Value::Object(out)
+}
+
+/// Builds the new config from what `stream.config.set` sent, on top of the saved one: a
+/// destination sent without a key keeps its saved key (and its address, if that is shown
+/// unchanged), so keys never have to come back to a screen. Checks everything the video
+/// process checks, with messages for a tech lead.
+pub fn config_from_input(
+    saved: &StreamConfig,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> Result<StreamConfig, String> {
+    use serde_json::Value;
+    let list = input.get("destinations").and_then(Value::as_array).ok_or("The destinations list is missing.")?;
+    let text = |o: &serde_json::Map<String, Value>, field: &str, max: usize| -> Result<Option<String>, String> {
+        match o.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if s.chars().count() <= max && !s.chars().any(char::is_control) => {
+                Ok(Some(s.trim().to_string()))
+            }
+            Some(_) => Err(format!("{field} is not valid (text of at most {max} characters)")),
+        }
+    };
+    let mut destinations: Vec<Destination> = Vec::new();
+    for item in list {
+        let o = item.as_object().ok_or("Each destination must be an object.")?;
+        let id = text(o, "id", 64)?.unwrap_or_default();
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err("Each destination needs an id of letters, numbers, - and _.".into());
+        }
+        if destinations.iter().any(|d| d.id == id) {
+            return Err(format!("Two destinations share the id {id}. Each one needs its own."));
+        }
+        let name = text(o, "name", crate::protocol::MAX_DEVICE_NAME)?.unwrap_or_default();
+        let url = text(o, "url", 2048)?.unwrap_or_default();
+        let new_key = text(o, "key", 512)?.filter(|k| !k.is_empty());
+        let enabled = o.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        let old = saved.destinations.iter().find(|d| d.id == id);
+        let (url, key) = match (new_key, old) {
+            // A new key for an HLS address as shown: keep its other settings (e.g. copy=1), drop the old cid.
+            (Some(k), Some(old)) if old.is_hls() && url == old.display_server() => (old.url_without_cid(), k),
+            (Some(k), _) => (url, k),
+            // The address as the screen was shown it: keep the saved one, which may hold the key.
+            (None, Some(old)) if url == old.display_server() => (old.url.clone(), old.key.clone()),
+            // Another server must never receive the saved key: it has to be entered again.
+            (None, Some(old)) if enabled && old.has_key() => {
+                let label = if name.is_empty() { id.clone() } else { name.clone() };
+                return Err(format!("{label}: the server address changed, so enter the stream key again."));
+            }
+            (None, _) => (url, String::new()),
+        };
+        destinations.push(Destination {
+            id,
+            name,
+            url,
+            key,
+            enabled,
+            max_quality: text(o, "maxQuality", 16)?.filter(|q| !q.is_empty()),
+            when_short: text(o, "whenShort", 16)?.filter(|q| !q.is_empty()),
+        });
+    }
+    let mode = match input.get("bandwidth").and_then(|b| b.get("mode")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if m == "auto" || m == "advanced" => Some(m.clone()),
+        Some(_) => return Err("The bandwidth mode must be Auto or Advanced.".into()),
+    };
+    if mode.as_deref() != Some("advanced") {
+        // Per-platform limits only mean something in Advanced mode; don't keep stale ones.
+        for d in &mut destinations {
+            (d.max_quality, d.when_short) = (None, None);
+        }
+    }
+    let config = StreamConfig {
+        version: CONFIG_VERSION,
+        destinations,
+        bandwidth: mode.map(|m| BandwidthConfig { mode: Some(m) }),
+    };
+    for d in config.destinations.iter().filter(|d| d.enabled) {
+        // validate() leads with the id; a name reads better.
+        validate(d).map_err(|e| match (d.name.is_empty(), e.strip_prefix(&format!("{}: ", d.id))) {
+            (false, Some(rest)) => format!("{}: {rest}", d.name),
+            _ => e,
+        })?;
+    }
+    if let Some(problem) = prefs(&config).1.into_iter().next() {
+        return Err(problem);
+    }
+    Ok(config)
+}
+
+/// Saves `config` as `stream.json` without ever leaving a half-written file: written to a
+/// uniquely named temp file (removed again if anything fails), flushed, then renamed into
+/// place, so the previous file stays whole until the new one is complete. The file keeps the
+/// old file's permissions (a new one is private to the user on Unix). No backup copy is kept:
+/// it would hold keys the tech lead just removed.
+pub fn save_config(dir: &Path, config: &StreamConfig) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(config)?;
+    let path = dir.join(CONFIG_FILE);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!("{CONFIG_FILE}.{}-{nanos}.tmp", std::process::id()));
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut f = options.open(&tmp)?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            f.set_permissions(meta.permissions())?;
+        }
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    // From an earlier version of this screen: a copy of the file as it was, removed keys included.
+    let _ = std::fs::remove_file(dir.join(format!("{CONFIG_FILE}.bak")));
+    Ok(())
 }
 
 /// A failure in words a tech lead can act on. The raw text (scrubbed of the key) goes to

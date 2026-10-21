@@ -21,6 +21,7 @@
  * Which theme is in use is a "setting" document, id "active-theme": { "v": 1, "themeId": "..." }.
  * Add fields, never rename or remove, and keep reading v 1: the native lyric layer (apps/daemon/src/lyrics.rs) will read
  * these same bodies. The three font names are a fixed list; each renderer picks its own face.
+ * Stream lyric layer: sans, serif and mono (and bold: false) all fall back to its one face, the system bold sans (Segoe UI Bold, else Arial Bold, else DejaVu Sans Bold).
  */
 import type { Doc } from "@jivvy/protocol";
 

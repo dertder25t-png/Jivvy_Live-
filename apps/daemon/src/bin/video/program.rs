@@ -319,15 +319,20 @@ impl Program {
 
         // Lyric layer: drawn only when the text changes, then reused for every frame.
         let (feed, font, w, h) = (self.feed.clone(), self.font, self.cfg.width, self.cfg.height);
-        let cache: Mutex<(Option<Vec<String>>, Option<gst_video::VideoOverlayComposition>)> = Mutex::default();
+        // Redrawn when the text or the active theme's style changes.
+        type Drawn = Option<(Vec<String>, lyrics::Style)>;
+        let cache: Mutex<(Drawn, Option<gst_video::VideoOverlayComposition>)> = Mutex::default();
         let face = ab_glyph::FontRef::try_from_slice(font).map_err(|e| format!("font: {e}"))?;
         get("lyrics")?.connect("draw", false, move |_| {
-            let lines = lines_for(feed.live.lock().unwrap().as_ref());
+            let (lines, style) = {
+                let live = feed.live.lock().unwrap();
+                (lines_for(live.as_ref()), lyrics::Style::from_theme(live.as_ref().and_then(|s| s.theme.as_ref())))
+            };
             let mut c = cache.lock().unwrap();
-            if c.0.as_ref() != Some(&lines) {
+            if c.0.as_ref().is_none_or(|(l, s)| *l != lines || *s != style) {
                 let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-                c.1 = lyrics::render(&face, &refs, w, h, &lyrics::Style::default()).and_then(to_composition);
-                c.0 = Some(lines.clone());
+                c.1 = lyrics::render(&face, &refs, w, h, &style).and_then(to_composition);
+                c.0 = Some((lines.clone(), style));
                 *feed.overlay.lock().unwrap() = lines;
                 feed.overlay_renders.fetch_add(1, Ordering::Relaxed);
             }

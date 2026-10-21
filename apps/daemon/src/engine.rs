@@ -105,6 +105,8 @@ fn device_may(command: &Command) -> bool {
             | Command::DocGet { .. }
             | Command::DocPut { .. }
             | Command::DocDelete { .. }
+            | Command::LicenseGet
+            | Command::LicenseSet { .. }
     )
 }
 
@@ -149,6 +151,8 @@ pub struct Engine {
     /// The body of the active theme (the "active-theme" setting names it), read from the library
     /// whenever a theme or setting is saved; screens get it in the state.
     theme: Option<serde_json::Value>,
+    /// The license key and trial, checked offline; never stops a service.
+    license: crate::license::License,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -202,6 +206,7 @@ impl Engine {
         let library = crate::library::Library::open(store.dir())
             .map_err(|e| crate::log("engine", format!("the library can't be opened: {e:?}")))
             .ok();
+        let license = crate::license::License::load(store.dir(), crate::license::public_key(), crate::now_ms());
         let mut engine = Engine {
             state,
             store,
@@ -217,6 +222,7 @@ impl Engine {
             last_shown_change: Instant::now(),
             library,
             theme: None,
+            license,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -253,6 +259,12 @@ impl Engine {
             black: self.state.black,
             since_last_change: self.last_shown_change.elapsed(),
         })
+    }
+
+    /// The license and trial; the notice only outside a service.
+    fn license_ack(&self, id: &str) -> Ack {
+        let license = self.license.status(crate::now_ms(), self.in_service());
+        protocol::ack_with(id, None, AckExtras { license: Some(license), ..Default::default() })
     }
 
     /// How many slides there are: the run sheet's, else `--slides`. Never 0.
@@ -447,6 +459,21 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
+            Command::LicenseGet => return self.license_ack(id),
+            Command::LicenseSet { key } => {
+                use crate::license::SetError;
+                match self.license.set(&key.0) {
+                    Ok(_) => return self.license_ack(id),
+                    Err(SetError::Invalid) => {
+                        let message = "That license key isn't valid. Copy it again from live.jivvy.org, all of it.";
+                        return protocol::nack(id, ErrorCode::BadArguments, message);
+                    }
+                    Err(SetError::Save(e)) => {
+                        crate::log("engine", format!("license.key save failed: {e}"));
+                        return protocol::nack(id, ErrorCode::Unavailable, "could not save; try again");
+                    }
+                }
+            }
             Command::MediaPut { id: media, offset, data, last } => {
                 return self.media_put(id, &media, offset, &data, last);
             }

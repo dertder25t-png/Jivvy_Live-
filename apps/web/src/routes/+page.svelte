@@ -12,6 +12,7 @@
   import ThemePicker from "$lib/ThemePicker.svelte";
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Export from "$lib/Export.svelte";
+  import License from "$lib/License.svelte";
   import Operator from "$lib/Operator.svelte";
   import PreflightCheck from "$lib/Preflight.svelte";
   import type { Preflight } from "@jivvy/protocol";
@@ -590,6 +591,7 @@
       <button type="submit">{ready ? "Reconnect" : "Connect"}</button>
     </form>
     <Export {ready} sender={() => conn} beforeExport={savePlansNow} />
+    <License {ready} send={(c) => conn?.send(c)} />
   {/if}
   <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
     {locked ? "Unlock" : "Lock for volunteers"}

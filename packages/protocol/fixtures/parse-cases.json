@@ -111,6 +111,10 @@
     {"name": "doc.put with a body that isn't an object", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"doc.put\",\"kind\":\"song\",\"id\":\"x\",\"title\":\"\",\"body\":[1]}}", "expect": {"ok": false, "code": "bad_arguments", "id": "a"}},
     {"name": "doc.put with a negative baseRev", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"doc.put\",\"kind\":\"song\",\"id\":\"x\",\"title\":\"\",\"body\":{},\"baseRev\":-1}}", "expect": {"ok": false, "code": "bad_arguments", "id": "a"}},
     {"name": "doc.delete", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"doc.delete\",\"kind\":\"song\",\"id\":\"x\",\"baseRev\":0}}", "expect": {"ok": true, "command": {"type": "doc.delete", "kind": "song", "id": "x", "baseRev": 0}}},
-    {"name": "doc.delete with a bad id", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"doc.delete\",\"kind\":\"song\",\"id\":\"a/b\"}}", "expect": {"ok": false, "code": "bad_arguments", "id": "a"}}
+    {"name": "doc.delete with a bad id", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"doc.delete\",\"kind\":\"song\",\"id\":\"a/b\"}}", "expect": {"ok": false, "code": "bad_arguments", "id": "a"}},
+    {"name": "license.get", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"license.get\"}}", "expect": {"ok": true, "command": {"type": "license.get"}}},
+    {"name": "license.set trims the pasted key", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"license.set\",\"key\":\" JL1.eyJ9.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\n\"}}", "expect": {"ok": true, "command": {"type": "license.set", "key": "JL1.eyJ9.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}},
+    {"name": "license.set with something that isn't a key", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"license.set\",\"key\":\"hello\"}}", "expect": {"ok": false, "code": "bad_arguments", "id": "a"}},
+    {"name": "license.set without a key", "input": "{\"v\":1,\"id\":\"a\",\"ts\":1,\"command\":{\"type\":\"license.set\"}}", "expect": {"ok": false, "code": "bad_arguments", "id": "a"}}
   ]
 }

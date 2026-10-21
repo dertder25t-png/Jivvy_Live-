@@ -6,6 +6,9 @@
  * unknown extra fields are never fatal: they are rejected / ignored with a typed reason.
  */
 
+import { isLicenseKeyShape, type LicenseStatus } from "./license";
+export * from "./license";
+
 export const PROTOCOL_VERSION = 1;
 /** Oldest version the daemon still accepts. Bump only when dropping support deliberately. */
 export const MIN_SUPPORTED_VERSION = 1;
@@ -117,7 +120,16 @@ export type Command =
    */
   | { type: "doc.put"; kind: string; id: string; title: string; body: Record<string, unknown>; baseRev?: number }
   /** Removes a document (with `baseRev`, only that revision); deleting one that's gone is fine. */
-  | { type: "doc.delete"; kind: string; id: string; baseRev?: number };
+  | { type: "doc.delete"; kind: string; id: string; baseRev?: number }
+  // ---- License (added in v1 without a version bump; older daemons answer unknown_command) ----
+  // Checked on the church computer, offline (see license.ts). It never stops a service.
+  /** The license and trial (`license` on the ack). */
+  | { type: "license.get" }
+  /**
+   * Saves a license key pasted from live.jivvy.org (`license` on the ack). `bad_arguments`, in
+   * plain words, if its signature isn't good; the key already saved then stays.
+   */
+  | { type: "license.set"; key: string };
 
 export type CommandType = Command["type"];
 
@@ -355,7 +367,14 @@ function parseCommand(raw: unknown): CommandResult {
     case "device.list":
     case "stream.preflight":
     case "runsheet.get":
+    case "license.get":
       return { ok: true, command: { type: raw.type } };
+    case "license.set": {
+      const key = typeof raw.key === "string" ? raw.key.trim() : null;
+      if (!isLicenseKeyShape(key))
+        return { ok: false, code: "bad_arguments", message: "license.set needs a key: the JL1. text from live.jivvy.org" };
+      return { ok: true, command: { type: "license.set", key } };
+    }
     case "media.put": {
       const ok = isMediaId(raw.id) && typeof raw.offset === "number" && Number.isInteger(raw.offset) && raw.offset >= 0
         && typeof raw.data === "string" && raw.data.length <= MAX_CHUNK_BASE64 && BASE64.test(raw.data);
@@ -684,6 +703,8 @@ export interface AckExtras {
   doc?: Doc;
   /** doc.put, doc.delete: the document as saved (a delete is a revision too, so revisions never repeat). */
   saved?: DocInfo;
+  /** license.get, license.set */
+  license?: LicenseStatus;
 }
 
 /** A document in the church computer's library, without its body. */

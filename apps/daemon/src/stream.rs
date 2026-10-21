@@ -235,6 +235,150 @@ pub fn load_config(dir: &Path) -> Result<StreamConfig, String> {
     Ok(c)
 }
 
+impl Destination {
+    /// Whether a stream key is set, in the `key` field or written into the address.
+    pub fn has_key(&self) -> bool {
+        if !self.key.trim().is_empty() {
+            return true;
+        }
+        if self.is_hls() {
+            let k = self.url_param("cid");
+            !k.is_empty() && !k.starts_with('$')
+        } else {
+            self.url.trim().trim_end_matches('/').matches('/').count() >= 4
+        }
+    }
+}
+
+/// The settings screen's view of `stream.json`: everything except the keys (`hasKey` only).
+/// An address that carries its key is cut back to scheme, host and app.
+pub fn config_view(config: &StreamConfig) -> serde_json::Value {
+    use serde_json::{Map, Value, json};
+    let destinations: Vec<Value> = config
+        .destinations
+        .iter()
+        .map(|d| {
+            let mut o = Map::new();
+            o.insert("id".into(), json!(d.id));
+            o.insert("name".into(), json!(d.name));
+            o.insert("url".into(), json!(redact_url(d.url.trim())));
+            o.insert("enabled".into(), json!(d.enabled));
+            o.insert("hasKey".into(), json!(d.has_key()));
+            if let Some(q) = &d.max_quality {
+                o.insert("maxQuality".into(), json!(q));
+            }
+            if let Some(w) = &d.when_short {
+                o.insert("whenShort".into(), json!(w));
+            }
+            Value::Object(o)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("destinations".into(), Value::Array(destinations));
+    if let Some(mode) = config.bandwidth.as_ref().and_then(|b| b.mode.as_ref()) {
+        out.insert("bandwidth".into(), json!({ "mode": mode }));
+    }
+    Value::Object(out)
+}
+
+/// Builds the new config from what `stream.config.set` sent, on top of the saved one: a
+/// destination sent without a key keeps its saved key (and its address, if that is shown
+/// unchanged), so keys never have to come back to a screen. Checks everything the video
+/// process checks, with messages for a tech lead.
+pub fn config_from_input(
+    saved: &StreamConfig,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> Result<StreamConfig, String> {
+    use serde_json::Value;
+    let list = input.get("destinations").and_then(Value::as_array).ok_or("The destinations list is missing.")?;
+    let text = |o: &serde_json::Map<String, Value>, field: &str, max: usize| -> Result<Option<String>, String> {
+        match o.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if s.chars().count() <= max && !s.chars().any(char::is_control) => {
+                Ok(Some(s.trim().to_string()))
+            }
+            Some(_) => Err(format!("{field} is not valid (text of at most {max} characters)")),
+        }
+    };
+    let mut destinations: Vec<Destination> = Vec::new();
+    for item in list {
+        let o = item.as_object().ok_or("Each destination must be an object.")?;
+        let id = text(o, "id", 64)?.unwrap_or_default();
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err("Each destination needs an id of letters, numbers, - and _.".into());
+        }
+        if destinations.iter().any(|d| d.id == id) {
+            return Err(format!("Two destinations share the id {id}. Each one needs its own."));
+        }
+        let name = text(o, "name", crate::protocol::MAX_DEVICE_NAME)?.unwrap_or_default();
+        let url = text(o, "url", 2048)?.unwrap_or_default();
+        let new_key = text(o, "key", 512)?.filter(|k| !k.is_empty());
+        let enabled = o.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+        let old = saved.destinations.iter().find(|d| d.id == id);
+        let (url, key) = match (new_key, old) {
+            (Some(k), _) => (url, k),
+            // The address as the screen was shown it: keep the saved one, which may hold the key.
+            (None, Some(old)) if url == redact_url(old.url.trim()) => (old.url.clone(), old.key.clone()),
+            (None, Some(old)) => (url, old.key.clone()),
+            (None, None) => (url, String::new()),
+        };
+        destinations.push(Destination {
+            id,
+            name,
+            url,
+            key,
+            enabled,
+            max_quality: text(o, "maxQuality", 16)?.filter(|q| !q.is_empty()),
+            when_short: text(o, "whenShort", 16)?.filter(|q| !q.is_empty()),
+        });
+    }
+    let mode = match input.get("bandwidth").and_then(|b| b.get("mode")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if m == "auto" || m == "advanced" => Some(m.clone()),
+        Some(_) => return Err("The bandwidth mode must be Auto or Advanced.".into()),
+    };
+    if mode.as_deref() != Some("advanced") {
+        // Per-platform limits only mean something in Advanced mode; don't keep stale ones.
+        for d in &mut destinations {
+            (d.max_quality, d.when_short) = (None, None);
+        }
+    }
+    let config = StreamConfig {
+        version: CONFIG_VERSION,
+        destinations,
+        bandwidth: mode.map(|m| BandwidthConfig { mode: Some(m) }),
+    };
+    for d in config.destinations.iter().filter(|d| d.enabled) {
+        // validate() leads with the id; a name reads better.
+        validate(d).map_err(|e| match (d.name.is_empty(), e.strip_prefix(&format!("{}: ", d.id))) {
+            (false, Some(rest)) => format!("{}: {rest}", d.name),
+            _ => e,
+        })?;
+    }
+    if let Some(problem) = prefs(&config).1.into_iter().next() {
+        return Err(problem);
+    }
+    Ok(config)
+}
+
+/// Saves `config` as `stream.json` without ever leaving a half-written file: written to a
+/// temp file, flushed, then renamed into place. The previous good file is kept as
+/// `stream.json.bak`. Both hold keys, so both stay in the data directory.
+pub fn save_config(dir: &Path, config: &StreamConfig) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(config)?;
+    let (path, tmp) = (dir.join(CONFIG_FILE), dir.join(format!("{CONFIG_FILE}.tmp")));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    if path.exists() {
+        let _ = std::fs::copy(&path, dir.join(format!("{CONFIG_FILE}.bak")));
+    }
+    std::fs::rename(&tmp, &path)
+}
+
 /// A failure in words a tech lead can act on. The raw text (scrubbed of the key) goes to
 /// the log; this goes on screen.
 pub fn plain_error(raw: &str) -> String {

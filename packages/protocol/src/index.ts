@@ -76,6 +76,21 @@ export type Command =
    * Never while streaming (`unavailable`): the test would take the stream's bandwidth.
    */
   | { type: "stream.preflight" }
+  /**
+   * Added in v1 without a version bump. The streaming destinations and advanced settings from
+   * `stream.json`, as `streamConfig` on the ack. Stream keys are never sent back: each
+   * destination says only `hasKey`. Older daemons answer unknown_command.
+   */
+  | { type: "stream.config.get" }
+  /**
+   * Added in v1 without a version bump. Replaces the destinations (in the order given: the first
+   * is the main platform) and advanced settings in `stream.json`. Write-only keys: a `key` sets
+   * one; leaving it out keeps the saved one. Checked with the same rules the daemon uses to
+   * start a stream, saved atomically, and answered with the new `streamConfig`. Refused with
+   * `unavailable` while streaming (the video process would reconnect changed destinations
+   * mid-service) and with `bad_arguments` and a plain message when something is wrong.
+   */
+  | { type: "stream.config.set"; config: StreamConfigInput }
   /** Church computer only. */
   | { type: "device.list" }
   /** Church computer only. Removing a device ends its open connections at once. */
@@ -185,6 +200,43 @@ function destinationList(x: unknown): StreamDestination[] | null {
     out.push({ id: d.id, name: d.name, state: d.state as DestinationState, quality: d.quality, ...top });
   }
   return out;
+}
+
+/** One destination as `stream.config.set` takes it. `key` is write-only. */
+export interface StreamConfigDestinationInput {
+  id: string;
+  name?: string;
+  /** Server address without the key, e.g. rtmps://a.rtmps.youtube.com:443/live2 */
+  url: string;
+  /** Set or replace the stream key; left out or empty keeps the saved one. Never sent back. */
+  key?: string;
+  enabled?: boolean;
+  /** Advanced bandwidth mode only: "1080p", "720p", "480p" or "360p". */
+  maxQuality?: string;
+  /** Advanced bandwidth mode only: "lower", "audioOnly" or "pause". */
+  whenShort?: string;
+}
+
+export interface StreamConfigInput {
+  destinations: StreamConfigDestinationInput[];
+  bandwidth?: { mode?: "auto" | "advanced" };
+}
+
+/** A destination as `stream.config.get` shows it: everything except the key. */
+export interface StreamConfigDestination {
+  id: string;
+  name: string;
+  /** Scheme, host and app only: any key in the saved address is cut off. */
+  url: string;
+  enabled: boolean;
+  hasKey: boolean;
+  maxQuality?: string;
+  whenShort?: string;
+}
+
+export interface StreamConfigView {
+  destinations: StreamConfigDestination[];
+  bandwidth?: { mode?: string };
 }
 
 /** A P-256 public key, raw uncompressed (0x04 || x || y, 65 bytes), base64url without padding. */
@@ -442,6 +494,15 @@ function parseCommand(raw: unknown): CommandResult {
       if (raw.status !== "off" && raw.status !== "recording" && raw.status !== "waiting")
         return { ok: false, code: "bad_arguments", message: "recording.report needs status off, recording or waiting" };
       return { ok: true, command: { type: "recording.report", status: raw.status, lowDisk: raw.lowDisk === true } };
+    case "stream.config.get":
+      return { ok: true, command: { type: "stream.config.get" } };
+    case "stream.config.set": {
+      const c = raw.config;
+      if (!isObj(c) || !Array.isArray(c.destinations) || c.destinations.length > MAX_DESTINATIONS
+        || !c.destinations.every((d) => isObj(d) && isId(d.id)))
+        return { ok: false, code: "bad_arguments", message: `stream.config.set needs config.destinations: up to ${MAX_DESTINATIONS}, each with an id` };
+      return { ok: true, command: { type: "stream.config.set", config: c as unknown as StreamConfigInput } };
+    }
     case "output.black":
       if (typeof raw.on !== "boolean")
         return { ok: false, code: "bad_arguments", message: "output.black needs boolean on" };
@@ -672,6 +733,8 @@ export interface AckExtras {
   devices?: DeviceInfo[];
   /** stream.preflight: `measuring`; the result follows as a `preflight` event. */
   preflight?: Preflight;
+  /** stream.config.get, stream.config.set: the saved destinations, without their keys. */
+  streamConfig?: StreamConfigView;
   /** runsheet.get: the run sheet, if one is set. */
   runSheet?: RunSheet;
   /** media.put: how much of the image the church computer has, and whether it is complete. */

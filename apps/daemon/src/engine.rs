@@ -97,6 +97,8 @@ fn device_may(command: &Command) -> bool {
             | Command::StateGet
             | Command::StateSubscribe
             | Command::StreamPreflight
+            | Command::StreamConfigGet
+            | Command::StreamConfigSet { .. }
             | Command::RunSheetSet { .. }
             | Command::RunSheetGet
             | Command::MediaPut { .. }
@@ -438,6 +440,8 @@ impl Engine {
                 }
                 return self.start_preflight(id, outbox);
             }
+            Command::StreamConfigGet => return self.stream_config(id, None),
+            Command::StreamConfigSet { config } => return self.stream_config(id, Some(config.0)),
             Command::PairRequest { .. } | Command::AuthHello { .. } | Command::AuthProve { .. } => {
                 return protocol::nack(id, ErrorCode::BadArguments, "the church computer doesn't need to pair");
             }
@@ -746,6 +750,57 @@ impl Engine {
                 crate::log("engine", format!("removed {removed} images the run sheet no longer shows"));
             }
         }));
+    }
+
+    /// `stream.config.get` (`set` is None) and `stream.config.set`: the destinations in
+    /// `stream.json`. The answer never holds a key, and nothing here logs one.
+    ///
+    /// A save is refused while streaming rather than applied later: the video process re-reads
+    /// `stream.json` every second and reconnects any destination whose address, key or name
+    /// changed, which would drop that platform mid-service. Refusing is also simpler to
+    /// explain than a change that waits for the next start.
+    fn stream_config(&mut self, id: &str, set: Option<serde_json::Map<String, serde_json::Value>>) -> Ack {
+        use crate::stream;
+        let dir = self.store.dir().to_path_buf();
+        let saved = match stream::load_config(&dir) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log("engine", format!("stream settings: {e}"));
+                return protocol::nack(
+                    id,
+                    ErrorCode::Unavailable,
+                    format!("{e}. Fix or remove the file, then try again."),
+                );
+            }
+        };
+        let config = match set {
+            None => saved,
+            Some(input) => {
+                if self.state.stream_wanted {
+                    return protocol::nack(
+                        id,
+                        ErrorCode::Unavailable,
+                        "Stop the stream before changing streaming settings. Saving now would reconnect and could drop it.",
+                    );
+                }
+                let next = match stream::config_from_input(&saved, &input) {
+                    Ok(c) => c,
+                    Err(e) => return protocol::nack(id, ErrorCode::BadArguments, e),
+                };
+                if let Err(e) = stream::save_config(&dir, &next) {
+                    crate::log("engine", format!("stream.json save failed: {}", e.kind()));
+                    return protocol::nack(
+                        id,
+                        ErrorCode::Unavailable,
+                        "Couldn't save the streaming settings; try again.",
+                    );
+                }
+                crate::log("engine", format!("streaming settings saved ({} destinations)", next.destinations.len()));
+                next
+            }
+        };
+        let extras = AckExtras { stream_config: Some(stream::config_view(&config)), ..Default::default() };
+        protocol::ack_with(id, None, extras)
     }
 
     /// The folder the images and the library live in.
@@ -1439,6 +1494,50 @@ mod tests {
     fn send(e: &mut Engine, command: Value) -> Value {
         let msg = json!({ "v": 1, "id": "t", "ts": 1, "command": command }).to_string();
         serde_json::to_value(e.handle_line(&msg)).unwrap()
+    }
+
+    #[test]
+    fn streaming_settings_save_and_read_back_without_the_key_and_wait_while_streaming() {
+        const SECRET: &str = "abcd-efgh-ijkl-mnop";
+        let (mut e, dir) = engine("stream-settings", 3);
+        let set = |name: &str, key: Option<&str>| {
+            let mut yt = json!({ "id": "youtube", "name": name, "url": "rtmps://a.rtmps.youtube.com:443/live2" });
+            if let Some(k) = key {
+                yt["key"] = json!(k);
+            }
+            json!({ "type": "stream.config.set", "config": { "destinations": [
+                yt, { "id": "fb", "name": "Facebook", "url": "rtmps://live-api-s.facebook.com:443/rtmp/", "key": "fbkey-1234", "enabled": false }
+            ] } })
+        };
+        let saved = send(&mut e, set("YouTube", Some(SECRET)));
+        assert_eq!(saved["ok"], true, "{saved}");
+        let got = send(&mut e, json!({ "type": "stream.config.get" }));
+        assert_eq!(got["streamConfig"]["destinations"][0]["id"], "youtube");
+        assert_eq!(got["streamConfig"]["destinations"][0]["hasKey"], true);
+        assert_eq!(got["streamConfig"]["destinations"][1]["enabled"], false);
+        assert!(!got.to_string().contains(SECRET) && !got.to_string().contains("fbkey"), "a key came back: {got}");
+        // Saved on disk for the video process, key included, and no temp file left behind.
+        let file = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        assert!(file.contains(SECRET));
+        assert!(!dir.join("stream.json.tmp").exists());
+        // Editing without a key keeps the saved one.
+        assert_eq!(send(&mut e, set("YouTube Live", None))["ok"], true);
+        let file = std::fs::read_to_string(dir.join("stream.json")).unwrap();
+        assert!(file.contains(SECRET) && file.contains("YouTube Live"));
+        // A mistake is refused in plain words and the saved file is untouched.
+        let bad = send(
+            &mut e,
+            json!({ "type": "stream.config.set", "config": { "destinations": [
+            { "id": "x", "name": "Church", "url": "ftp://nope" }] } }),
+        );
+        assert_eq!(bad["ok"], false);
+        assert!(bad["message"].as_str().unwrap().starts_with("Church: the server address must start with"));
+        assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        // While streaming a save is refused, a read is not.
+        send(&mut e, json!({ "type": "stream.start" }));
+        assert_eq!(send(&mut e, set("Renamed", None))["code"], "unavailable");
+        assert_eq!(std::fs::read_to_string(dir.join("stream.json")).unwrap(), file);
+        assert_eq!(send(&mut e, json!({ "type": "stream.config.get" }))["ok"], true);
     }
 
     #[test]

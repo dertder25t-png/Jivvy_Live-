@@ -74,6 +74,11 @@ begin
     if new_hlc is null or new_hlc !~ '^[0-9]{13}-[0-9]{6}-[A-Za-z0-9_-]{1,16}$' then
       raise exception 'hlc must be 13 digits, 6 digits and a node id' using errcode = '22023';
     end if;
+    -- A computer whose date is more than a day ahead mustn't leave a field nobody can change.
+    if left(new_hlc, 13)::bigint > (extract(epoch from now()) * 1000)::bigint + 86400000 then
+      raise exception 'hlc is more than a day ahead of the server; check this computer''s date and time'
+        using errcode = '22023';
+    end if;
     -- A body field at most the daemon's whole-document limit (512 KB).
     if pg_column_size(coalesce(c -> 'value', 'null'::jsonb)) > 524288 then
       raise exception 'a value can be at most 512 KB' using errcode = '22023';

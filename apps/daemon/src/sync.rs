@@ -160,6 +160,16 @@ struct CloudRows {
 }
 
 impl MemoryCloud {
+    /// Tests: a row as a computer with a wrong date could have left it (the real cloud refuses
+    /// clocks more than a day ahead of its own, but a copy from elsewhere may still hold one).
+    #[cfg(test)]
+    fn plant(&self, change: FieldChange) {
+        let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        c.seq += 1;
+        let seq = c.seq;
+        c.rows.insert((change.kind.clone(), change.id.clone(), change.field.clone()), (seq, change));
+    }
+
     /// While true, every request fails as `Offline`.
     pub fn set_offline(&self, offline: bool) {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).offline = offline;
@@ -369,18 +379,24 @@ fn stamp(db: &Connection, now: u64) -> rusqlite::Result<String> {
     Ok(format!("{:013}-{:06}-{node}", next.0, next.1))
 }
 
-/// A clock from elsewhere we can use: well formed and not more than a day ahead of ours.
-fn usable(hlc: &str, now: u64) -> bool {
-    match parse_hlc(hlc) {
-        Some((ms, _)) if ms <= now.saturating_add(MAX_AHEAD_MS) => true,
-        Some(_) => {
-            if !WARNED_AHEAD.swap(true, Ordering::Relaxed) {
-                crate::log("sync", "ignoring changes stamped more than a day ahead (another computer's date is wrong)");
-            }
-            false
-        }
-        None => false,
+/// A clock from elsewhere more than a day ahead of ours. It still merges by plain last-writer-
+/// wins, but this computer's clock never jumps to it (logged once).
+fn far_ahead(hlc: &str, now: u64) -> bool {
+    let ahead = parse_hlc(hlc).is_some_and(|(ms, _)| ms > now.saturating_add(MAX_AHEAD_MS));
+    if ahead && !WARNED_AHEAD.swap(true, Ordering::Relaxed) {
+        crate::log(
+            "sync",
+            "a change is stamped more than a day ahead (another computer's date is wrong); not following its clock",
+        );
     }
+    ahead
+}
+
+/// The clock just after `hlc`, stamped by `node`: for a field whose clock is ahead of ours.
+fn just_after(hlc: &str, node: &str) -> Option<String> {
+    let (ms, n) = parse_hlc(hlc)?;
+    let (ms, n) = if n >= MAX_COUNTER { (ms + 1, 0) } else { (ms, n + 1) };
+    Some(format!("{ms:013}-{n:06}-{node}"))
 }
 
 /// A clock from elsewhere: the next local one comes after it.
@@ -431,8 +447,19 @@ pub(crate) fn record_local(
         names
     };
     let hlc = stamp(db, now)?;
+    let node = hlc.splitn(3, '-').nth(2).unwrap_or_default().to_string();
     for field in changed {
-        mark_dirty(db, kind, id, &field, &hlc)?;
+        // A field whose clock is ahead of ours (stamped far ahead elsewhere) gets the clock
+        // just after it, so a later edit here still wins without moving our whole clock.
+        let have: Option<String> = db
+            .query_row(
+                "SELECT hlc FROM sync_fields WHERE kind = ?1 AND id = ?2 AND field = ?3",
+                params![kind, id, field],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mine = have.filter(|h| *h >= hlc).and_then(|h| just_after(&h, &node)).unwrap_or_else(|| hlc.clone());
+        mark_dirty(db, kind, id, &field, &mine)?;
     }
     Ok(())
 }
@@ -561,7 +588,7 @@ fn merge_doc(
     let (mut both, mut delete_fight, mut wrote) = (false, false, false);
     let mut lyric_hlc: Option<String> = None;
     for c in changes {
-        if !usable(&c.hlc, now) {
+        if parse_hlc(&c.hlc).is_none() {
             continue;
         }
         let local: Option<(String, bool, Option<String>)> = tx
@@ -575,7 +602,9 @@ fn merge_doc(
         if local.as_ref().is_some_and(|(hlc, _, base)| *hlc == c.hlc || base.as_deref() == Some(c.hlc.as_str())) {
             continue;
         }
-        observe(&tx, &c.hlc)?;
+        if !far_ahead(&c.hlc, now) {
+            observe(&tx, &c.hlc)?;
+        }
         theirs.set(&c.field, &c.value);
         let dirty = local.as_ref().is_some_and(|(_, d, _)| *d);
         let edited_here = dirty && state.get(&c.field) != c.value;
@@ -724,7 +753,8 @@ impl Syncer {
                 return Ok(true);
             }
         }
-        Ok(true)
+        // Still refused after three tries: the outbox stays, so the status keeps saying it's waiting.
+        Ok(outbox(self.lib.conn())?.is_empty())
     }
 
     /// One round: pull and merge everything new, then push the outbox, checking `go_on` (no
@@ -777,7 +807,8 @@ pub fn spawn(
             let wait = match s.round(crate::now_ms(), &go_on) {
                 Ok(round) => {
                     retry = FIRST_RETRY;
-                    report(if round.finished { "ok" } else { "paused_for_service" }, round.changed);
+                    let state = if round.finished || go_on() { "ok" } else { "paused_for_service" };
+                    report(state, round.changed);
                     EVERY
                 }
                 Err(e) => {
@@ -937,6 +968,26 @@ mod tests {
         let mut c = Syncer::new(Library::open(&dc).unwrap(), Box::new(cloud.clone()));
         c.round(4_300, &go).unwrap();
         assert_eq!(c.library().get("plan", "sun").unwrap().unwrap().body, body(json!({ "items": [] })));
+
+        // A far-future cloud field doesn't block later edits, and our clock stays our own.
+        let far = format!("{:013}-000000-wrongdate", 9_000_000_000_000u64);
+        cloud.plant(FieldChange {
+            kind: "plan".into(),
+            id: "sun".into(),
+            field: "title".into(),
+            value: json!("From the future"),
+            hlc: far,
+            base: None,
+        });
+        a.round(5_000, &go).unwrap();
+        assert_eq!(a.library().get("plan", "sun").unwrap().unwrap().info.title, "From the future");
+        a.library().put("plan", "sun", "Sunday again", &body(json!({ "items": [] })), None, 5_100).unwrap();
+        let r = a.round(5_200, &go).unwrap();
+        assert!(r.finished && a.library().sync_pending().unwrap() == 0, "the later edit went out");
+        c.round(5_300, &go).unwrap();
+        assert_eq!(c.library().get("plan", "sun").unwrap().unwrap().info.title, "Sunday again");
+        let clock = meta(a.library().conn(), "clock").unwrap().unwrap();
+        assert!(clock.starts_with("5100-"), "our clock didn't jump ahead: {clock}");
         drop((a, b, c));
         let _ = (std::fs::remove_dir_all(&da), std::fs::remove_dir_all(&db), std::fs::remove_dir_all(&dc));
     }
@@ -981,6 +1032,7 @@ mod tests {
         // Clocks are fixed width, so text order is time order; anything else is refused.
         assert!(parse_hlc("0000000002000-000001-AbC_d-9").is_some());
         assert!(parse_hlc("2000-1-AbC").is_none() && parse_hlc("0000000002000-000001-").is_none());
-        assert!(!usable(&format!("{:013}-000000-x", 10 + MAX_AHEAD_MS + 1), 10));
+        assert!(far_ahead(&format!("{:013}-000000-x", 10 + MAX_AHEAD_MS + 1), 10));
+        assert_eq!(just_after("0000000002000-999999-a", "b").as_deref(), Some("0000000002001-000000-b"));
     }
 }

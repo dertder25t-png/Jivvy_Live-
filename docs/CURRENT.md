@@ -17,10 +17,9 @@ Read this file and your one item only. Do not read the whole repo or the full `d
 - PR gate: `.\dev.ps1 check` in `apps/daemon` (fmt, clippy, fast tier, npm typecheck and tests).
 - Base branch: `main`. The lead merges PRs once review and CI are done.
 
-## Remaining items (round 4)
-- [~] Sync engine — #65 merged (outbox, per-field merge, conflicts, status, against a fake). Supabase transport + site token exchange: PR open (daemon/sync-supabase). Next: owner setup (Supabase project, Pages secrets, D1 migration 0005).
-- Later: email alerts via the church account; Stripe go-live (owner).
-- Merged so far: #48–#64 (see BUILD_PLAN.md).
+## Remaining items
+- Stage 1A is built (#48–#67). What's left is the owner's setup (Stripe, secrets, D1 and Supabase migrations; see apps/site/README.md) and Stage 1B (Harden).
+- Before launch: test-mode licenses grant Plus (see HARDENING.md); Stripe go-live.
 
 ## Avoiding conflicts between parallel PRs
 - `apps/web/src/routes/+page.svelte` is shared. Put new UI in a new component under `src/lib` and keep the

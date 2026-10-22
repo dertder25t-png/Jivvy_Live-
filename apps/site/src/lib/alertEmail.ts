@@ -1,22 +1,21 @@
 // POST /api/alert: the church computer's stream-down and no-sound alerts, emailed to the church
 // account's own address. Never the waitlist, never anyone else. Nothing here is needed during a
 // service: the church computer sends this in the background and the service never waits for it.
-import { ALERT_EMAIL_BACK_OF, ALERT_EMAIL_KINDS, SERVICE_ALERT_MESSAGES, verifyLicenseKey, type ServiceAlertKind } from "@jivvy/protocol";
+import { ALERT_EMAIL_BACK_OF, ALERT_EMAIL_KINDS, SERVICE_ALERT_MESSAGES, decodeLicensePayload, type ServiceAlertKind } from "@jivvy/protocol";
+import { sha256Hex } from "./account";
 
 /** At most one email per church per alert kind in this long. */
 export const KIND_WINDOW_MS = 10 * 60_000;
 /** At most this many alert emails per church per day. */
 export const PER_DAY = 20;
 
-export interface AlertEnv {
-  /** The production license public key (raw Ed25519, base64url). */
-  LICENSE_PUBLIC_KEY?: string;
-  /** The published test key's public half (packages/protocol/fixtures/license.json); test-mode licenses are signed with its private half. */
-  LICENSE_TEST_PUBLIC_KEY?: string;
-}
+/** Longest request body /api/alert reads (a license key is under 1100 characters). */
+export const MAX_BODY = 4096;
 
 /** Where the limits live and where the email goes. */
 export interface AlertStore {
+  /** The license keys this site issued and recorded for the church (the licenses table). */
+  issuedKeys(churchId: string): Promise<string[]>;
   /** The church account's own address, if the church exists. */
   churchEmail(churchId: string): Promise<string | null>;
   /** When an email of this kind was last sent to the church (0 if never). */
@@ -44,18 +43,33 @@ export function alertEmail(kind: ServiceAlertKind): { subject: string; text: str
   };
 }
 
-export async function handleAlert(data: Record<string, unknown>, env: AlertEnv, store: AlertStore, nowMs: number): Promise<Answer> {
+/** Equal strings, compared without stopping at the first difference. */
+function sameHash(a: string, b: string): boolean {
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
+/**
+ * The church the posted key belongs to, only if it is exactly a key this site issued and recorded
+ * for that church. A signature alone proves nothing: the test signing key is published, so
+ * anyone can sign a "valid" key for any church id. Compared as SHA-256 hashes, in constant time.
+ */
+async function issuedTo(key: string, store: AlertStore): Promise<string | null> {
+  const church = decodeLicensePayload(key)?.church;
+  if (!church) return null;
+  const posted = await sha256Hex(key);
+  let found = false;
+  for (const issued of await store.issuedKeys(church)) found = sameHash(posted, await sha256Hex(issued)) || found;
+  return found ? church : null;
+}
+
+export async function handleAlert(data: Record<string, unknown>, store: AlertStore, nowMs: number): Promise<Answer> {
   const kind = data.kind;
   const key = data.key;
   if (typeof kind !== "string" || !(ALERT_EMAIL_KINDS as readonly string[]).includes(kind) || typeof key !== "string")
     return { status: 400, body: { ok: false, error: "Unsupported alert." } };
-  const publicKeys = [env.LICENSE_PUBLIC_KEY, env.LICENSE_TEST_PUBLIC_KEY].filter((k): k is string => !!k);
-  if (publicKeys.length === 0) return { status: 503, body: { ok: false, error: "Alert emails aren't open yet." } };
-  let church: string | null = null;
-  for (const pub of publicKeys) {
-    church = (await verifyLicenseKey(key, pub))?.church ?? null;
-    if (church) break;
-  }
+  const church = await issuedTo(key, store);
   const to = church ? await store.churchEmail(church) : null;
   if (!church || !to) return { status: 401, body: { ok: false, error: "Unknown license." } };
   const alertKind = kind as ServiceAlertKind;

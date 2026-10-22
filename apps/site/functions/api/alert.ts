@@ -1,12 +1,28 @@
 // POST /api/alert { key, kind, message }: emails a stream-down or no-sound alert to the church
 // account's own address. Authenticated by the license key's signature and church id, not a cookie.
-import { KIND_WINDOW_MS, PER_DAY, handleAlert, type AlertStore } from "../../src/lib/alertEmail";
-import { json, readJson, withinLimit, type Env } from "../../src/lib/server";
+import { KIND_WINDOW_MS, MAX_BODY, PER_DAY, handleAlert, type AlertStore } from "../../src/lib/alertEmail";
+import { json, withinLimit, type Env } from "../../src/lib/server";
 
 export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   if (!env.DB || !env.EMAIL || !env.EMAIL_FROM) return json({ ok: false, error: "Alert emails aren't open yet." }, 503);
   const { DB: db, EMAIL: email, EMAIL_FROM: from } = env;
+  // JSON only, and small: a license key is the biggest thing in it.
+  if (!(request.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json"))
+    return json({ ok: false, error: "Unsupported request." }, 415);
+  const text = await request.text();
+  if (text.length > MAX_BODY) return json({ ok: false, error: "Request too large." }, 413);
+  let data: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) data = parsed as Record<string, unknown>;
+  } catch {
+    // Not JSON: handled as an empty request below.
+  }
   const store: AlertStore = {
+    async issuedKeys(id) {
+      const { results } = await db.prepare("SELECT license_key FROM licenses WHERE church_id = ?1").bind(id).all<{ license_key: string }>();
+      return results.map((r) => r.license_key);
+    },
     async churchEmail(id) {
       return (await db.prepare("SELECT email FROM churches WHERE id = ?1").bind(id).first<{ email: string }>())?.email ?? null;
     },
@@ -33,6 +49,6 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       await email.send({ from: { email: from, name: "Jivvy Live" }, to, subject, text });
     },
   };
-  const answer = await handleAlert(await readJson(request), env, store, Date.now());
+  const answer = await handleAlert(data, store, Date.now());
   return json(answer.body, answer.status);
 };

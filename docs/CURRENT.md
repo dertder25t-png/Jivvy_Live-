@@ -17,13 +17,10 @@ Read this file and your one item only. Do not read the whole repo or the full `d
 - PR gate: `.\dev.ps1 check` in `apps/daemon` (fmt, clippy, fast tier, npm typecheck and tests).
 - Base branch: `main`. The lead merges PRs once review and CI are done.
 
-## Remaining items (round 3)
-- [ ] No-audio and stream-down alerts: web push now (email follows the license item) — branch `daemon/alert-push`
-- [ ] Church account, Stripe checkout (test mode), offline-verified license key, 30-day trial — branch `site/license`
-- [ ] Streaming settings screen (destinations and keys from the web app instead of editing stream.json) — branch `web/stream-settings`
-- [ ] Recordings list labelled by service, in local time — branch `web/recordings`
-- Next: sync engine with Supabase (needs the church account first).
-- Stages 1A items 1–6 and the follow-ups are merged (#48–#58); see BUILD_PLAN.md.
+## Remaining items (round 4)
+- [ ] Sync engine between the church computer and Supabase — branch `daemon/sync` (first PR: the local edit queue and sync logic against a fake; no cloud resources created)
+- Later: email alerts via the church account; Stripe go-live (owner).
+- Merged so far: #48–#64 (see BUILD_PLAN.md).
 
 ## Avoiding conflicts between parallel PRs
 - `apps/web/src/routes/+page.svelte` is shared. Put new UI in a new component under `src/lib` and keep the

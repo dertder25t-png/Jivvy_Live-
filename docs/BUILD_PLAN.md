@@ -215,9 +215,9 @@ Everything a church needs to run a whole service. Built and tested by us on our 
 
 **Then**
 
-- [ ] No-audio and stream-down alerts (web push + email)
+- [x] No-audio and stream-down alerts (web push + email) — #63 web push from the church computer (stream down within ~10.5 s, no sound, lowered/paused; known push services only). Left for later: email alerts, using the church account from #64
 - [x] Blocks sleep during services; no updates during service windows — #51 (Windows; `in_service()` is what the future updater checks; macOS/Linux in HARDENING.md)
-- [ ] Church account, Stripe checkout, license key, 30-day trial
+- [x] Church account, Stripe checkout, license key, 30-day trial — #62 (Ed25519 key checked offline, local trial, church-computer only), #64 (sign-in by emailed code, test-mode Checkout, signed webhook). Owner to do: Stripe account, secrets and D1 migrations per apps/site/README.md; go-live with live keys is a separate step
 - [x] Export of songs, run sheets, themes and settings in open formats, available on every license — #52
 - [ ] Sync engine between the church computer and Supabase: queues edits made offline, syncs when the connection returns, resolves edits made in two places (per-field last-writer-wins with a visible "changed elsewhere" notice; songs keep both versions), and shows sync status. Pauses cleanly when Plus ends, leaving the local copy complete. (Its chaos test, editing on two devices while the internet is cut, is written in 1B.)
 

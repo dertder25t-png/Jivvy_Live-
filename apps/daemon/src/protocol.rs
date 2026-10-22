@@ -150,6 +150,12 @@ pub enum Command {
     /// How syncing the library with the cloud is going (`sync` on the ack; see `sync.rs`).
     #[serde(rename = "sync.status")]
     SyncStatus,
+    /// Whether alert emails are on (`alertEmail` on the ack; see `alert_email.rs`).
+    #[serde(rename = "alert.email.get")]
+    AlertEmailGet,
+    /// Turn alert emails on or off.
+    #[serde(rename = "alert.email.set")]
+    AlertEmailSet { enabled: bool },
 }
 
 /// A license key as sent; its `Debug` never prints it, so it can't reach a log by accident.
@@ -806,6 +812,9 @@ pub struct AckExtras {
     /// recording.list: where recordings are kept, as configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recordings_folder: Option<String>,
+    /// alert.email.get, alert.email.set
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alert_email: Option<crate::alert_email::Status>,
     /// sync.status
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<crate::sync::SyncStatus>,
@@ -1057,6 +1066,11 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         "push.key" => Command::PushKey,
         "push.test" => Command::PushTest,
         "sync.status" => Command::SyncStatus,
+        "alert.email.get" => Command::AlertEmailGet,
+        "alert.email.set" => match obj.get("enabled").and_then(Value::as_bool) {
+            Some(enabled) => Command::AlertEmailSet { enabled },
+            None => return Err((ErrorCode::BadArguments, "alert.email.set needs enabled: true or false")),
+        },
         "push.subscribe" => {
             match (push_endpoint(obj.get("endpoint")), public_key(obj.get("p256dh")), push_auth(obj.get("auth"))) {
                 (Some(endpoint), Some(p256dh), Some(auth)) => Command::PushSubscribe { endpoint, p256dh, auth },

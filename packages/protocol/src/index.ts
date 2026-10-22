@@ -172,7 +172,14 @@ export type Command =
   // The church computer syncs its library with the cloud copy by itself (Plus only). The library
   // on the church computer stays the master copy; nothing in a service waits on the cloud.
   /** How syncing is going (`sync` on the ack): last synced, changes waiting, and why it's paused. */
-  | { type: "sync.status" };
+  | { type: "sync.status" }
+  // ---- Alerts by email (added in v1 without a version bump) ----
+  // The same stream-down and no-sound alerts (and their "back"), emailed to the church account's
+  // own address by live.jivvy.org, off by default. Needs a license key. Older daemons answer unknown_command.
+  /** Whether alert emails are on (`alertEmail` on the ack). */
+  | { type: "alert.email.get" }
+  /** Turns alert emails on or off (`alertEmail` on the ack). */
+  | { type: "alert.email.set"; enabled: boolean };
 
 export type CommandType = Command["type"];
 
@@ -470,6 +477,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "push.key":
     case "push.test":
     case "sync.status":
+    case "alert.email.get":
     case "recording.list":
       return { ok: true, command: { type: raw.type } };
     case "license.set": {
@@ -478,6 +486,10 @@ function parseCommand(raw: unknown): CommandResult {
         return { ok: false, code: "bad_arguments", message: "license.set needs a key: the JL1. text from live.jivvy.org" };
       return { ok: true, command: { type: "license.set", key } };
     }
+    case "alert.email.set":
+      if (typeof raw.enabled !== "boolean")
+        return { ok: false, code: "bad_arguments", message: "alert.email.set needs enabled: true or false" };
+      return { ok: true, command: { type: "alert.email.set", enabled: raw.enabled } };
     case "push.subscribe": {
       const { endpoint, p256dh, auth } = raw;
       if (typeof endpoint !== "string" || !isPushEndpoint(endpoint) || typeof p256dh !== "string"
@@ -832,6 +844,8 @@ export interface AckExtras {
   recordings?: RecordingSet[];
   /** recording.list: where recordings are kept on the church computer, as configured. */
   recordingsFolder?: string;
+  /** alert.email.get, alert.email.set */
+  alertEmail?: AlertEmailStatus;
   /** sync.status */
   sync?: SyncStatus;
 }
@@ -972,6 +986,30 @@ export interface PushPayload {
   message: string;
   tag: string;
 }
+
+/** Alert emails on this church computer (`alertEmail` on the ack). */
+export interface AlertEmailStatus {
+  /** The church turned them on. Off by default. */
+  enabled: boolean;
+  /** A license key is saved, so the site can tell which church account to email. Without one nothing is sent. */
+  available: boolean;
+}
+
+/**
+ * What the church computer POSTs to live.jivvy.org/api/alert: the license key (the proof of
+ * which church), the alert's kind and its plain words. Nothing else; never a stream key or URL.
+ * The site emails the church account's own address, with its own copy of the words.
+ */
+export interface AlertEmailRequest {
+  key: string;
+  kind: ServiceAlertKind;
+  message: string;
+}
+
+/** The alert kinds that are emailed: the whole-stream ones, each "down" with its "back". */
+export const ALERT_EMAIL_KINDS: readonly ServiceAlertKind[] = ["stream.down", "stream.up", "audio.silent", "audio.back"];
+/** Each emailed "back" kind and the "down" kind it follows: it is sent only if that "down" was. */
+export const ALERT_EMAIL_BACK_OF: Readonly<Record<string, ServiceAlertKind>> = { "stream.up": "stream.down", "audio.back": "audio.silent" };
 
 export interface Alert {
   kind: AlertKind;

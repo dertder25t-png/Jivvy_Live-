@@ -173,6 +173,11 @@ impl License {
         Ok(&self.key.insert((key.to_string(), payload)).1)
     }
 
+    /// The saved key, to prove which church this is to live.jivvy.org (alert emails). Never log it.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_ref().map(|(k, _)| k.as_str())
+    }
+
     /// Plus (the cloud features) is on: a key whose `plus_until` is still ahead.
     pub fn plus_active(&self, now_ms: u64) -> bool {
         self.key.as_ref().is_some_and(|(_, p)| now_ms < p.plus_until)

@@ -17,6 +17,9 @@ export interface Env {
   LICENSE_PRIVATE_KEY?: string;
   /** The published test key (packages/protocol/fixtures/license.json); only debug daemons accept licenses signed by it. */
   LICENSE_TEST_PRIVATE_KEY?: string;
+  /** Public halves of the two license keys, for checking the signature on alert emails (raw Ed25519, base64url). */
+  LICENSE_PUBLIC_KEY?: string;
+  LICENSE_TEST_PUBLIC_KEY?: string;
 }
 
 export const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>

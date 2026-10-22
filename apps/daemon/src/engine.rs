@@ -140,6 +140,8 @@ fn device_may(command: &Command) -> bool {
             | Command::PushSubscribe { .. }
             | Command::PushTest
             | Command::SyncStatus
+            | Command::AlertEmailGet
+            | Command::AlertEmailSet { .. }
     )
 }
 
@@ -221,6 +223,8 @@ pub struct Engine {
     last_sent: Option<StateSnapshot>,
     /// Alerts to the tech lead by web push.
     push: crate::push::Push,
+    /// Alerts to the church account's email address, off by default.
+    alert_email: crate::alert_email::AlertEmail,
     /// Since when the wanted stream isn't live, and whether that was alerted yet.
     stream_down: Option<(Instant, bool)>,
     /// Since when the live stream is silent, and whether that was alerted yet.
@@ -266,6 +270,7 @@ impl Engine {
         push.keep_only(|d| d == "this-computer" || devices.contains_id(d));
         let mut engine = Engine {
             push,
+            alert_email: crate::alert_email::AlertEmail::load(store.dir()),
             stream_down: None,
             stream_started: None,
             been_live: false,
@@ -348,6 +353,11 @@ impl Engine {
                 self.send_to_subscribers(line);
             }
         }
+    }
+
+    fn alert_email_ack(&self, id: &str) -> Ack {
+        let status = self.alert_email.status(self.license.key().is_some());
+        protocol::ack_with(id, None, AckExtras { alert_email: Some(status), ..Default::default() })
     }
 
     fn sync_ack(&self, id: &str) -> Ack {
@@ -540,6 +550,8 @@ impl Engine {
         if self.should_push(alert.kind, now) {
             self.push.alert(&alert.message, alert.kind);
         }
+        // The site keeps the limits (per kind, per day, "back" only after "down"); this only queues.
+        self.alert_email.alert(self.license.key(), alert.kind, &alert.message);
     }
 
     /// A flapping stream mustn't buzz a phone every few seconds: each kind is pushed at most
@@ -560,6 +572,11 @@ impl Engine {
             self.pushed_down.insert(kind);
         }
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alert_email_to(&mut self, url: &str) {
+        self.alert_email.post_to(url);
     }
 
     #[cfg(test)]
@@ -707,6 +724,14 @@ impl Engine {
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
             Command::LicenseGet => return self.license_ack(id),
             Command::SyncStatus => return self.sync_ack(id),
+            Command::AlertEmailGet => return self.alert_email_ack(id),
+            Command::AlertEmailSet { enabled } => {
+                if let Err(e) = self.alert_email.set(enabled) {
+                    crate::log("engine", format!("alert-email.json save failed: {e}"));
+                    return protocol::nack(id, ErrorCode::Unavailable, "could not save; try again");
+                }
+                return self.alert_email_ack(id);
+            }
             Command::LicenseSet { key } => {
                 use crate::license::SetError;
                 match self.license.set(&key.0) {
@@ -3052,6 +3077,42 @@ mod tests {
         send(&mut e, json!({ "type": "device.remove", "deviceId": device }));
         assert!(!e.push.has(&device));
         assert_eq!(crate::push::Push::load(&dir).public_key(), Some(push_key));
+    }
+
+    #[test]
+    fn a_stream_down_alert_is_posted_to_the_site_for_email_once_the_church_turns_it_on() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../packages/protocol/fixtures/license.json")).unwrap();
+        let key = fixture["key"].as_str().unwrap().to_string();
+        let (mut e, dir) = engine("alert-email", 10);
+        let (url, posts) = fake_push_service();
+        e.alert_email_to(&url);
+        // Off by default, and nothing to send with until a license key is saved.
+        let got = send(&mut e, json!({ "type": "alert.email.get" }));
+        assert_eq!(got["alertEmail"], json!({ "enabled": false, "available": false }), "{got}");
+        assert_eq!(send(&mut e, json!({ "type": "alert.email.set", "enabled": "yes" }))["ok"], false);
+        assert_eq!(send(&mut e, json!({ "type": "license.set", "key": key }))["ok"], true);
+        let on = send(&mut e, json!({ "type": "alert.email.set", "enabled": true }));
+        assert_eq!(on["alertEmail"], json!({ "enabled": true, "available": true }), "{on}");
+        // The setting survives a restart.
+        assert!(crate::alert_email::AlertEmail::load(&dir).status(true).enabled);
+
+        send(&mut e, json!({ "type": "stream.start" }));
+        let t0 = Instant::now();
+        let t = |s: u64| t0 + Duration::from_secs(s);
+        e.stream_report = Some((StreamStatus::Live, t(0)));
+        e.last_levels = Some(t(0));
+        e.tick_at(t(0));
+        e.tick_at(t(4));
+        e.tick_at(t(4) + protocol::STREAM_DOWN_AFTER);
+        let (_, body) = posts.recv_timeout(Duration::from_secs(20)).expect("a post to the site");
+        let down = protocol::service_alert("stream.down");
+        // The kind and the plain words, with the key as proof of the church; nothing else.
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({ "key": key, "kind": "stream.down", "message": down.message })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An engine that can finish work on other threads, as the real one can.

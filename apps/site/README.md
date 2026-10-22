@@ -16,6 +16,7 @@ Astro on Cloudflare Pages, with Pages Functions in `functions/` (`npm run dev:si
 | `POST /api/account/logout` | Ends the sign-in. |
 | `POST /api/checkout` | A Stripe Checkout Session for one church license (test mode only: anything but an `sk_test_` key is refused). |
 | `POST /api/stripe-webhook` | Checks `Stripe-Signature`, and on `checkout.session.completed` (paid, `livemode: false`) issues the key: Ed25519-signed `{church, plan: "church", updatesUntil: +3 years, plusUntil: +1 year, issued}` (`packages/protocol/src/license.ts`). Retried deliveries issue nothing new (one license per checkout). |
+| `POST /api/alert {key, kind, message}` | Alert emails. The church computer posts a stream-down or no-sound alert (`stream.down`, `stream.up`, `audio.silent`, `audio.back`), authenticated by its license key: the key must exactly match one this site issued and recorded in the `licenses` table for that church id (compared as SHA-256 hashes, in constant time; a merely well-signed key is refused, since the test signing key is public), then the site emails **that church account's own address only** (never the waitlist) with its own copy of the alert's words, ignoring the posted text. JSON only, body capped at 4 KB, and the key is never echoed or logged. Per church: at most 1 email per kind per 10 minutes and 20 a day; a "back" email only after its "down" email was sent. Answers 200 `{sent: false, reason}` when throttled. Off on the church computer by default (Alerts, "Also email these alerts"). Needs `DB`, `EMAIL`, `EMAIL_FROM` (otherwise 503). |
 
 Codes and session tokens are stored only as SHA-256 hashes.
 
@@ -30,7 +31,7 @@ npx wrangler d1 migrations apply jivvy-live --remote
 npx wrangler d1 migrations apply jivvy-live-preview --remote --env preview
 ```
 
-**Email (Cloudflare Email Sending)**, for sign-in codes only:
+**Email (Cloudflare Email Sending)**, for sign-in codes and alert emails (each only to the church account's own address). Apply migration `0004_alert_emails.sql` too:
 - Onboard the sending domain to Email Sending, then add a `send_email` binding named `EMAIL` to the Pages project (or in `wrangler.toml`: `[[send_email]]` with `name = "EMAIL"`).
 - `EMAIL_FROM` (variable): the sender address, on that domain.
 

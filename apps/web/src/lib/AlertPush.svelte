@@ -57,6 +57,25 @@
     }
   }
 
+  // Alerts by email: the same alerts, also emailed to the church account's address (off by default).
+  let email = $state<{ enabled: boolean; available: boolean } | null>(null);
+  let emailNote = $state("");
+
+  $effect(() => {
+    if (!ready) return;
+    void send({ type: "alert.email.get" })?.then((ack) => {
+      // An older church computer doesn't know it: the choice just isn't shown.
+      email = ack.ok && ack.alertEmail ? ack.alertEmail : null;
+    });
+  });
+
+  async function setEmail(enabled: boolean) {
+    emailNote = "";
+    const ack = await send({ type: "alert.email.set", enabled });
+    if (ack?.ok && ack.alertEmail) email = ack.alertEmail;
+    else emailNote = ack && !ack.ok ? ack.message : "Not connected.";
+  }
+
   async function test() {
     note = "";
     const ack = await send({ type: "push.test" });
@@ -77,6 +96,16 @@
       <button onclick={test} disabled={!ready || !on}>Send test alert</button>
     </div>
   </div>
+  {#if email}
+    <label class="email">
+      <input type="checkbox" checked={email.enabled} disabled={!ready} onchange={(e) => setEmail(e.currentTarget.checked)} />
+      Also email these alerts to the church account's address
+    </label>
+    {#if !email.available}
+      <p class="hint">Emails need a license key from live.jivvy.org; until one is saved on this computer, none are sent.</p>
+    {/if}
+    {#if emailNote}<p class="note" role="status">{emailNote}</p>{/if}
+  {/if}
   {#if !supported}<p class="note">This browser can't get alerts. On an iPhone, add Jivvy to the home screen first.</p>{/if}
   {#if note}<p class="note" role="status">{note}</p>{/if}
 </section>
@@ -115,6 +144,13 @@
     border-radius: 6px;
     background: var(--card);
     border: 1px solid var(--line);
+  }
+  .email {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    font-size: 14px;
   }
   button {
     border: 1px solid var(--line);

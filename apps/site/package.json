@@ -10,7 +10,7 @@
     "typecheck": "astro check",
     "test": "vitest run"
   },
-  "dependencies": { "astro": "^5.14.0" },
+  "dependencies": { "@jivvy/protocol": "*", "astro": "^5.14.0" },
   "devDependencies": {
     "@astrojs/check": "^0.9.4",
     "@cloudflare/workers-types": "^4.20250900.0",

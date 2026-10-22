@@ -1,0 +1,155 @@
+---
+import { PRICING } from "../lib/pricing";
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Your church account · Jivvy Live</title>
+    <meta name="theme-color" content="#10224F" />
+    <link rel="icon" href="/brand/jivvy-app-icon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <main>
+      <a href="/"><img src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="147" height="60" /></a>
+      <h1>Your church account</h1>
+      <p class="sub">
+        Jivvy Live starts a {PRICING.trialDays}-day trial on the church computer by itself, with no account and no card. Sign in
+        here to buy a license and get its key.
+      </p>
+
+      <section id="signin">
+        <form id="email-form">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required />
+          <button type="submit">Email me a code</button>
+        </form>
+        <form id="code-form" hidden>
+          <label for="code">The 8-digit code we emailed you</label>
+          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required />
+          <button type="submit">Sign in</button>
+        </form>
+      </section>
+
+      <section id="account" hidden>
+        <p>Signed in as <strong id="who"></strong>. <button id="logout" class="link">Sign out</button></p>
+        <div id="licenses"></div>
+        <button id="buy">Buy a license (${PRICING.oneTime}, test mode)</button>
+        <p class="sub">Paste the key into Jivvy Live on the church computer: License, then Save key. It is checked on that computer with no internet needed.</p>
+      </section>
+
+      <p id="note" role="status"></p>
+    </main>
+
+    <script is:inline>
+      const $ = (id) => document.getElementById(id);
+      const note = (t) => ($("note").textContent = t || "");
+      const post = (url, body) =>
+        fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) }).then((r) => r.json());
+      const day = (ms) => new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+
+      async function load() {
+        const a = await fetch("/api/account").then((r) => r.json()).catch(() => ({}));
+        $("signin").hidden = !!a.signedIn;
+        $("account").hidden = !a.signedIn;
+        if (!a.signedIn) return;
+        $("who").textContent = a.email;
+        const list = $("licenses");
+        list.replaceChildren();
+        for (const l of a.licenses || []) {
+          const box = document.createElement("div");
+          box.className = "license";
+          const p = document.createElement("p");
+          p.textContent = `License (${l.plan}): Plus until ${day(l.plusUntil)}, new features until ${day(l.updatesUntil)}.`;
+          const key = document.createElement("textarea");
+          key.readOnly = true;
+          key.rows = 3;
+          key.value = l.key;
+          box.append(p, key);
+          list.append(box);
+        }
+        if (!(a.licenses || []).length && new URLSearchParams(location.search).has("paid"))
+          note("Thank you. Your key appears here within a minute; refresh to see it.");
+      }
+
+      $("email-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const r = await post("/api/account/code", { email: $("email").value });
+        if (!r.ok) return note(r.error);
+        $("code-form").hidden = false;
+        note("Check your email for the code.");
+      });
+      $("code-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const r = await post("/api/account/verify", { email: $("email").value, code: $("code").value });
+        if (!r.ok) return note(r.error);
+        note("");
+        load();
+      });
+      $("logout").addEventListener("click", async () => {
+        await post("/api/account/logout");
+        load();
+      });
+      $("buy").addEventListener("click", async () => {
+        const r = await post("/api/checkout");
+        if (r.ok && r.url) location.href = r.url;
+        else note(r.error);
+      });
+      load();
+    </script>
+
+    <style>
+      body {
+        margin: 0;
+        background: #f4f1ea;
+        color: #10224f;
+        font-family: system-ui, sans-serif;
+      }
+      main {
+        max-width: 36rem;
+        margin: 0 auto;
+        padding: 2rem 16px;
+        display: grid;
+        gap: 1rem;
+      }
+      form {
+        display: grid;
+        gap: 0.4rem;
+      }
+      input,
+      textarea {
+        font: inherit;
+        padding: 0.5rem;
+        border: 1px solid #10224f;
+        border-radius: 6px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      textarea {
+        font-family: monospace;
+        font-size: 0.8rem;
+      }
+      button {
+        font: inherit;
+        padding: 0.6rem 1rem;
+        background: #2e6bff;
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+        justify-self: start;
+      }
+      button.link {
+        background: none;
+        color: #2e6bff;
+        padding: 0;
+        text-decoration: underline;
+      }
+      .sub {
+        font-size: 0.9rem;
+      }
+    </style>
+  </body>
+</html>

@@ -45,6 +45,9 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       await db.prepare("UPDATE alert_emails SET sent_at = ?3 WHERE church_id = ?1 AND kind = ?2 AND sent_at = ?4").bind(id, kind, previous, now).run();
     },
     underDailyLimit: (id, now) => withinLimit(db, `alert-day:${id}`, PER_DAY, 24 * 60 * 60_000, now),
+    async refundDaily(id) {
+      await db.prepare("UPDATE rate_limits SET hits = MAX(hits - 1, 0) WHERE bucket = ?1").bind(`alert-day:${id}`).run();
+    },
     async send(to, subject, text) {
       await email.send({ from: { email: from, name: "Jivvy Live" }, to, subject, text });
     },

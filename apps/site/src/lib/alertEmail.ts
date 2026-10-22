@@ -26,6 +26,8 @@ export interface AlertStore {
   release(churchId: string, kind: string, previous: number, nowMs: number): Promise<void>;
   /** Counts one more email today; false once the church is over `PER_DAY`. */
   underDailyLimit(churchId: string, nowMs: number): Promise<boolean>;
+  /** Gives back the day's count taken by `underDailyLimit` when the email was not sent. */
+  refundDaily(churchId: string, nowMs: number): Promise<void>;
   send(to: string, subject: string, text: string): Promise<void>;
 }
 
@@ -78,16 +80,22 @@ export async function handleAlert(data: Record<string, unknown>, store: AlertSto
   if (down && (await store.lastSent(church, down)) <= (await store.lastSent(church, alertKind))) return ok(false, "no down email");
   const previous = await store.claim(church, alertKind, nowMs);
   if (previous === null) return ok(false, "throttled");
-  if (!(await store.underDailyLimit(church, nowMs))) {
-    await store.release(church, alertKind, previous, nowMs);
-    return ok(false, "daily limit");
-  }
-  const mail = alertEmail(alertKind);
+  // Everything after the claim undoes what it took if it doesn't end in a sent email.
+  let sent = false;
+  let counted = false;
   try {
+    if (!(await store.underDailyLimit(church, nowMs))) return ok(false, "daily limit");
+    counted = true;
+    const mail = alertEmail(alertKind);
     await store.send(to, mail.subject, mail.text);
+    sent = true;
+    return ok(true);
   } catch {
-    await store.release(church, alertKind, previous, nowMs);
     return { status: 502, body: { ok: false, error: "We couldn't send the email just now." } };
+  } finally {
+    if (!sent) {
+      await store.release(church, alertKind, previous, nowMs).catch(() => {});
+      if (counted) await store.refundDaily(church, nowMs).catch(() => {});
+    }
   }
-  return ok(true);
 }

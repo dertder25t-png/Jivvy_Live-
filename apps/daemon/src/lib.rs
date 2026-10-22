@@ -17,6 +17,7 @@ pub mod hardware;
 pub mod hls;
 pub mod images;
 pub mod library;
+pub mod license;
 pub mod lyrics;
 pub mod media;
 pub mod outputs;

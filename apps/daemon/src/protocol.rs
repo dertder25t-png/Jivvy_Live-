@@ -132,6 +132,12 @@ pub enum Command {
         #[serde(rename = "baseRev", skip_serializing_if = "Option::is_none")]
         base_rev: Option<u64>,
     },
+    /// The license and trial (see `license.rs`).
+    #[serde(rename = "license.get")]
+    LicenseGet,
+    /// Save a license key; refused unless its signature is good. Never log `key`.
+    #[serde(rename = "license.set")]
+    LicenseSet { key: LicenseKey },
     /// The VAPID public key a browser subscribes with (`pushKey` on the ack).
     #[serde(rename = "push.key")]
     PushKey,
@@ -141,6 +147,29 @@ pub enum Command {
     /// A test alert to this device's subscription.
     #[serde(rename = "push.test")]
     PushTest,
+}
+
+/// A license key as sent; its `Debug` never prints it, so it can't reach a log by accident.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct LicenseKey(pub String);
+
+impl std::fmt::Debug for LicenseKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LicenseKey(..)")
+    }
+}
+
+/// Longest license key, in characters (the TypeScript `MAX_LICENSE_KEY`).
+pub const MAX_LICENSE_KEY: usize = 1024;
+
+/// Looks like a license key, `JL1.<payload>.<signature>` (the TypeScript `isLicenseKeyShape`);
+/// the signature is checked by `license::verify`.
+pub fn is_license_key_shape(key: &str) -> bool {
+    let b64 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    let Some(rest) = key.strip_prefix("JL1.") else { return false };
+    let Some((payload, sig)) = rest.split_once('.') else { return false };
+    key.len() <= MAX_LICENSE_KEY && (1..=900).contains(&payload.len()) && b64(payload) && sig.len() == 86 && b64(sig)
 }
 
 /// The push services pushes may go to: these hosts, or any host under them.
@@ -762,6 +791,9 @@ pub struct AckExtras {
     /// doc.put, doc.delete
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved: Option<DocInfo>,
+    /// license.get, license.set
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<crate::license::LicenseStatus>,
     /// push.key: the VAPID public key, raw P-256, base64url.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push_key: Option<String>,
@@ -1011,6 +1043,11 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
             }
         }
         "runsheet.get" => Command::RunSheetGet,
+        "license.get" => Command::LicenseGet,
+        "license.set" => match obj.get("key").and_then(Value::as_str).map(str::trim) {
+            Some(key) if is_license_key_shape(key) => Command::LicenseSet { key: LicenseKey(key.into()) },
+            _ => return Err((ErrorCode::BadArguments, "license.set needs a key: the JL1. text from live.jivvy.org")),
+        },
         "push.key" => Command::PushKey,
         "push.test" => Command::PushTest,
         "push.subscribe" => {

@@ -24,6 +24,8 @@ jivvy-ctl [--connect ADDR] COMMAND      (ADDR defaults to 127.0.0.1:47800)
   preflight            test the upload and say what each platform will get (about 5 s)
   devices              list paired devices
   devices remove ID    unpair a device; its open connections end at once
+  license              show the trial or license on this computer
+  license set KEY      save a license key from live.jivvy.org (checked offline)
 
 Prints the engine's answer as one JSON line; exits 1 if the engine refused the command
 or can't be reached, 2 for a usage mistake.";
@@ -73,6 +75,8 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
         ["devices"] => json!({ "type": "device.list" }),
         ["preflight"] => json!({ "type": "stream.preflight" }),
         ["devices", "remove", id] => json!({ "type": "device.remove", "deviceId": id }),
+        ["license"] => json!({ "type": "license.get" }),
+        ["license", "set", key] => json!({ "type": "license.set", "key": key }),
         [] => return Err(USAGE.into()),
         other => return Err(format!("unknown command: {}\n\n{USAGE}", other.join(" "))),
     };
@@ -110,6 +114,8 @@ mod tests {
             ("record stop", json!({ "type": "recording.stop" })),
             ("pair open", json!({ "type": "pair.open" })),
             ("pair close", json!({ "type": "pair.close" })),
+            ("license", json!({ "type": "license.get" })),
+            ("license set JL1.x.y", json!({ "type": "license.set", "key": "JL1.x.y" })),
             ("pair approve r1", json!({ "type": "pair.approve", "requestId": "r1" })),
             ("pair deny r1", json!({ "type": "pair.deny", "requestId": "r1" })),
             ("devices", json!({ "type": "device.list" })),

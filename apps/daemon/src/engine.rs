@@ -70,6 +70,9 @@ pub struct Session {
     device_id: Option<String>,
     /// The key and challenge from the last `auth.hello`; one proof per challenge.
     hello: Option<(String, String)>,
+    /// A device connecting from the church computer itself (its own browser): once paired and
+    /// proven, it may also do what `this_computer_may` allows, which no phone may.
+    on_this_computer: bool,
 }
 
 impl Session {
@@ -81,10 +84,30 @@ impl Session {
         Session::new(false)
     }
 
+    /// A WebSocket connection: from this computer when the peer is a loopback address or the
+    /// address it connected to (a browser on the church computer using its own LAN name).
+    pub fn device_from(peer: Option<std::net::IpAddr>, ours: Option<std::net::IpAddr>) -> Session {
+        let mut s = Session::new(false);
+        s.on_this_computer = peer.is_some_and(|p| p.is_loopback() || Some(p) == ours);
+        s
+    }
+
     fn new(local: bool) -> Session {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Session { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), local, device_id: None, hello: None }
+        Session {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            local,
+            device_id: None,
+            hello: None,
+            on_this_computer: false,
+        }
     }
+}
+
+/// What a paired device on the church computer itself may do besides running the service:
+/// the license panel. Pairing and devices stay with the local channel.
+fn this_computer_may(command: &Command) -> bool {
+    matches!(command, Command::LicenseGet | Command::LicenseSet { .. })
 }
 
 /// What a paired device may do: run the service. Pairing, devices and the video process's
@@ -165,6 +188,8 @@ pub struct Engine {
     /// The body of the active theme (the "active-theme" setting names it), read from the library
     /// whenever a theme or setting is saved; screens get it in the state.
     theme: Option<serde_json::Value>,
+    /// The license key and trial, checked offline; never stops a service.
+    license: crate::license::License,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -232,6 +257,7 @@ impl Engine {
         let library = crate::library::Library::open(store.dir())
             .map_err(|e| crate::log("engine", format!("the library can't be opened: {e:?}")))
             .ok();
+        let license = crate::license::License::load(store.dir(), crate::license::public_key(), crate::now_ms());
         let mut push = crate::push::Push::load(store.dir());
         // A device removed while push.json couldn't be saved gets nothing after a restart either.
         push.keep_only(|d| d == "this-computer" || devices.contains_id(d));
@@ -258,6 +284,7 @@ impl Engine {
             last_shown_change: Instant::now(),
             library,
             theme: None,
+            license,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -294,6 +321,12 @@ impl Engine {
             black: self.state.black,
             since_last_change: self.last_shown_change.elapsed(),
         })
+    }
+
+    /// The license and trial; the notice only outside a service.
+    fn license_ack(&self, id: &str) -> Ack {
+        let license = self.license.status(crate::now_ms(), self.in_service());
+        protocol::ack_with(id, None, AckExtras { license: Some(license), ..Default::default() })
     }
 
     /// How many slides there are: the run sheet's, else `--slides`. Never 0.
@@ -534,7 +567,8 @@ impl Engine {
             let Some(device) = session.device_id.as_deref().filter(|d| self.devices.contains_id(d)) else {
                 return protocol::nack(id, ErrorCode::Unauthorized, "pair this device first");
             };
-            if !device_may(&env.command) {
+            let allowed = device_may(&env.command) || (session.on_this_computer && this_computer_may(&env.command));
+            if !allowed {
                 crate::log("engine", format!("refused {} from device {device}", command_name(&env.command)));
                 return protocol::nack(id, ErrorCode::Unauthorized, "only the church computer can do that");
             }
@@ -627,6 +661,29 @@ impl Engine {
                 return protocol::ack_with(id, Some(self.view()), extras);
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
+            Command::LicenseGet => return self.license_ack(id),
+            Command::LicenseSet { key } => {
+                use crate::license::SetError;
+                match self.license.set(&key.0) {
+                    Ok(_) => return self.license_ack(id),
+                    Err(SetError::Invalid) => {
+                        let message = "That license key isn't valid. Copy it again from live.jivvy.org, all of it.";
+                        return protocol::nack(id, ErrorCode::BadArguments, message);
+                    }
+                    Err(SetError::Older) => {
+                        let message = "That key is older than the one already saved, so the saved one stays.";
+                        return protocol::nack(id, ErrorCode::BadArguments, message);
+                    }
+                    Err(SetError::NoPublicKey) => {
+                        let message = "This copy of Jivvy Live was built without a license key check, so it can't take keys. Services run as normal.";
+                        return protocol::nack(id, ErrorCode::Unavailable, message);
+                    }
+                    Err(SetError::Save(e)) => {
+                        crate::log("engine", format!("license.key save failed: {e}"));
+                        return protocol::nack(id, ErrorCode::Unavailable, "could not save; try again");
+                    }
+                }
+            }
             Command::MediaPut { id: media, offset, data, last } => {
                 return self.media_put(id, &media, offset, &data, last);
             }
@@ -1550,7 +1607,8 @@ fn serve_ws_connection(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(WS_HANDSHAKE_TIMEOUT))?;
     let shared = Arc::new(stream.try_clone()?);
-    let mut session = Session::device();
+    let mut session =
+        Session::device_from(stream.peer_addr().ok().map(|a| a.ip()), stream.local_addr().ok().map(|a| a.ip()));
     let result = match tls {
         None => ws_session(stream, &shared, engine, access, data_dir, &mut session, false),
         // No good certificate yet: refuse rather than serve in plain text.
@@ -3058,8 +3116,26 @@ mod tests {
             json!({ "type": "stream.report", "status": "live" }),
             json!({ "type": "recording.report", "status": "recording" }),
             json!({ "type": "media.levels", "peakDb": [0], "rmsDb": [0] }),
+            json!({ "type": "license.get" }),
+            json!({ "type": "license.set", "key": format!("JL1.eyJ9.{}", "A".repeat(86)) }),
         ] {
             assert_eq!(phone.send(&mut e, command.clone())["code"], "unauthorized", "{command}");
+        }
+
+        // The church computer's own browser, paired like any device, has the license panel too
+        // (loopback, or the computer's own LAN address); pairing stays with the local channel.
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        for (peer, ours, here) in [("127.0.0.1", lan, true), ("192.168.1.20", lan, true), ("192.168.1.30", lan, false)]
+        {
+            let mut browser = Phone::new();
+            browser.session = Session::device_from(peer.parse().ok(), Some(ours));
+            browser.prove(&mut e, &key);
+            let got = browser.send(&mut e, json!({ "type": "license.get" }));
+            assert_eq!(got["ok"] == true, here, "{peer}: {got}");
+            if here {
+                assert_eq!(got["license"]["keyPresent"], false);
+                assert_eq!(browser.send(&mut e, json!({ "type": "pair.open" }))["code"], "unauthorized");
+            }
         }
     }
 

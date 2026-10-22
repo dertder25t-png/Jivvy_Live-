@@ -6,6 +6,9 @@
  * unknown extra fields are never fatal: they are rejected / ignored with a typed reason.
  */
 
+import { isLicenseKeyShape, type LicenseStatus } from "./license";
+export * from "./license";
+
 export const PROTOCOL_VERSION = 1;
 /** Oldest version the daemon still accepts. Bump only when dropping support deliberately. */
 export const MIN_SUPPORTED_VERSION = 1;
@@ -140,6 +143,17 @@ export type Command =
   | { type: "doc.put"; kind: string; id: string; title: string; body: Record<string, unknown>; baseRev?: number }
   /** Removes a document (with `baseRev`, only that revision); deleting one that's gone is fine. */
   | { type: "doc.delete"; kind: string; id: string; baseRev?: number }
+  // ---- License (added in v1 without a version bump; older daemons answer unknown_command) ----
+  // Checked on the church computer, offline (see license.ts). It never stops a service.
+  // Church computer only: its local channel, or a paired connection from the church computer
+  // itself (its own browser). Any other device gets `unauthorized`.
+  /** The license and trial (`license` on the ack). */
+  | { type: "license.get" }
+  /**
+   * Saves a license key pasted from live.jivvy.org (`license` on the ack). `bad_arguments`, in
+   * plain words, if its signature isn't good; the key already saved then stays.
+   */
+  | { type: "license.set"; key: string }
   // ---- Alerts by web push (added in v1 without a version bump) ----
   // The church computer sends its alerts (stream down, no sound, a platform lowered or paused)
   // by web push (RFC 8030/8291, VAPID) to each device that asked, even with no Jivvy screen
@@ -447,10 +461,17 @@ function parseCommand(raw: unknown): CommandResult {
     case "device.list":
     case "stream.preflight":
     case "runsheet.get":
+    case "license.get":
     case "push.key":
     case "push.test":
     case "recording.list":
       return { ok: true, command: { type: raw.type } };
+    case "license.set": {
+      const key = typeof raw.key === "string" ? raw.key.trim() : null;
+      if (!isLicenseKeyShape(key))
+        return { ok: false, code: "bad_arguments", message: "license.set needs a key: the JL1. text from live.jivvy.org" };
+      return { ok: true, command: { type: "license.set", key } };
+    }
     case "push.subscribe": {
       const { endpoint, p256dh, auth } = raw;
       if (typeof endpoint !== "string" || !isPushEndpoint(endpoint) || typeof p256dh !== "string"
@@ -797,6 +818,8 @@ export interface AckExtras {
   doc?: Doc;
   /** doc.put, doc.delete: the document as saved (a delete is a revision too, so revisions never repeat). */
   saved?: DocInfo;
+  /** license.get, license.set */
+  license?: LicenseStatus;
   /** push.key: the church computer's VAPID public key (raw P-256, base64url). */
   pushKey?: string;
   /** recording.list: newest first. */

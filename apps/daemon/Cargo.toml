@@ -33,6 +33,9 @@ required-features = ["video"]
 
 [features]
 video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+# Lets a release build go without JIVVY_LICENSE_PUBLIC_KEY (build.rs). For CI and test builds
+# only: such a build accepts no license keys. Never ship one.
+unlicensed-release = []
 
 [dependencies]
 ab_glyph = "0.2"

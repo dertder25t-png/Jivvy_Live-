@@ -61,9 +61,9 @@ jobs:
           # there at ~7 fps. The video tests run the hardware check once and use its choice,
           # so the program finds the CPU path by measuring, as a church PC without a GPU would.
           - os: windows-latest
-            features: "--features video"
+            features: "--features video,unlicensed-release"
           - os: ubuntu-latest
-            features: "--features video"
+            features: "--features video,unlicensed-release"
     runs-on: ${{ matrix.os }}
     defaults:
       run:

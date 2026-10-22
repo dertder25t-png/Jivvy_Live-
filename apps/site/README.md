@@ -19,6 +19,17 @@ Astro on Cloudflare Pages, with Pages Functions in `functions/` (`npm run dev:si
 
 Codes and session tokens are stored only as SHA-256 hashes.
 
+## Sync sign-in (Plus)
+
+Church accounts live here in D1, not in Supabase Auth. A church computer gets a short-lived Supabase token for its church's cloud copy (`supabase/0001_sync.sql`) like this (`src/lib/syncToken.ts`):
+
+| Endpoint | What it does |
+|---|---|
+| `POST /api/sync/nonce` | A single-use nonce (5 minutes), stored in D1 `sync_nonces`. |
+| `POST /api/sync/token {nonce, publicKey, signature, licenseKey?}` | Checks the ECDSA P-256 signature of the church computer's device key over `"jivvy-live sync token v1\n" + nonce + "\n" + publicKey`, uses up the nonce, and answers `{token, expiresAt, supabaseUrl, supabaseAnonKey}`: an HS256 JWT for 1 hour with `role: authenticated` and `app_metadata.church_id`. A device key it hasn't seen needs the license key once, which registers it (D1 `sync_devices`, at most 5 per church) to the church the `licenses` table says the key belongs to. Only a church whose latest `plus_until` is still ahead gets a token (`no_plus` otherwise). |
+
+No bearer secret that works forever crosses the network: each token request signs a fresh nonce, and a token ends after an hour. The daemon never has Supabase built in; it learns the URL and anon key from the answer.
+
 ## What the owner sets up (nothing is created by the code)
 
 None of this is in the repo. Each one is optional at runtime: when it's missing, that endpoint answers 503 and nothing else breaks.
@@ -41,6 +52,9 @@ npx wrangler d1 migrations apply jivvy-live-preview --remote --env preview
 | `LICENSE_PRIVATE_KEY` | The production Ed25519 private key, PKCS#8, base64url. Make the pair once (command in `apps/daemon/README.md`, "License and trial"); the public half goes into release daemon builds as `JIVVY_LICENSE_PUBLIC_KEY`. Never use the fixture's published test key here. |
 | `LICENSE_TEST_PRIVATE_KEY` | The published test signing key (`testOnlyPrivateKeyPkcs8` in `packages/protocol/fixtures/license.json`). Test-mode purchases are signed with this, never with `LICENSE_PRIVATE_KEY`; only debug daemons accept those keys. The webhook issues nothing without it. |
 | `STRIPE_SECRET_KEY` | The Stripe **test** secret or restricted key (`sk_test_…` or `rk_test_…`). Live keys are refused until the code is changed on purpose. |
+| `SUPABASE_URL` | The Supabase project's URL (`https://<ref>.supabase.co`), handed to church computers with their token. |
+| `SUPABASE_ANON_KEY` | The project's anon (public) key, handed out with the token; RLS in `supabase/0001_sync.sql` does the guarding. |
+| `SUPABASE_JWT_SECRET` | The project's JWT secret (Project Settings, API / JWT Keys: the legacy HS256 secret). Signs church computers' 1-hour tokens; never leaves the site. Without all three, `/api/sync/*` answers 503. |
 | `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://live.jivvy.org/api/stripe-webhook` listening for `checkout.session.completed` and `checkout.session.async_payment_succeeded`. |
 
 **Variables:** `STRIPE_PRICE_ID` (a test-mode one-time price of exactly $200 USD; the webhook issues a key only for a `payment` session of 20000 usd) and `SITE_URL` (e.g. `https://live.jivvy.org`, used for Stripe's return links).

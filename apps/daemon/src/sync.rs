@@ -23,8 +23,9 @@
 //! - A top-level body value of `null` counts as removed; a document made again sends `null` for
 //!   every field it had before, so no copy brings an old field back.
 //!
-//! The cloud is behind `Transport`; `MemoryCloud` is an in-memory stand-in with the same rules
-//! as `apps/site/supabase/0001_sync.sql`. Nothing here logs a token.
+//! The cloud is behind `Transport`: `sync_cloud::SupabaseTransport` is the real one, and
+//! `MemoryCloud` an in-memory stand-in with the same rules as `apps/site/supabase/0001_sync.sql`.
+//! Nothing here logs a token.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -17,6 +17,12 @@ export interface Env {
   LICENSE_PRIVATE_KEY?: string;
   /** The published test key (packages/protocol/fixtures/license.json); only debug daemons accept licenses signed by it. */
   LICENSE_TEST_PRIVATE_KEY?: string;
+  /** The Supabase project's URL, handed to church computers with their sync token. */
+  SUPABASE_URL?: string;
+  /** The Supabase anon (public) key, handed out with the token; RLS does the guarding. */
+  SUPABASE_ANON_KEY?: string;
+  /** Signs church computers' 1-hour sync tokens (HS256). Never sent anywhere. */
+  SUPABASE_JWT_SECRET?: string;
 }
 
 export const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>

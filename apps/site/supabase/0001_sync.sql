@@ -13,8 +13,9 @@
 -- are serialized per church (advisory lock), so a church's seq values commit in order and a
 -- pull never skips one.
 --
--- Who's who: each church signs in as a Supabase Auth user whose app_metadata.church_id is the
--- `church` of its license key (set by live.jivvy.org with the service role, never by the user).
+-- Who's who: church accounts live on live.jivvy.org (D1), not in Supabase Auth. A church
+-- computer gets a 1-hour JWT from live.jivvy.org/api/sync/token, signed with this project's JWT
+-- secret, whose app_metadata.church_id is its church (set by the site, never by the computer).
 
 create table if not exists public.sync_fields (
   church_id text not null,

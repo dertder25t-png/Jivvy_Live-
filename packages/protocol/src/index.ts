@@ -845,7 +845,7 @@ export interface AckExtras {
  * those like `ok`.
  */
 export interface SyncStatus {
-  state: "ok" | "offline" | "paused_for_service" | "no_plus" | "not_set_up";
+  state: "ok" | "offline" | "paused_for_service" | "no_plus" | "not_set_up" | (string & {});
   /** Documents with changes made here that the cloud doesn't have yet. */
   pending: number;
   /** When a sync last finished, ms since epoch; left out if never. */
@@ -866,6 +866,8 @@ export interface SyncNotice {
   /** When it was noticed, ms since epoch. */
   at: number;
   copyId?: string;
+  /** Deleted in one place and edited later in the other: the edit brought it back. */
+  restored?: boolean;
 }
 
 /** One recorded set (a folder of video parts) on the church computer. */

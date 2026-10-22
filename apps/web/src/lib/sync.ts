@@ -26,6 +26,7 @@ export function syncLine(s: SyncStatus, time: (ms: number) => string): string {
 
 /** The notice for a document changed here and elsewhere. */
 export function noticeLine(n: SyncStatus["changedElsewhere"][number]): string {
+  if (n.restored) return `"${n.title}" was deleted in one place and edited in the other: it is back, with the edit.`;
   return n.copyId
     ? `"${n.title}" was changed here and elsewhere: both versions are kept.`
     : `"${n.title}" was changed here and elsewhere: the latest edit to each part is kept.`;

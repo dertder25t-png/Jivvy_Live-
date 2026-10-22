@@ -65,7 +65,7 @@ impl Library {
             db.execute_batch("ALTER TABLE docs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")?;
         }
         let mut lib = Library { db };
-        crate::sync::open(&mut lib.db, crate::now_ms())?;
+        crate::sync::open(&mut lib.db, crate::now_ms(), &crate::sync::home(data_dir))?;
         Ok(lib)
     }
 
@@ -93,7 +93,8 @@ impl Library {
     }
 
     /// Saves a document as the sync engine merged it (one revision on, so every screen's copy
-    /// is now old). A deleted one keeps only its marker.
+    /// is now old). A deleted one keeps its body, hidden, so a later edit elsewhere can bring
+    /// all of it back.
     pub(crate) fn write_state(
         db: &Connection,
         kind: &str,
@@ -102,7 +103,7 @@ impl Library {
         now: u64,
     ) -> rusqlite::Result<DocInfo> {
         let rev = Self::read_state(db, kind, id)?.map_or(0, |(_, rev)| rev) + 1;
-        let body = if state.deleted { "{}".to_string() } else { Value::Object(state.body.clone()).to_string() };
+        let body = Value::Object(state.body.clone()).to_string();
         db.execute(
             "INSERT INTO docs (kind, id, title, body, rev, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (kind, id) DO UPDATE SET title = ?3, body = ?4, rev = ?5, updated_at = ?6, deleted = ?7",
@@ -239,7 +240,8 @@ impl Library {
             return Err(Error::Conflict { current: rev });
         }
         tx.execute(
-            "UPDATE docs SET deleted = 1, body = '{}', rev = ?3, updated_at = ?4 WHERE kind = ?1 AND id = ?2",
+            // The body stays, hidden: an edit made elsewhere after this delete brings it back.
+            "UPDATE docs SET deleted = 1, rev = ?3, updated_at = ?4 WHERE kind = ?1 AND id = ?2",
             params![kind, id, rev + 1, now],
         )?;
         let gone = DocState { title: title.clone(), body: Map::new(), deleted: true };

@@ -9,6 +9,8 @@ describe("sync status line", () => {
     expect(syncLine(s, () => "10:30")).toBe("Offline: changes are saved here and sync when the internet is back. 2 changes waiting.");
     expect(syncLine({ ...s, state: "ok", pending: 0 }, () => "10:30")).toBe("Synced at 10:30.");
     expect(syncLine({ ...s, state: "paused_for_service", pending: 1 }, () => "")).toBe("Sync paused during the service. 1 change waiting.");
+    expect(noticeLine(s.changedElsewhere[1]!)).toMatch(/it is back/);
+    expect(syncLine({ ...s, state: "newer_state", pending: 0, lastSyncedAt: undefined }, () => "")).toBe("Synced.");
     expect(noticeLine(s.changedElsewhere[0]!)).toBe('"Amazing Grace" was changed here and elsewhere: both versions are kept.');
   });
 });

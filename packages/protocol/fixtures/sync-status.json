@@ -1,0 +1,15 @@
+{
+  "about": "A sync.status ack (SyncStatus in packages/protocol, sync::SyncStatus in the Rust daemon): offline with two documents waiting, after a song was changed here and elsewhere and both versions were kept, and a plan deleted in one place was brought back by a later edit in the other. The Rust daemon serializes the same value to exactly this. Add fields, never rename.",
+  "command": { "type": "sync.status" },
+  "ack": {
+    "sync": {
+      "state": "offline",
+      "pending": 2,
+      "lastSyncedAt": 1791646212000,
+      "changedElsewhere": [
+        { "kind": "song", "id": "grace", "title": "Amazing Grace", "at": 1791646200000, "copyId": "grace-elsewhere-AbCd" },
+        { "kind": "plan", "id": "sunday", "title": "Sunday 9:30", "at": 1791646100000, "restored": true }
+      ]
+    }
+  }
+}

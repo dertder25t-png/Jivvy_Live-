@@ -3,13 +3,15 @@
 //! copy for churches without Plus; the cloud, later, is a synced copy. Each entry is a document
 //! of a kind with an id, a title and a JSON body the UI shapes. Every save bumps its revision,
 //! so a save based on an older copy can be refused instead of losing another device's edit.
+//! Every save and delete also notes which fields changed, for the cloud sync (`sync.rs`).
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value};
 
 use crate::protocol::{Doc, DocInfo};
+use crate::sync::DocState;
 
 pub const FILE: &str = "library.sqlite3";
 
@@ -62,7 +64,52 @@ impl Library {
         if !has_deleted {
             db.execute_batch("ALTER TABLE docs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")?;
         }
-        Ok(Library { db })
+        let mut lib = Library { db };
+        crate::sync::open(&mut lib.db, crate::now_ms(), &crate::sync::home(data_dir))?;
+        Ok(lib)
+    }
+
+    /// For the sync engine, which keeps its tables in this file.
+    pub(crate) fn conn(&mut self) -> &mut Connection {
+        &mut self.db
+    }
+
+    pub(crate) fn db(&self) -> &Connection {
+        &self.db
+    }
+
+    /// A document as saved, deleted or not, and its revision.
+    pub(crate) fn read_state(db: &Connection, kind: &str, id: &str) -> rusqlite::Result<Option<(DocState, u64)>> {
+        db.query_row("SELECT title, body, deleted, rev FROM docs WHERE kind = ?1 AND id = ?2", params![kind, id], |r| {
+            let body: String = r.get(1)?;
+            let state = DocState {
+                title: r.get(0)?,
+                body: serde_json::from_str::<Map<String, Value>>(&body).unwrap_or_default(),
+                deleted: r.get(2)?,
+            };
+            Ok((state, r.get::<_, u64>(3)?))
+        })
+        .optional()
+    }
+
+    /// Saves a document as the sync engine merged it (one revision on, so every screen's copy
+    /// is now old). A deleted one keeps its body, hidden, so a later edit elsewhere can bring
+    /// all of it back.
+    pub(crate) fn write_state(
+        db: &Connection,
+        kind: &str,
+        id: &str,
+        state: &DocState,
+        now: u64,
+    ) -> rusqlite::Result<DocInfo> {
+        let rev = Self::read_state(db, kind, id)?.map_or(0, |(_, rev)| rev) + 1;
+        let body = Value::Object(state.body.clone()).to_string();
+        db.execute(
+            "INSERT INTO docs (kind, id, title, body, rev, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (kind, id) DO UPDATE SET title = ?3, body = ?4, rev = ?5, updated_at = ?6, deleted = ?7",
+            params![kind, id, state.title, body, rev, now, state.deleted],
+        )?;
+        Ok(DocInfo { kind: kind.into(), id: id.into(), title: state.title.clone(), rev, updated_at: now })
     }
 
     /// The documents of a kind, newest first, without bodies.
@@ -151,7 +198,7 @@ impl Library {
         base_rev: Option<u64>,
         now: u64,
     ) -> Result<DocInfo, Error> {
-        let tx = self.db.transaction()?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (last, exists) = Self::revision(&tx, kind, id)?;
         // A deleted one counts as not there (0), but its revisions carry on from where they were.
         let current = if exists { last } else { 0 };
@@ -160,11 +207,14 @@ impl Library {
         }
         let rev = last + 1;
         let json = serde_json::to_string(body).map_err(|e| Error::Db(e.to_string()))?;
+        let old = Self::read_state(&tx, kind, id)?.map(|(s, _)| s);
         tx.execute(
             "INSERT INTO docs (kind, id, title, body, rev, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
              ON CONFLICT (kind, id) DO UPDATE SET title = ?3, body = ?4, rev = ?5, updated_at = ?6, deleted = 0",
             params![kind, id, title, json, rev, now],
         )?;
+        let new = DocState { title: title.into(), body: body.clone(), deleted: false };
+        crate::sync::record_local(&tx, kind, id, old.as_ref(), &new, now)?;
         tx.commit()?;
         Ok(DocInfo { kind: kind.into(), id: id.into(), title: title.into(), rev, updated_at: now })
     }
@@ -172,7 +222,7 @@ impl Library {
     /// Removes a document (leaving a marker, one revision on); with `base_rev`, only that
     /// revision. None if there was none.
     pub fn delete(&mut self, kind: &str, id: &str, base_rev: Option<u64>, now: u64) -> Result<Option<DocInfo>, Error> {
-        let tx = self.db.transaction()?;
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some((title, rev)) = tx
             .query_row(
                 "SELECT title, rev FROM docs WHERE kind = ?1 AND id = ?2 AND deleted = 0",
@@ -190,9 +240,12 @@ impl Library {
             return Err(Error::Conflict { current: rev });
         }
         tx.execute(
-            "UPDATE docs SET deleted = 1, body = '{}', rev = ?3, updated_at = ?4 WHERE kind = ?1 AND id = ?2",
+            // The body stays, hidden: an edit made elsewhere after this delete brings it back.
+            "UPDATE docs SET deleted = 1, rev = ?3, updated_at = ?4 WHERE kind = ?1 AND id = ?2",
             params![kind, id, rev + 1, now],
         )?;
+        let gone = DocState { title: title.clone(), body: Map::new(), deleted: true };
+        crate::sync::record_local(&tx, kind, id, None, &gone, now)?;
         tx.commit()?;
         Ok(Some(DocInfo { kind: kind.into(), id: id.into(), title, rev: rev + 1, updated_at: now }))
     }

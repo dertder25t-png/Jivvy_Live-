@@ -147,6 +147,9 @@ pub enum Command {
     /// A test alert to this device's subscription.
     #[serde(rename = "push.test")]
     PushTest,
+    /// How syncing the library with the cloud is going (`sync` on the ack; see `sync.rs`).
+    #[serde(rename = "sync.status")]
+    SyncStatus,
 }
 
 /// A license key as sent; its `Debug` never prints it, so it can't reach a log by accident.
@@ -803,6 +806,9 @@ pub struct AckExtras {
     /// recording.list: where recordings are kept, as configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recordings_folder: Option<String>,
+    /// sync.status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<crate::sync::SyncStatus>,
 }
 
 /// How much of an image the church computer has.
@@ -1050,6 +1056,7 @@ fn parse_command(raw: Option<&Value>) -> Result<Command, (ErrorCode, &'static st
         },
         "push.key" => Command::PushKey,
         "push.test" => Command::PushTest,
+        "sync.status" => Command::SyncStatus,
         "push.subscribe" => {
             match (push_endpoint(obj.get("endpoint")), public_key(obj.get("p256dh")), push_auth(obj.get("auth"))) {
                 (Some(endpoint), Some(p256dh), Some(auth)) => Command::PushSubscribe { endpoint, p256dh, auth },

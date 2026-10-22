@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, SILENCE_AFTER_MS, SILENCE_DB, STREAM_DOWN_AFTER_MS, TEST_ALERT_MESSAGE, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, serviceAlert, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type ServiceAlertKind, type StreamDestination, type StateSnapshot } from "../src/index";
+import { PROTOCOL_VERSION, SILENCE_AFTER_MS, SILENCE_DB, STREAM_DOWN_AFTER_MS, TEST_ALERT_MESSAGE, ack, dispatch, makeEnvelope, parseEnvelope, preflightSummary, serviceAlert, streamAlerts, type PreflightDestination, type Command, type DaemonLike, type ServiceAlertKind, type StreamDestination, type StateSnapshot, type SyncStatus } from "../src/index";
 import serviceAlertFixtures from "../fixtures/service-alerts.json";
 import fixtures from "../fixtures/parse-cases.json";
 import alertFixtures from "../fixtures/stream-alerts.json";
 import preflightFixtures from "../fixtures/preflight-summary.json";
 import stateTheme from "../fixtures/state-theme.json";
+import syncStatus from "../fixtures/sync-status.json";
 
 type Case = { name: string; input: string; expect: { ok: boolean; command?: unknown; code?: string; id?: string } };
 const cases = fixtures.cases as Case[];
@@ -107,5 +108,14 @@ describe("state with a theme (the same fixture is read by the Rust daemon)", () 
     expect(withTheme.theme?.font).toBe("serif");
     const plain: StateSnapshot = { slideIndex: 0, black: false, stream: "off" };
     expect(plain.theme).toBeUndefined();
+  });
+});
+
+describe("sync status (the same fixture is written by the Rust daemon)", () => {
+  it("is asked for with sync.status and comes back as a SyncStatus", () => {
+    const r = parseEnvelope(JSON.stringify(makeEnvelope(syncStatus.command as Command, { id: "s" })));
+    expect(r.ok && r.envelope.command).toEqual({ type: "sync.status" });
+    const s: SyncStatus = syncStatus.ack.sync as SyncStatus;
+    expect([s.state, s.pending, s.changedElsewhere[0]?.copyId]).toEqual(["offline", 2, "grace-elsewhere-AbCd"]);
   });
 });

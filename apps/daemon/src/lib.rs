@@ -30,6 +30,7 @@ pub mod recording;
 pub mod runsheet;
 pub mod snapshot;
 pub mod stream;
+pub mod sync;
 pub mod tls;
 pub mod watchdog;
 pub mod web;

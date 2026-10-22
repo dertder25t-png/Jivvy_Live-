@@ -139,6 +139,7 @@ fn device_may(command: &Command) -> bool {
             | Command::PushKey
             | Command::PushSubscribe { .. }
             | Command::PushTest
+            | Command::SyncStatus
     )
 }
 
@@ -190,6 +191,8 @@ pub struct Engine {
     theme: Option<serde_json::Value>,
     /// The license key and trial, checked offline; never stops a service.
     license: crate::license::License,
+    /// What the sync thread last said ("ok", "offline", "paused_for_service", ...).
+    sync_state: &'static str,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -285,6 +288,7 @@ impl Engine {
             library,
             theme: None,
             license,
+            sync_state: "not_set_up",
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -321,6 +325,46 @@ impl Engine {
             black: self.state.black,
             since_last_change: self.last_shown_change.elapsed(),
         })
+    }
+
+    /// Plus (the cloud features, sync among them) is active now.
+    pub fn plus_active(&self) -> bool {
+        self.license.plus_active(crate::now_ms())
+    }
+
+    /// The sync thread's latest state, and the documents a round changed here: every screen
+    /// hears of them like any other save, and the theme follows.
+    pub fn synced(&mut self, state: &'static str, changed: Vec<(protocol::DocInfo, bool)>) {
+        self.sync_state = state;
+        if changed.iter().any(|(d, _)| d.kind == "theme" || d.kind == "setting") {
+            let before = self.theme.clone();
+            self.refresh_theme();
+            if self.theme != before {
+                self.broadcast();
+            }
+        }
+        for (doc, deleted) in changed {
+            if let Ok(line) = serde_json::to_vec(&protocol::doc_changed_event(&doc, deleted)) {
+                self.send_to_subscribers(line);
+            }
+        }
+    }
+
+    fn sync_ack(&self, id: &str) -> Ack {
+        let Some(lib) = self.library.as_ref() else {
+            return protocol::nack(
+                id,
+                ErrorCode::Unavailable,
+                "the church computer's library can't be opened; see its log",
+            );
+        };
+        match lib.sync_status(self.sync_state) {
+            Ok(sync) => protocol::ack_with(id, None, AckExtras { sync: Some(sync), ..Default::default() }),
+            Err(e) => {
+                crate::log("engine", format!("library: can't read the sync status: {e:?}"));
+                protocol::nack(id, ErrorCode::Unavailable, "the library couldn't be read; try again")
+            }
+        }
     }
 
     /// The license and trial; the notice only outside a service.
@@ -662,6 +706,7 @@ impl Engine {
             }
             Command::RunSheetSet { run_sheet } => return self.set_run_sheet(id, run_sheet),
             Command::LicenseGet => return self.license_ack(id),
+            Command::SyncStatus => return self.sync_ack(id),
             Command::LicenseSet { key } => {
                 use crate::license::SetError;
                 match self.license.set(&key.0) {
@@ -1917,6 +1962,10 @@ mod tests {
         let mut e = Engine::new(Store::new(&dir).unwrap(), Snapshot::default(), 10);
         assert_eq!(send(&mut e, json!({ "type": "doc.list", "kind": "song" }))["docs"][0]["title"], "Amazing Grace");
         assert_eq!(send(&mut e, json!({ "type": "doc.get", "kind": "song", "id": "grace" }))["doc"]["body"], song);
+        // Waiting for the cloud: no Plus in a trial, so it stays here.
+        e.synced("no_plus", Vec::new());
+        let sync = send(&mut e, json!({ "type": "sync.status" }))["sync"].clone();
+        assert_eq!(sync, json!({ "state": "no_plus", "pending": 1, "changedElsewhere": [] }));
     }
 
     #[test]

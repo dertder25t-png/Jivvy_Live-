@@ -167,7 +167,12 @@ export type Command =
    */
   | { type: "push.subscribe"; endpoint: string; p256dh: string; auth: string }
   /** Pushes a test alert to this device's subscription; `unavailable` if it has none. */
-  | { type: "push.test" };
+  | { type: "push.test" }
+  // ---- Cloud sync (added in v1 without a version bump; older daemons answer unknown_command) ----
+  // The church computer syncs its library with the cloud copy by itself (Plus only). The library
+  // on the church computer stays the master copy; nothing in a service waits on the cloud.
+  /** How syncing is going (`sync` on the ack): last synced, changes waiting, and why it's paused. */
+  | { type: "sync.status" };
 
 export type CommandType = Command["type"];
 
@@ -464,6 +469,7 @@ function parseCommand(raw: unknown): CommandResult {
     case "license.get":
     case "push.key":
     case "push.test":
+    case "sync.status":
     case "recording.list":
       return { ok: true, command: { type: raw.type } };
     case "license.set": {
@@ -826,6 +832,42 @@ export interface AckExtras {
   recordings?: RecordingSet[];
   /** recording.list: where recordings are kept on the church computer, as configured. */
   recordingsFolder?: string;
+  /** sync.status */
+  sync?: SyncStatus;
+}
+
+/**
+ * Where syncing with the cloud stands (fixtures/sync-status.json).
+ * `ok`: syncing (`pending` changes still to send); `offline`: no internet, changes wait here;
+ * `paused_for_service`: a service is on, so sync waits until it's over; `no_plus`: Plus isn't
+ * active, so sync is off and everything stays on this computer; `not_set_up`: Plus is on but
+ * this computer isn't linked to the church account yet. Newer daemons may add states: show
+ * those like `ok`.
+ */
+export interface SyncStatus {
+  state: "ok" | "offline" | "paused_for_service" | "no_plus" | "not_set_up" | (string & {});
+  /** Documents with changes made here that the cloud doesn't have yet. */
+  pending: number;
+  /** When a sync last finished, ms since epoch; left out if never. */
+  lastSyncedAt?: number;
+  /** Documents changed here and elsewhere before they synced, newest first (up to 20). */
+  changedElsewhere: SyncNotice[];
+}
+
+/**
+ * A document changed here and elsewhere before it synced. Each field keeps its latest edit; a
+ * song whose words changed in both places keeps both versions (`copyId`: the other one, titled
+ * "<title> (changed elsewhere)").
+ */
+export interface SyncNotice {
+  kind: string;
+  id: string;
+  title: string;
+  /** When it was noticed, ms since epoch. */
+  at: number;
+  copyId?: string;
+  /** Deleted in one place and edited later in the other: the edit brought it back. */
+  restored?: boolean;
 }
 
 /** One recorded set (a folder of video parts) on the church computer. */

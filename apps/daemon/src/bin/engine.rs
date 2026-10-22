@@ -73,6 +73,22 @@ fn main() {
         }
     }
 
+    // Syncs the library with the church's cloud copy (Plus only), on its own thread; it takes
+    // the engine's lock only to ask whether a service is on and to hand over what changed.
+    // Not linked to a church account yet: the Supabase transport is the next step.
+    {
+        let (gate, report) = (engine.clone(), engine.clone());
+        jivvy_daemon::sync::spawn(
+            data_dir.clone(),
+            None,
+            move || {
+                let e = gate.lock().unwrap_or_else(|p| p.into_inner());
+                (e.plus_active(), e.in_service())
+            },
+            move |state, changed| report.lock().unwrap_or_else(|p| p.into_inner()).synced(state, changed),
+        );
+    }
+
     // Keeps the computer awake while a service is on. One thread for the engine's whole life:
     // Windows ties the request to the thread that made it.
     {

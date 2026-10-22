@@ -173,6 +173,11 @@ impl License {
         Ok(&self.key.insert((key.to_string(), payload)).1)
     }
 
+    /// Plus (the cloud features) is on: a key whose `plus_until` is still ahead.
+    pub fn plus_active(&self, now_ms: u64) -> bool {
+        self.key.as_ref().is_some_and(|(_, p)| now_ms < p.plus_until)
+    }
+
     /// The license and trial at `now_ms`. `in_service`: no notice at all.
     pub fn status(&self, now_ms: u64, in_service: bool) -> LicenseStatus {
         let trial_ends_at = self.trial_started_at.saturating_add(TRIAL_MS);

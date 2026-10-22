@@ -39,9 +39,10 @@ npx wrangler d1 migrations apply jivvy-live-preview --remote --env preview
 | Name | What |
 |---|---|
 | `LICENSE_PRIVATE_KEY` | The production Ed25519 private key, PKCS#8, base64url. Make the pair once (command in `apps/daemon/README.md`, "License and trial"); the public half goes into release daemon builds as `JIVVY_LICENSE_PUBLIC_KEY`. Never use the fixture's published test key here. |
-| `STRIPE_SECRET_KEY` | The Stripe **test** secret key (`sk_test_…`). Live keys are refused until the code is changed on purpose. |
-| `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://live.jivvy.org/api/stripe-webhook` listening for `checkout.session.completed`. |
+| `LICENSE_TEST_PRIVATE_KEY` | The published test signing key (`testOnlyPrivateKeyPkcs8` in `packages/protocol/fixtures/license.json`). Test-mode purchases are signed with this, never with `LICENSE_PRIVATE_KEY`; only debug daemons accept those keys. The webhook issues nothing without it. |
+| `STRIPE_SECRET_KEY` | The Stripe **test** secret or restricted key (`sk_test_…` or `rk_test_…`). Live keys are refused until the code is changed on purpose. |
+| `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://live.jivvy.org/api/stripe-webhook` listening for `checkout.session.completed` and `checkout.session.async_payment_succeeded`. |
 
-**Variables:** `STRIPE_PRICE_ID` (a test-mode one-time price of $200) and `SITE_URL` (e.g. `https://live.jivvy.org`, used for Stripe's return links).
+**Variables:** `STRIPE_PRICE_ID` (a test-mode one-time price of exactly $200 USD; the webhook issues a key only for a `payment` session of 20000 usd) and `SITE_URL` (e.g. `https://live.jivvy.org`, used for Stripe's return links).
 
 Try it with Stripe's test card `4242 4242 4242 4242`. No real charge can happen with a test key.

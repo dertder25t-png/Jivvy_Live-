@@ -6,6 +6,9 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   if (!env.DB) return json({ error: "not configured" }, 503);
   const db = env.DB;
   const store: LicenseStore = {
+    async hasChurch(id) {
+      return !!(await db.prepare("SELECT 1 AS x FROM churches WHERE id = ?1").bind(id).first());
+    },
     async save(l) {
       await db
         .prepare(

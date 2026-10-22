@@ -1,10 +1,17 @@
 // Stripe Checkout and its webhook. Test mode only for now: live keys and live events are refused.
 import type { LicensePayload } from "@jivvy/protocol";
+import { PRICING } from "./pricing";
 
 /** How old a webhook's signed timestamp may be (Stripe's default tolerance). */
 export const SIGNATURE_TOLERANCE_S = 300;
 
-export const isTestSecretKey = (k: string | undefined): k is string => typeof k === "string" && k.startsWith("sk_test_");
+/** A Stripe test-mode secret or restricted key (`sk_test_`, `rk_test_`). */
+export const isTestSecretKey = (k: string | undefined): k is string =>
+  typeof k === "string" && (k.startsWith("sk_test_") || k.startsWith("rk_test_"));
+
+/** What the one church license costs in Stripe (STRIPE_PRICE_ID must be this price): $200, in cents. */
+export const EXPECTED_AMOUNT_CENTS = PRICING.oneTime * 100;
+export const EXPECTED_CURRENCY = "usd";
 
 const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 
@@ -58,8 +65,13 @@ export function paidCheckout(event: unknown): PaidCheckout | null {
   if (typeof event !== "object" || event === null) return null;
   const e = event as { type?: unknown; livemode?: unknown; data?: { object?: Record<string, unknown> } };
   const s = e.data?.object;
-  if (e.type !== "checkout.session.completed" || e.livemode !== false || !s) return null;
+  // async_payment_succeeded: a delayed method (bank debit) that settled after the checkout completed.
+  const types = ["checkout.session.completed", "checkout.session.async_payment_succeeded"];
+  if (typeof e.type !== "string" || !types.includes(e.type) || e.livemode !== false || !s) return null;
   if (s.payment_status !== "paid" || typeof s.id !== "string" || typeof s.client_reference_id !== "string") return null;
+  // Only the one-time church license at its price: anything else is not ours to issue a key for.
+  if (s.mode !== "payment" || s.amount_total !== EXPECTED_AMOUNT_CENTS) return null;
+  if (typeof s.currency !== "string" || s.currency.toLowerCase() !== EXPECTED_CURRENCY) return null;
   return { sessionId: s.id, churchId: s.client_reference_id };
 }
 

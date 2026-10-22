@@ -1,8 +1,10 @@
 // POST /api/checkout: a Stripe Checkout Session for the signed-in church (test mode only).
 import { checkoutForm, isTestSecretKey } from "../../src/lib/stripe";
-import { json, signedIn, type Env } from "../../src/lib/server";
+import { guardPost, json, signedIn, type Env } from "../../src/lib/server";
 
 export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
+  const blocked = guardPost(request);
+  if (blocked) return blocked;
   if (!env.DB) return json({ ok: false, error: "Accounts aren't open yet." }, 503);
   // Never a live key: no real charge until the owner decides to switch.
   if (!isTestSecretKey(env.STRIPE_SECRET_KEY) || !env.STRIPE_PRICE_ID || !env.SITE_URL)

@@ -9,21 +9,30 @@ export const MAX_CODE_ATTEMPTS = 5;
 export const RESEND_MS = 60_000;
 /** How long a sign-in lasts. */
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
-export const SESSION_COOKIE = "jl_session";
+/** `__Host-` pins the cookie to this exact host: Secure, Path=/, no Domain. */
+export const SESSION_COOKIE = "__Host-jl_session";
+/** Digits in a sign-in code. */
+export const CODE_DIGITS = 8;
 
-const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+// Plain addresses only: dotted-atom local part, dotted DNS labels, a letters-only last label.
+const EMAIL =
+  /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 
 /** A trimmed, lowercased email address, or null. */
 export function normalEmail(x: unknown): string | null {
   if (typeof x !== "string") return null;
   const email = x.trim().toLowerCase();
-  return email.length <= 254 && EMAIL.test(email) ? email : null;
+  return email.length <= 254 && email.indexOf("@") <= 64 && EMAIL.test(email) ? email : null;
 }
 
-/** Six random digits. */
+/** Eight random digits, uniform (draws above the largest multiple of 10^8 are thrown away). */
 export function newCode(): string {
-  const n = crypto.getRandomValues(new Uint32Array(1))[0]! % 1_000_000;
-  return n.toString().padStart(6, "0");
+  const range = 10 ** CODE_DIGITS;
+  const limit = 2 ** 32 - (2 ** 32 % range);
+  const buf = new Uint32Array(1);
+  do crypto.getRandomValues(buf);
+  while (buf[0]! >= limit);
+  return (buf[0]! % range).toString().padStart(CODE_DIGITS, "0");
 }
 
 const b64url = (bytes: Uint8Array) =>

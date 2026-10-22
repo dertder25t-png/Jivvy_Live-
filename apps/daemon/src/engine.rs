@@ -193,6 +193,8 @@ pub struct Engine {
     license: crate::license::License,
     /// What the sync thread last said ("ok", "offline", "paused_for_service", ...).
     sync_state: &'static str,
+    /// Why sync can't run here at all (plain words), for `sync.status`.
+    sync_problem: Option<String>,
     subscribers: Vec<Outbox>,
     /// The church computer's subscribers, which also hear about pairing.
     local_subscribers: Vec<Outbox>,
@@ -289,6 +291,7 @@ impl Engine {
             theme: None,
             license,
             sync_state: "not_set_up",
+            sync_problem: None,
             subscribers: Vec::new(),
             local_subscribers: Vec::new(),
             devices,
@@ -334,6 +337,11 @@ impl Engine {
 
     /// The sync thread's latest state, and the documents a round changed here: every screen
     /// hears of them like any other save, and the theme follows.
+    /// Sync can't run on this computer: `why`, in plain words, goes into `sync.status`.
+    pub fn set_sync_problem(&mut self, why: impl Into<String>) {
+        self.sync_problem = Some(why.into());
+    }
+
     pub fn synced(&mut self, state: &'static str, changed: Vec<(protocol::DocInfo, bool)>) {
         self.sync_state = state;
         if changed.iter().any(|(d, _)| d.kind == "theme" || d.kind == "setting") {
@@ -359,7 +367,10 @@ impl Engine {
             );
         };
         match lib.sync_status(self.sync_state) {
-            Ok(sync) => protocol::ack_with(id, None, AckExtras { sync: Some(sync), ..Default::default() }),
+            Ok(mut sync) => {
+                sync.problem = self.sync_problem.clone();
+                protocol::ack_with(id, None, AckExtras { sync: Some(sync), ..Default::default() })
+            }
             Err(e) => {
                 crate::log("engine", format!("library: can't read the sync status: {e:?}"));
                 protocol::nack(id, ErrorCode::Unavailable, "the library couldn't be read; try again")

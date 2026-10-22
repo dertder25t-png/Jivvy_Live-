@@ -3,10 +3,11 @@
 // cloud copy (apps/site/supabase/0001_sync.sql reads app_metadata.church_id from it).
 //
 // 1. POST /api/sync/nonce          -> { nonce }   (single use, 5 minutes)
-// 2. POST /api/sync/token { nonce, publicKey, signature, licenseKey? }
+// 2. POST /api/sync/token { nonce, publicKey, signature, licenseKey?, name? }
 //    signature: ECDSA P-256 / SHA-256, raw r||s, base64url, over SYNC_SIGNING_PREFIX + nonce + "\n" + publicKey.
 //    publicKey: the uncompressed P-256 point, base64url. A key seen before needs no license key;
-//    a new one is registered to the license key's church (at most MAX_DEVICES per church).
+//    a new one is registered to the license key's church (at most MAX_DEVICES per church, Plus
+//    only). A key the church removed on /account never gets a token again.
 //    -> { token, expiresAt, supabaseUrl, supabaseAnonKey }, only while the church has Plus.
 // Nothing here is needed during a service: sync pauses then, and the library is on the computer.
 
@@ -29,12 +30,17 @@ export interface SyncEnv {
 export interface SyncStore {
   /** Deletes the nonce if it exists and hasn't expired; true only for the one caller that did. */
   useNonce(nonce: string, nowMs: number): Promise<boolean>;
-  /** The church a registered device key belongs to. */
-  deviceChurch(publicKey: string): Promise<string | null>;
+  /** A device key seen before: its church, and whether the church removed it. */
+  device(publicKey: string): Promise<{ churchId: string; removed: boolean } | null>;
   /** The church a license key was issued to (from the licenses table, never from the key's own text). */
   licenseChurch(licenseKey: string): Promise<string | null>;
-  deviceCount(churchId: string): Promise<number>;
-  addDevice(publicKey: string, churchId: string, nowMs: number): Promise<void>;
+  /**
+   * Registers a new device key, in one conditional write: only while the church has fewer than
+   * `max` devices not removed, so parallel requests can't pass the limit. True if it was added.
+   */
+  addDevice(publicKey: string, churchId: string, name: string, nowMs: number, max: number): Promise<boolean>;
+  /** Notes when the device last got a token (shown on the account page). */
+  touchDevice(publicKey: string, nowMs: number): Promise<void>;
   /** The latest plus_until of the church's licenses (0: none). */
   plusUntil(churchId: string): Promise<number>;
 }
@@ -108,17 +114,31 @@ export async function handleSyncToken(data: Record<string, unknown>, env: SyncEn
   if (!(await verifyDevice(publicKey, signedText(nonce, publicKey), signature)))
     return { status: 401, body: { ok: false, error: "bad signature" } };
   if (!(await store.useNonce(nonce, nowMs))) return { status: 401, body: { ok: false, error: "nonce expired; ask for a new one" } };
-  let church = await store.deviceChurch(publicKey);
-  if (!church) {
-    // A new church computer: registered to the church whose license key it holds.
+  const noPlus: Answer = { status: 403, body: { ok: false, error: "no_plus" } };
+  const known = await store.device(publicKey);
+  // Removed on the account page: this key never gets a token again.
+  if (known?.removed) return { status: 403, body: { ok: false, error: "device_removed" } };
+  let church = known?.churchId ?? null;
+  if (church) {
+    if ((await store.plusUntil(church)) <= nowMs) return noPlus;
+  } else {
+    // A new church computer: registered to the church whose license key it holds, only with Plus.
     if (!licenseKey) return { status: 401, body: { ok: false, error: "unknown_device" } };
     church = await store.licenseChurch(licenseKey);
     if (!church) return { status: 403, body: { ok: false, error: "That license key isn't one we issued." } };
-    if ((await store.deviceCount(church)) >= MAX_DEVICES)
-      return { status: 403, body: { ok: false, error: `This church already syncs on ${MAX_DEVICES} computers.` } };
-    await store.addDevice(publicKey, church, nowMs);
+    if ((await store.plusUntil(church)) <= nowMs) return noPlus;
+    const name = typeof data.name === "string" ? data.name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 64) : "";
+    if (!(await store.addDevice(publicKey, church, name, nowMs, MAX_DEVICES))) {
+      // Lost a race with itself (fine) or the church is at the limit.
+      const now = await store.device(publicKey);
+      if (!now || now.removed || now.churchId !== church)
+        return {
+          status: 403,
+          body: { ok: false, error: `This church already syncs on ${MAX_DEVICES} computers. Remove one at live.jivvy.org/account.` },
+        };
+    }
   }
-  if ((await store.plusUntil(church)) <= nowMs) return { status: 403, body: { ok: false, error: "no_plus" } };
+  await store.touchDevice(publicKey, nowMs);
   const claims = syncClaims(church, nowMs);
   return {
     status: 200,

@@ -32,8 +32,11 @@ pub const DEFAULT_SITE: &str = "https://live.jivvy.org";
 pub const SIGNING_PREFIX: &str = "jivvy-live sync token v1\n";
 /// A token this close to its end is replaced before the next request.
 const REFRESH_BEFORE_MS: u64 = 5 * 60 * 1000;
-/// The largest answer read: a pull of 200 fields of up to 512 KB each.
-const MAX_ANSWER: u64 = 128 * 1024 * 1024;
+/// The largest sign-in answer read (a nonce, or a token and where it works).
+const MAX_SIGN_IN_ANSWER: u64 = 64 * 1024;
+/// The largest data answer read: a pull (or a push's refused rows) of 200 fields of up to
+/// 512 KB each, with room for JSON escaping and the other columns.
+const MAX_DATA_ANSWER: u64 = 128 * 1024 * 1024;
 
 /// The current token, where it works, and when it ends. Not `Debug`, so it can't be logged.
 struct Token {
@@ -65,20 +68,54 @@ fn is_loopback(host_and_path: &str) -> bool {
     host == "127.0.0.1" || host == "localhost"
 }
 
-/// This computer's sync device key (PKCS#8), made once and kept in `dir`.
+/// What `sync.status` says when the device key file is there but unusable.
+pub const KEY_UNREADABLE: &str = "sync device key can't be read";
+
+/// This computer's sync device key (PKCS#8), made only when `dir` has none. A key file that is
+/// there but can't be read or parsed is never replaced (that would be a different computer to
+/// the site); sync stays off with a plain reason instead.
 fn device_key(dir: &Path) -> std::io::Result<EcdsaKeyPair> {
     let path = dir.join("sync-device-key.p8");
     let rng = SystemRandom::new();
-    if let Ok(bytes) = std::fs::read(&path)
-        && let Ok(key) = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &bytes, &rng)
-    {
-        return Ok(key);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            return EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &bytes, &rng)
+                .map_err(|_| std::io::Error::other(KEY_UNREADABLE));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(std::io::Error::other(KEY_UNREADABLE)),
     }
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-        .map_err(|_| std::io::Error::other("can't make a key"))?;
-    crate::devices::save_durably(&path, pkcs8.as_ref())?;
+        .map_err(|_| std::io::Error::other("can't make a sync device key"))?;
+    save_new_private(&path, pkcs8.as_ref())?;
     EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
-        .map_err(|_| std::io::Error::other("can't read the key just made"))
+        .map_err(|_| std::io::Error::other(KEY_UNREADABLE))
+}
+
+/// Writes `bytes` to a new file at `path` (owner-only on Unix), whole or not at all, and never
+/// over a file already there: a temp file, flushed, then hard-linked into place.
+fn save_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp-{}", crate::devices::random_id(6)));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let written = (|| {
+        let mut f = open.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::hard_link(&tmp, path)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    written
+}
+
+/// This computer's name (at most 64 characters), for the church's list of computers.
+fn computer_name() -> String {
+    let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_default();
+    name.chars().filter(|c| !c.is_control()).take(64).collect()
 }
 
 /// A row of `sync_fields` as PostgREST sends it.
@@ -109,6 +146,8 @@ impl SupabaseTransport {
         let public_key = B64.encode(key.public_key().as_ref());
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            // A redirect could carry the token somewhere else: never followed, an error instead.
+            .max_redirects(0)
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_global(Some(Duration::from_secs(60)))
             .user_agent(format!("Jivvy / Jivvy Live / {}", env!("CARGO_PKG_VERSION")))
@@ -117,9 +156,16 @@ impl SupabaseTransport {
         Ok(SupabaseTransport { site, data_dir: data_dir.to_path_buf(), key, public_key, agent, token: None })
     }
 
-    /// Sends one request (POST with a JSON body, else GET) and reads its JSON answer. Any failure to connect or read is `Offline`;
-    /// the URL and headers never reach an error.
-    fn send(&self, url: &str, headers: &[(&str, &str)], body: Option<&Value>) -> Result<(u16, Value), SyncError> {
+    /// Sends one request (POST with a JSON body, else GET) and reads its JSON answer, at most
+    /// `limit` bytes. Any failure to connect or read is `Offline`; a redirect is refused. The
+    /// URL and headers never reach an error.
+    fn send(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&Value>,
+        limit: u64,
+    ) -> Result<(u16, Value), SyncError> {
         let result = match body {
             Some(b) => {
                 let bytes = serde_json::to_vec(b).map_err(|e| SyncError::Local(e.to_string()))?;
@@ -139,7 +185,10 @@ impl SupabaseTransport {
         };
         let resp = result.map_err(|_| SyncError::Offline)?;
         let status = resp.status().as_u16();
-        let bytes = resp.into_body().with_config().limit(MAX_ANSWER).read_to_vec().map_err(|_| SyncError::Offline)?;
+        if (300..400).contains(&status) {
+            return Err(SyncError::Cloud(format!("the cloud answered with a redirect ({status}); not following it")));
+        }
+        let bytes = resp.into_body().with_config().limit(limit).read_to_vec().map_err(|_| SyncError::Offline)?;
         let value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
         Ok((status, value))
     }
@@ -149,7 +198,8 @@ impl SupabaseTransport {
     fn sign_in(&mut self) -> Result<(), SyncError> {
         let mut license: Option<String> = None;
         loop {
-            let (status, answer) = self.send(&format!("{}/api/sync/nonce", self.site), &[], Some(&json!({})))?;
+            let nonce_url = format!("{}/api/sync/nonce", self.site);
+            let (status, answer) = self.send(&nonce_url, &[], Some(&json!({})), MAX_SIGN_IN_ANSWER)?;
             let nonce = match answer["nonce"].as_str() {
                 Some(n) if status == 200 => n.to_string(),
                 _ => return Err(SyncError::Cloud(format!("live.jivvy.org refused to sign in ({status})"))),
@@ -163,8 +213,11 @@ impl SupabaseTransport {
                 json!({ "nonce": nonce, "publicKey": self.public_key, "signature": B64.encode(signature.as_ref()) });
             if let Some(l) = &license {
                 body["licenseKey"] = Value::String(l.clone());
+                // Shown on the church's account page, to tell its computers apart.
+                body["name"] = Value::String(computer_name());
             }
-            let (status, answer) = self.send(&format!("{}/api/sync/token", self.site), &[], Some(&body))?;
+            let token_url = format!("{}/api/sync/token", self.site);
+            let (status, answer) = self.send(&token_url, &[], Some(&body), MAX_SIGN_IN_ANSWER)?;
             if status == 200 {
                 let token = (|| {
                     let url = answer["supabaseUrl"].as_str()?.trim_end_matches('/').to_string();
@@ -197,6 +250,8 @@ impl SupabaseTransport {
             }
             return Err(SyncError::Cloud(if why == "no_plus" {
                 "Plus isn't active for this church at live.jivvy.org".to_string()
+            } else if why == "device_removed" {
+                "this computer was removed from sync on the church's account at live.jivvy.org".to_string()
             } else {
                 format!("live.jivvy.org refused to sign in: {why}")
             }));
@@ -216,7 +271,7 @@ impl SupabaseTransport {
             let auth = format!("Bearer {}", t.jwt);
             let headers =
                 [("apikey", t.anon_key.as_str()), ("Authorization", auth.as_str()), ("Accept", "application/json")];
-            let (status, answer) = self.send(&url, &headers, body)?;
+            let (status, answer) = self.send(&url, &headers, body, MAX_DATA_ANSWER)?;
             match status {
                 200..=299 => return Ok(answer),
                 401 | 403 if attempt == 0 => self.token = None,
@@ -355,6 +410,7 @@ mod tests {
                             .collect();
                         (200, Value::Array(rows))
                     }
+                    (_, p) if p.starts_with("/moved/") => (302, json!({})),
                     _ => (404, json!({ "error": "not found" })),
                 };
                 drop(s);
@@ -403,6 +459,16 @@ mod tests {
             (2, 2, 2),
             "the license key went once per computer"
         );
+        drop(s);
+        // A redirect is never followed.
+        let mut moved = SupabaseTransport::new(&format!("{site}/moved"), &da).unwrap();
+        assert!(matches!(moved.pull(0, 10), Err(SyncError::Cloud(why)) if why.contains("redirect")));
+        // A key file that can't be read is never replaced: sync stays off and says why.
+        let key_file = da.join("sync-device-key.p8");
+        std::fs::write(&key_file, b"not a key").unwrap();
+        let err = SupabaseTransport::new(&site, &da).err().expect("an unreadable key stops sync");
+        assert_eq!(err.to_string(), KEY_UNREADABLE);
+        assert_eq!(std::fs::read(&key_file).unwrap(), b"not a key");
         drop((a, b));
         let _ = (std::fs::remove_dir_all(&da), std::fs::remove_dir_all(&db));
     }

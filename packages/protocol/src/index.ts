@@ -852,6 +852,8 @@ export interface SyncStatus {
   lastSyncedAt?: number;
   /** Documents changed here and elsewhere before they synced, newest first (up to 20). */
   changedElsewhere: SyncNotice[];
+  /** Why sync can't run on this computer, in plain words (e.g. its device key can't be read); left out when nothing is wrong. */
+  problem?: string;
 }
 
 /**

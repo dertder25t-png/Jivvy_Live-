@@ -11,5 +11,13 @@
         { "kind": "plan", "id": "sunday", "title": "Sunday 9:30", "at": 1791646100000, "restored": true }
       ]
     }
+  },
+  "withProblem": {
+    "sync": {
+      "state": "not_set_up",
+      "pending": 0,
+      "changedElsewhere": [],
+      "problem": "sync device key can't be read"
+    }
   }
 }

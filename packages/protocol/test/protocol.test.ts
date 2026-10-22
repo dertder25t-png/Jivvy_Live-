@@ -117,5 +117,7 @@ describe("sync status (the same fixture is written by the Rust daemon)", () => {
     expect(r.ok && r.envelope.command).toEqual({ type: "sync.status" });
     const s: SyncStatus = syncStatus.ack.sync as SyncStatus;
     expect([s.state, s.pending, s.changedElsewhere[0]?.copyId]).toEqual(["offline", 2, "grace-elsewhere-AbCd"]);
+    const p: SyncStatus = syncStatus.withProblem.sync as SyncStatus;
+    expect([p.state, p.problem]).toEqual(["not_set_up", "sync device key can't be read"]);
   });
 });

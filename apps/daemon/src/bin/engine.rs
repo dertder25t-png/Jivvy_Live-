@@ -85,6 +85,7 @@ fn main() {
             Ok(t) => Some(Box::new(t) as Box<dyn jivvy_daemon::sync::Transport>),
             Err(e) => {
                 log("engine", format!("sync is off: {e}"));
+                engine.lock().unwrap_or_else(|p| p.into_inner()).set_sync_problem(e.to_string());
                 None
             }
         };

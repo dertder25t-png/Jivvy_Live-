@@ -223,6 +223,9 @@ pub struct SyncStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced_at: Option<u64>,
     pub changed_elsewhere: Vec<Notice>,
+    /// Why sync can't run on this computer, in plain words; none when nothing is wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// A document changed here and elsewhere before it synced.
@@ -494,7 +497,7 @@ impl Library {
                 })
             })?
             .collect::<Result<_, _>>()?;
-        Ok(SyncStatus { state, pending: self.sync_pending()?, last_synced_at, changed_elsewhere })
+        Ok(SyncStatus { state, pending: self.sync_pending()?, last_synced_at, changed_elsewhere, problem: None })
     }
 }
 
@@ -1019,8 +1022,17 @@ mod tests {
                     restored: true,
                 },
             ],
+            problem: None,
         };
         assert_eq!(serde_json::to_value(&status).unwrap(), f["ack"]["sync"]);
+        let broken = SyncStatus {
+            state: "not_set_up",
+            pending: 0,
+            last_synced_at: None,
+            changed_elsewhere: vec![],
+            problem: Some("sync device key can't be read".into()),
+        };
+        assert_eq!(serde_json::to_value(&broken).unwrap(), f["withProblem"]["sync"]);
         assert_eq!(
             [
                 paused(false, true, true),

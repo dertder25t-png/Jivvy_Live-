@@ -59,6 +59,9 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # HTTP: YouTube's HLS segment upload, and the pre-flight upload test.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 wry = "0.57"
+# Web push alerts to the tech lead: the RFC 8291 payload encryption (MIT OR Apache-2.0, pure
+# Rust). VAPID is signed with ring above, so its optional JWT dependency stays off.
+web-push-native = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 # Test certificates for the wss tests.

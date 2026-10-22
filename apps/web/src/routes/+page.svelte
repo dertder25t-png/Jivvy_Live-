@@ -13,6 +13,7 @@
   import { LOCK_KEY, isLocked, lock, unlock, validPin } from "$lib/lock";
   import Export from "$lib/Export.svelte";
   import License from "$lib/License.svelte";
+  import SyncStatusLine from "$lib/SyncStatus.svelte";
   import Operator from "$lib/Operator.svelte";
   import PreflightCheck from "$lib/Preflight.svelte";
   import AlertPush from "$lib/AlertPush.svelte";
@@ -601,6 +602,7 @@
     </form>
     <Export {ready} sender={() => conn} beforeExport={savePlansNow} />
     <License {ready} {live} send={(c) => conn?.send(c)} />
+    <SyncStatusLine {ready} send={(c) => conn?.send(c)} />
   {/if}
   <button class="lock" onclick={() => openPin(locked ? "unlock" : "lock")} aria-expanded={pinForm !== ""}>
     {locked ? "Unlock" : "Lock for volunteers"}

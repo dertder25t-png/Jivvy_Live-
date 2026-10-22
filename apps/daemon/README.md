@@ -155,6 +155,17 @@ A destination whose address is `https://` uses YouTube's HLS ingestion instead o
   node -e "crypto.subtle.generateKey({name:'Ed25519'},true,['sign','verify']).then(async k=>{const b=a=>Buffer.from(a).toString('base64url');console.log('public ',b(await crypto.subtle.exportKey('raw',k.publicKey)));console.log('private',b(await crypto.subtle.exportKey('pkcs8',k.privateKey)))})"
   ```
 
+## Cloud sync (Plus)
+
+`src/sync.rs`. The library on this computer stays the master copy; the cloud is a synced copy, and nothing in a service waits on it.
+
+- **Outbox:** every `doc.put` / `doc.delete` notes which fields changed (`title`, `deleted`, each top-level `body.<key>`) in `library.sqlite3` (`sync_fields`), in the save's own transaction, each stamped with a hybrid logical clock (ms, counter, this computer's node id). Dirty fields are the outbox; many edits to one field offline send one change. Documents saved before sync existed are added once when the library opens.
+- **Merge:** a round pulls the cloud's changes since its cursor, then pushes the outbox. Per field, the later clock wins (the cloud applies the same rule, so every copy converges). A field changed here and elsewhere before syncing gives a "changed elsewhere" notice (`sync.status`). When a song's words (`sections`, `arrangement`) changed in both places, this computer keeps its words and saves the other version as a new song, "<title> (changed elsewhere)". Screens hear merged changes as `doc.changed`.
+- **When:** its own thread and its own database connection, every 15 s while all is well, backing off up to 5 minutes while offline. It takes the engine's lock only to ask whether a service is on (`Engine::in_service`) and to hand over what changed, never across a network call. It waits while a service is on, and stops when Plus ends (`plusUntil`), leaving the local copy complete; the outbox keeps collecting, so turning Plus back on sends everything.
+- **Status:** `sync.status` answers `{ state, pending, lastSyncedAt?, changedElsewhere }`, `state` one of `ok`, `offline`, `paused_for_service`, `no_plus`, `not_set_up` (fixture `packages/protocol/fixtures/sync-status.json`).
+- **Transport:** behind the `Transport` trait; `MemoryCloud` is the in-memory stand-in the tests use. The Supabase (PostgREST) transport is the next PR, so for now a church with Plus shows `not_set_up`. The cloud schema and row-level security are in `apps/site/supabase/0001_sync.sql`, for the owner to apply; nothing creates Supabase projects, tables or keys.
+- **Config the Supabase transport will need** (none of it in the repo or the logs): the project URL (`https://<ref>.supabase.co`), its anon (publishable) key, and the church computer's sign-in from the church account: a Supabase Auth user whose `app_metadata.church_id` is the license key's `church`, set by live.jivvy.org with the service role. Its refresh token is kept in the data directory and never logged. Pull is `GET /rest/v1/sync_fields?seq=gt.<cursor>&order=seq.asc&limit=200`; push is `POST /rest/v1/rpc/sync_push`.
+
 ## Command channel
 
 Newline-delimited JSON on `127.0.0.1:47800`, one protocol envelope per line and one ack per line. Every ok ack carries `state`. After `state.subscribe`, the connection also receives `state` events on every change, `levels` events for meters, and `alert` events (a platform lowered, paused or resumed).

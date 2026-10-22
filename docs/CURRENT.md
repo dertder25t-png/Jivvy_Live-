@@ -18,7 +18,7 @@ Read this file and your one item only. Do not read the whole repo or the full `d
 - Base branch: `main`. The lead merges PRs once review and CI are done.
 
 ## Remaining items (round 4)
-- [ ] Sync engine between the church computer and Supabase — branch `daemon/sync` (first PR: the local edit queue and sync logic against a fake; no cloud resources created)
+- [~] Sync engine — #65 merged (outbox, per-field merge, conflicts, status, against a fake). Next: the real Supabase transport PR.
 - Later: email alerts via the church account; Stripe go-live (owner).
 - Merged so far: #48–#64 (see BUILD_PLAN.md).
 

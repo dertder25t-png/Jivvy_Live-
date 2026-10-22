@@ -15,3 +15,4 @@ Format: `- [ ] YYYY-MM-DD · test or area · symptom (link to the CI run if ther
 - [ ] 2026-10-16 · no-sleep is Windows only (`apps/daemon/src/power.rs`) · TODO: macOS (IOPMAssertion) and Linux (systemd-inhibit) before those church computers are supported.
 
 ## Fixed
+- [ ] 2026-10-21 · sync far-future fields (`apps/daemon/src/sync.rs`) · a local edit to a field the cloud holds more than 24 h ahead is stamped just after it, which the cloud then refuses; only possible for rows written before the SQL 24 h check, so none exist today. Revisit with the real transport.

@@ -23,8 +23,9 @@
 //! - A top-level body value of `null` counts as removed; a document made again sends `null` for
 //!   every field it had before, so no copy brings an old field back.
 //!
-//! The cloud is behind `Transport`; `MemoryCloud` is an in-memory stand-in with the same rules
-//! as `apps/site/supabase/0001_sync.sql`. Nothing here logs a token.
+//! The cloud is behind `Transport`: `sync_cloud::SupabaseTransport` is the real one, and
+//! `MemoryCloud` an in-memory stand-in with the same rules as `apps/site/supabase/0001_sync.sql`.
+//! Nothing here logs a token.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -222,6 +223,9 @@ pub struct SyncStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced_at: Option<u64>,
     pub changed_elsewhere: Vec<Notice>,
+    /// Why sync can't run on this computer, in plain words; none when nothing is wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// A document changed here and elsewhere before it synced.
@@ -493,7 +497,7 @@ impl Library {
                 })
             })?
             .collect::<Result<_, _>>()?;
-        Ok(SyncStatus { state, pending: self.sync_pending()?, last_synced_at, changed_elsewhere })
+        Ok(SyncStatus { state, pending: self.sync_pending()?, last_synced_at, changed_elsewhere, problem: None })
     }
 }
 
@@ -1018,8 +1022,17 @@ mod tests {
                     restored: true,
                 },
             ],
+            problem: None,
         };
         assert_eq!(serde_json::to_value(&status).unwrap(), f["ack"]["sync"]);
+        let broken = SyncStatus {
+            state: "not_set_up",
+            pending: 0,
+            last_synced_at: None,
+            changed_elsewhere: vec![],
+            problem: Some("sync device key can't be read".into()),
+        };
+        assert_eq!(serde_json::to_value(&broken).unwrap(), f["withProblem"]["sync"]);
         assert_eq!(
             [
                 paused(false, true, true),

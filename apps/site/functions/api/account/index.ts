@@ -10,5 +10,14 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
   )
     .bind(church.id)
     .all();
-  return json({ ok: true, signedIn: true, email: church.email, churchId: church.id, licenses: results });
+  // Church computers that sync; removed ones are left out. Their table arrives with migration
+  // 0005, so a database without it still shows the account.
+  const devices = await env.DB.prepare(
+    "SELECT public_key AS publicKey, name, created_at AS createdAt, last_used_at AS lastUsedAt FROM sync_devices WHERE church_id = ?1 AND removed_at IS NULL ORDER BY created_at",
+  )
+    .bind(church.id)
+    .all()
+    .then((r) => r.results)
+    .catch(() => []);
+  return json({ ok: true, signedIn: true, email: church.email, churchId: church.id, licenses: results, devices });
 };

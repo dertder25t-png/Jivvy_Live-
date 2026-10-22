@@ -38,6 +38,11 @@ import { PRICING } from "../lib/pricing";
         <div id="licenses"></div>
         <button id="buy">Buy a license (${PRICING.oneTime}, test mode)</button>
         <p class="sub">Paste the key into Jivvy Live on the church computer: License, then Save key. It is checked on that computer with no internet needed.</p>
+        <div id="devices-box" hidden>
+          <h2>Computers that sync</h2>
+          <p class="sub">With Plus, up to 5 church computers keep the library in sync. Remove one you no longer use to make room; a removed computer stops syncing.</p>
+          <ul id="devices"></ul>
+        </div>
       </section>
 
       <p id="note" role="status"></p>
@@ -69,6 +74,25 @@ import { PRICING } from "../lib/pricing";
           key.value = l.key;
           box.append(p, key);
           list.append(box);
+        }
+        const devices = $("devices");
+        devices.replaceChildren();
+        $("devices-box").hidden = !(a.devices || []).length;
+        for (const d of a.devices || []) {
+          const li = document.createElement("li");
+          const text = document.createElement("span");
+          text.textContent = `${d.name || `Added ${day(d.createdAt)}`}: last seen ${day(d.lastUsedAt)}. `;
+          const remove = document.createElement("button");
+          remove.className = "link";
+          remove.textContent = "Remove";
+          remove.addEventListener("click", async () => {
+            if (!confirm("Stop this computer from syncing? Its library stays on it.")) return;
+            const r = await post("/api/account/device-remove", { publicKey: d.publicKey });
+            if (!r.ok) note(r.error);
+            load();
+          });
+          li.append(text, remove);
+          devices.append(li);
         }
         if (!(a.licenses || []).length && new URLSearchParams(location.search).has("paid"))
           note("Thank you. Your key appears here within a minute; refresh to see it.");

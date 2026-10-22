@@ -2,7 +2,7 @@
 //!
 //! jivvy-engine [--data-dir DIR] [--listen ADDR] [--slides N] [--supervised]
 //!              [--listen-ws ADDR] [--ws-origin ORIGIN]... [--ws-cert PEM --ws-key PEM]
-//!              [--upload-test-url URL]
+//!              [--upload-test-url URL] [--sync-url URL]
 //!
 //! `--listen-ws` also serves the protocol over WebSocket (off by default). Browsers may use
 //! it only from an origin given with `--ws-origin`; programs always may. With `--ws-cert` and
@@ -29,6 +29,7 @@ fn main() {
     let mut ws_access = engine::WsAccess::default();
     let (mut ws_cert, mut ws_key): (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let mut upload_test_url: Option<String> = None;
+    let mut sync_url = jivvy_daemon::sync_cloud::DEFAULT_SITE.to_string();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| fail(&format!("{flag} needs a value")));
@@ -51,6 +52,8 @@ fn main() {
             "--ws-key" => ws_key = Some(PathBuf::from(val())),
             // Pre-flight's upload test (tests point it at a local stand-in).
             "--upload-test-url" => upload_test_url = Some(val()),
+            // Where sync signs in (tests point it at a local stand-in).
+            "--sync-url" => sync_url = val(),
             other => fail(&format!("unknown flag {other}")),
         }
     }
@@ -75,12 +78,20 @@ fn main() {
 
     // Syncs the library with the church's cloud copy (Plus only), on its own thread; it takes
     // the engine's lock only to ask whether a service is on and to hand over what changed.
-    // Not linked to a church account yet: the Supabase transport is the next step.
+    // It signs in at live.jivvy.org (or --sync-url) with this computer's device key.
     {
         let (gate, report) = (engine.clone(), engine.clone());
+        let transport = match jivvy_daemon::sync_cloud::SupabaseTransport::new(&sync_url, &data_dir) {
+            Ok(t) => Some(Box::new(t) as Box<dyn jivvy_daemon::sync::Transport>),
+            Err(e) => {
+                log("engine", format!("sync is off: {e}"));
+                engine.lock().unwrap_or_else(|p| p.into_inner()).set_sync_problem(e.to_string());
+                None
+            }
+        };
         jivvy_daemon::sync::spawn(
             data_dir.clone(),
-            None,
+            transport,
             move || {
                 let e = gate.lock().unwrap_or_else(|p| p.into_inner());
                 (e.plus_active(), e.in_service())

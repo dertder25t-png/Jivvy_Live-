@@ -11,6 +11,7 @@ Format: `- [ ] YYYY-MM-DD · test or area · symptom (link to the CI run if ther
 - [ ] 2026-10-14 · engine lock vs. disk flushes · `fsync` runs while the engine's lock is held (the snapshot on every slide change, and the last piece of an image upload, #41); on a stalled disk that can outlast the watchdog's 2 s heartbeat and restart the engine. Decide in 1B whether flushes move off the lock or the heartbeat stops depending on it (codex review on #41).
 - [ ] 2026-10-16 · PWA service worker · a tab left open across an update can fail a lazy import of an old chunk, because `activate` deletes the old cache at once; a reload fixes it.
 - [ ] 2026-10-21 · license trial (`apps/daemon/src/license.rs`) · the 30-day trial starts again if `license-trial.json` is deleted, and a clock set back extends it. Decide in 1B whether to anchor it (e.g. in the library database); it must never stop a service either way.
+- [ ] 2026-10-21 · no-sound alert thresholds (`apps/daemon/src/protocol.rs`, `SILENCE_DB` -60 dBFS for `SILENCE_AFTER` 10 s) · fixed constants; a quiet prayer or a noisy room may need them set per church. Make them configurable in 1B (#63).
 - [ ] 2026-10-16 · no-sleep is Windows only (`apps/daemon/src/power.rs`) · TODO: macOS (IOPMAssertion) and Linux (systemd-inhibit) before those church computers are supported.
 
 ## Fixed

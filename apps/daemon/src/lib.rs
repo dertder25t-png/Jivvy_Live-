@@ -25,6 +25,7 @@ pub mod power;
 pub mod preflight;
 pub mod program;
 pub mod protocol;
+pub mod push;
 pub mod recording;
 pub mod runsheet;
 pub mod snapshot;

@@ -23,6 +23,8 @@ export interface Env {
   SUPABASE_ANON_KEY?: string;
   /** Signs church computers' 1-hour sync tokens (HS256). Never sent anywhere. */
   SUPABASE_JWT_SECRET?: string;
+  /** Addresses allowed into /admin (comma separated). They sign in with the usual emailed code. */
+  ADMIN_EMAILS?: string;
 }
 
 export const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>

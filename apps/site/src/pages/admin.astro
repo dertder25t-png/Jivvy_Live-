@@ -1,0 +1,271 @@
+---
+// The owner's admin page: the waitlist and church accounts. Only ADMIN_EMAILS get data.
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Admin · Jivvy Live</title>
+    <meta name="theme-color" content="#10224F" />
+    <link rel="icon" href="/brand/jivvy-app-icon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <main>
+      <a href="/"><img src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="147" height="60" /></a>
+      <h1>Admin</h1>
+
+      <section id="signin" hidden>
+        <p class="sub">Sign in with an admin address. We email you a code.</p>
+        <form id="email-form">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required />
+          <button type="submit">Email me a code</button>
+        </form>
+        <form id="code-form" hidden>
+          <label for="code">The 8-digit code we emailed you</label>
+          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required />
+          <button type="submit">Sign in</button>
+        </form>
+      </section>
+
+      <section id="admin" hidden>
+        <p>Signed in as <strong id="who"></strong>. <button id="logout" class="link">Sign out</button></p>
+
+        <div class="stats">
+          <div><strong id="n-total">0</strong><span>on the waitlist</span></div>
+          <div><strong id="n-alpha">0</strong><span>want to test the alpha</span></div>
+          <div><strong id="n-week">0</strong><span>joined in the last 7 days</span></div>
+          <div><strong id="n-accounts">0</strong><span>church accounts</span></div>
+        </div>
+
+        <h2>Waitlist</h2>
+        <div class="tools">
+          <input id="search" type="search" placeholder="Search email, church, software" aria-label="Search the waitlist" />
+          <label class="check"><input id="alpha-only" type="checkbox" /> Alpha testers only</label>
+          <a class="button" href="/api/admin/waitlist?format=csv">Download CSV</a>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Email</th><th>Church</th><th>Size</th><th>Software</th><th>Alpha</th><th>Joined</th><th></th></tr></thead>
+            <tbody id="waitlist"></tbody>
+          </table>
+        </div>
+        <p class="sub" id="shown"></p>
+
+        <h2>Church accounts</h2>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Email</th><th>Created</th><th>Licenses</th><th>Plus</th><th>Syncing computers</th></tr></thead>
+            <tbody id="accounts"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <p id="note" role="status"></p>
+    </main>
+
+    <script is:inline>
+      const $ = (id) => document.getElementById(id);
+      const note = (t) => ($("note").textContent = t || "");
+      const post = (url, body) =>
+        fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) }).then((r) => r.json());
+      const day = (d) => new Date(d).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+      // D1 stores waitlist times as "YYYY-MM-DD HH:MM:SS" in UTC.
+      const utc = (s) => new Date(s.replace(" ", "T") + "Z");
+      let waitlist = [];
+
+      const td = (text) => {
+        const c = document.createElement("td");
+        c.textContent = text;
+        return c;
+      };
+
+      function renderWaitlist() {
+        const q = $("search").value.trim().toLowerCase();
+        const alphaOnly = $("alpha-only").checked;
+        const rows = waitlist.filter(
+          (w) => (!alphaOnly || w.alphaTester) && (!q || [w.email, w.church, w.software, w.size].some((v) => v.toLowerCase().includes(q))),
+        );
+        const body = $("waitlist");
+        body.replaceChildren();
+        for (const w of rows) {
+          const tr = document.createElement("tr");
+          const remove = document.createElement("button");
+          remove.className = "link";
+          remove.textContent = "Remove";
+          remove.addEventListener("click", async () => {
+            if (!confirm(`Delete ${w.email} from the waitlist? This can't be undone.`)) return;
+            const r = await post("/api/admin/waitlist-remove", { email: w.email });
+            note(r.ok ? `Removed ${w.email}.` : r.error);
+            load();
+          });
+          const action = document.createElement("td");
+          action.append(remove);
+          tr.append(td(w.email), td(w.church), td(w.size), td(w.software), td(w.alphaTester ? "Yes" : ""), td(day(utc(w.createdAt))), action);
+          body.append(tr);
+        }
+        $("shown").textContent = rows.length === waitlist.length ? "" : `Showing ${rows.length} of ${waitlist.length}.`;
+      }
+
+      async function load() {
+        const r = await fetch("/api/admin/waitlist");
+        const w = await r.json().catch(() => ({}));
+        $("signin").hidden = r.status !== 401;
+        $("admin").hidden = !w.ok;
+        if (!w.ok) return r.status === 401 ? null : note(w.error || "Couldn't load the admin page.");
+        $("who").textContent = w.email;
+        waitlist = w.waitlist;
+        const weekAgo = Date.now() - 7 * 86_400_000;
+        $("n-total").textContent = waitlist.length;
+        $("n-alpha").textContent = waitlist.filter((x) => x.alphaTester).length;
+        $("n-week").textContent = waitlist.filter((x) => utc(x.createdAt).getTime() > weekAgo).length;
+        renderWaitlist();
+
+        const a = await fetch("/api/admin/accounts").then((x) => x.json()).catch(() => ({}));
+        const body = $("accounts");
+        body.replaceChildren();
+        $("n-accounts").textContent = (a.accounts || []).length;
+        for (const c of a.accounts || []) {
+          const tr = document.createElement("tr");
+          const plus = c.plusUntil ? `${c.plusActive ? "Until" : "Ended"} ${day(c.plusUntil)}` : "";
+          tr.append(td(c.email), td(day(c.createdAt)), td(String(c.licenses)), td(plus), td(String(c.devices)));
+          body.append(tr);
+        }
+      }
+
+      $("search").addEventListener("input", renderWaitlist);
+      $("alpha-only").addEventListener("change", renderWaitlist);
+      $("email-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const r = await post("/api/account/code", { email: $("email").value });
+        if (!r.ok) return note(r.error);
+        $("code-form").hidden = false;
+        note("Check your email for the code.");
+      });
+      $("code-form").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const r = await post("/api/account/verify", { email: $("email").value, code: $("code").value });
+        if (!r.ok) return note(r.error);
+        note("");
+        load();
+      });
+      $("logout").addEventListener("click", async () => {
+        await post("/api/account/logout");
+        note("");
+        load();
+      });
+      load();
+    </script>
+
+    <!-- Global: rows and buttons are made by the script, which scoped styles never reach. -->
+    <style is:global>
+      body {
+        margin: 0;
+        background: #f4f1ea;
+        color: #10224f;
+        font-family: system-ui, sans-serif;
+      }
+      main {
+        max-width: 64rem;
+        margin: 0 auto;
+        padding: 2rem 16px;
+        display: grid;
+        gap: 1rem;
+      }
+      h2 {
+        margin: 1rem 0 0;
+      }
+      form {
+        display: grid;
+        gap: 0.4rem;
+        max-width: 24rem;
+      }
+      input[type="email"],
+      input[type="search"],
+      input[inputmode] {
+        font: inherit;
+        padding: 0.5rem;
+        border: 1px solid #10224f;
+        border-radius: 6px;
+        box-sizing: border-box;
+        width: 100%;
+      }
+      button,
+      a.button {
+        font: inherit;
+        padding: 0.6rem 1rem;
+        background: #2e6bff;
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+        justify-self: start;
+        text-decoration: none;
+        white-space: nowrap;
+      }
+      button.link {
+        background: none;
+        color: #2e6bff;
+        padding: 0;
+        text-decoration: underline;
+      }
+      .sub {
+        font-size: 0.9rem;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+        gap: 0.75rem;
+      }
+      .stats div {
+        background: #fff;
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        display: grid;
+      }
+      .stats strong {
+        font-size: 1.75rem;
+      }
+      .stats span {
+        font-size: 0.85rem;
+      }
+      .tools {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: center;
+      }
+      .tools input[type="search"] {
+        flex: 1 1 16rem;
+        width: auto;
+      }
+      .check {
+        display: flex;
+        gap: 0.4rem;
+        align-items: center;
+      }
+      .scroll {
+        overflow-x: auto;
+        background: #fff;
+        border-radius: 8px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid #e4dfd3;
+        vertical-align: top;
+      }
+      th {
+        white-space: nowrap;
+      }
+    </style>
+  </body>
+</html>

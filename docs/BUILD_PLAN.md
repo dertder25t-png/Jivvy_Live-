@@ -135,6 +135,7 @@ Prove the hardest piece works before building on it.
 
 - [x] Website at live.jivvy.org (Astro on Cloudflare Pages) with features, pricing, FAQ and waitlist
   - Oct 6, 2026: call booking removed. The waitlist collects emails for two announcements (alpha testing opens, launch) and an "I'd like to help test the alpha" checkbox.
+  - Nov 10, 2026: `/admin` for the owner: read the waitlist (search, alpha testers only, CSV export, remove an address) and the church accounts. Behind Cloudflare Access, and every admin request's Access token is verified again in the site's code against `ADMIN_EMAILS`. Read-only apart from removing a signup; it sends no email.
 - [x] Tech spike: web lyrics composited over a camera feed, hardware-encoded, streamed to YouTube, on a $300 laptop
   - Done (`spikes/lyrics-stream`): lyrics over webcam at 1080p30 with GPU compositing at about 1% CPU (Media Foundation encoder), crash-safe recording, and an x264 software fallback that also holds 1080p30 (about one core; ~28% of two pinned cores). Found an Intel Quick Sync driver crash on the test laptop; Media Foundation's encoder avoids it.
   - Moved to Stage 1: streaming to YouTube (the new channel can't go live yet) is part of the Streaming item, and the $300-laptop run is part of the hardware lab.

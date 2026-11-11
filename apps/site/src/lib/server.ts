@@ -23,6 +23,12 @@ export interface Env {
   SUPABASE_ANON_KEY?: string;
   /** Signs church computers' 1-hour sync tokens (HS256). Never sent anywhere. */
   SUPABASE_JWT_SECRET?: string;
+  /** Addresses allowed into /admin (comma separated), as Cloudflare Access reports them. */
+  ADMIN_EMAILS?: string;
+  /** The Cloudflare Access team in front of /admin: "jivvy" or https://jivvy.cloudflareaccess.com. */
+  ACCESS_TEAM_DOMAIN?: string;
+  /** The Access application's audience (AUD) tag; tokens for any other app are refused. */
+  ACCESS_AUD?: string;
 }
 
 export const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>

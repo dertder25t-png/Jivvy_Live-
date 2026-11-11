@@ -5,6 +5,7 @@ Astro on Cloudflare Pages, with Pages Functions in `functions/` (`npm run dev:si
 - `/` the public site: features, pricing, FAQ and the alpha waitlist (`/api/waitlist`, D1 table `waitlist`).
 - `/api/upload-test`: the pre-flight upload test's endpoint (counts what arrives, stores nothing).
 - `/account` church accounts and license keys (not linked from the site yet). A church signs in with a one-time code emailed to the address it typed, buys a license with Stripe Checkout, and copies the key into Jivvy Live on the church computer. The trial needs none of this: the church computer starts it by itself, with no account and no card. Nothing here is needed during a service, because the church computer checks its key offline.
+- `/admin` the owner's admin page (not linked, `noindex`): the waitlist (search, alpha testers only, download CSV, remove an address) and church accounts (licenses, Plus, syncing computers; never license keys). Two locks: Cloudflare Access sits in front of `/admin` and `/api/admin/*` (sign-in with a one-time code Cloudflare emails), and every admin endpoint verifies Access's signed token itself (RS256 against the team's keys, this app's audience, not expired) and checks the email is in `ADMIN_EMAILS`. A request that reaches the site any other way (the `pages.dev` address, a forged header) gets 401. With any of `ADMIN_EMAILS`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` unset the admin endpoints answer 503.
 
 ## Account and checkout endpoints
 
@@ -17,6 +18,9 @@ Astro on Cloudflare Pages, with Pages Functions in `functions/` (`npm run dev:si
 | `POST /api/checkout` | A Stripe Checkout Session for one church license (test mode only: anything but an `sk_test_` key is refused). |
 | `POST /api/stripe-webhook` | Checks `Stripe-Signature`, and on `checkout.session.completed` (paid, `livemode: false`) issues the key: Ed25519-signed `{church, plan: "church", updatesUntil: +3 years, plusUntil: +1 year, issued}` (`packages/protocol/src/license.ts`). Retried deliveries issue nothing new (one license per checkout). |
 | `POST /api/alert {key, kind, message}` | Alert emails. The church computer posts a stream-down or no-sound alert (`stream.down`, `stream.up`, `audio.silent`, `audio.back`), authenticated by its license key: the key must exactly match one this site issued and recorded in the `licenses` table for that church id (compared as SHA-256 hashes, in constant time; a merely well-signed key is refused, since the test signing key is public), then the site emails **that church account's own address only** (never the waitlist) with its own copy of the alert's words, ignoring the posted text. JSON only, body capped at 4 KB, and the key is never echoed or logged. Per church: at most 1 email per kind per 10 minutes and 20 a day; a "back" email only after its "down" email was sent. Answers 200 `{sent: false, reason}` when throttled. Off on the church computer by default (Alerts, "Also email these alerts"). Needs `DB`, `EMAIL`, `EMAIL_FROM` (otherwise 503). |
+| `GET /api/admin/waitlist` | Admins only (Cloudflare Access token checked): every signup, newest first; `?format=csv` downloads it (cells that look like formulas are escaped). |
+| `POST /api/admin/waitlist-remove {email}` | Admins only: deletes that address from the waitlist. |
+| `GET /api/admin/accounts` | Admins only: church accounts with license count, latest Plus date and syncing computers. No license keys. |
 
 Codes and session tokens are stored only as SHA-256 hashes.
 
@@ -58,6 +62,8 @@ npx wrangler d1 migrations apply jivvy-live-preview --remote --env preview
 | `SUPABASE_ANON_KEY` | The project's anon (public) key, handed out with the token; RLS in `supabase/0001_sync.sql` does the guarding. |
 | `SUPABASE_JWT_SECRET` | The project's JWT secret (Project Settings, API / JWT Keys: the legacy HS256 secret). Signs church computers' 1-hour tokens; never leaves the site. Without all three, `/api/sync/*` answers 503. |
 | `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://live.jivvy.org/api/stripe-webhook` listening for `checkout.session.completed` and `checkout.session.async_payment_succeeded`. |
+
+**Admin page:** a Cloudflare Access self-hosted application named "Jivvy Live admin" for `live.jivvy.org/admin` and `live.jivvy.org/api/admin`, with an Allow policy for the admin's email (One-time PIN login). Variables on Pages: `ADMIN_EMAILS` (comma separated, the same addresses), `ACCESS_TEAM_DOMAIN` (e.g. `jivvy` or `https://jivvy.cloudflareaccess.com`) and `ACCESS_AUD` (the application's AUD tag).
 
 **Variables:** `STRIPE_PRICE_ID` (a test-mode one-time price of exactly $200 USD; the webhook issues a key only for a `payment` session of 20000 usd) and `SITE_URL` (e.g. `https://live.jivvy.org`, used for Stripe's return links).
 

@@ -25,5 +25,5 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
       },
     });
   }
-  return json({ ok: true, email: admin.email, waitlist: rows });
+  return json({ ok: true, email: admin, waitlist: rows });
 };

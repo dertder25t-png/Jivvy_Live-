@@ -1,5 +1,6 @@
 ---
-// The owner's admin page: the waitlist and church accounts. Only ADMIN_EMAILS get data.
+// The owner's admin page: the waitlist and church accounts. Cloudflare Access signs the visitor
+// in before this loads; the API checks that sign-in again and only ADMIN_EMAILS get data.
 ---
 <!doctype html>
 <html lang="en">
@@ -16,22 +17,9 @@
       <a href="/"><img src="/brand/jivvy-live-lockup.svg" alt="Jivvy Live" width="147" height="60" /></a>
       <h1>Admin</h1>
 
-      <section id="signin" hidden>
-        <p class="sub">Sign in with an admin address. We email you a code.</p>
-        <form id="email-form">
-          <label for="email">Email</label>
-          <input id="email" name="email" type="email" autocomplete="email" required />
-          <button type="submit">Email me a code</button>
-        </form>
-        <form id="code-form" hidden>
-          <label for="code">The 8-digit code we emailed you</label>
-          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required />
-          <button type="submit">Sign in</button>
-        </form>
-      </section>
 
       <section id="admin" hidden>
-        <p>Signed in as <strong id="who"></strong>. <button id="logout" class="link">Sign out</button></p>
+        <p>Signed in as <strong id="who"></strong>. <a href="/cdn-cgi/access/logout">Sign out</a></p>
 
         <div class="stats">
           <div><strong id="n-total">0</strong><span>on the waitlist</span></div>
@@ -112,9 +100,8 @@
       async function load() {
         const r = await fetch("/api/admin/waitlist");
         const w = await r.json().catch(() => ({}));
-        $("signin").hidden = r.status !== 401;
         $("admin").hidden = !w.ok;
-        if (!w.ok) return r.status === 401 ? null : note(w.error || "Couldn't load the admin page.");
+        if (!w.ok) return note(w.error || "Couldn't load the admin page.");
         $("who").textContent = w.email;
         waitlist = w.waitlist;
         const weekAgo = Date.now() - 7 * 86_400_000;
@@ -137,25 +124,6 @@
 
       $("search").addEventListener("input", renderWaitlist);
       $("alpha-only").addEventListener("change", renderWaitlist);
-      $("email-form").addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const r = await post("/api/account/code", { email: $("email").value });
-        if (!r.ok) return note(r.error);
-        $("code-form").hidden = false;
-        note("Check your email for the code.");
-      });
-      $("code-form").addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const r = await post("/api/account/verify", { email: $("email").value, code: $("code").value });
-        if (!r.ok) return note(r.error);
-        note("");
-        load();
-      });
-      $("logout").addEventListener("click", async () => {
-        await post("/api/account/logout");
-        note("");
-        load();
-      });
       load();
     </script>
 
@@ -177,14 +145,7 @@
       h2 {
         margin: 1rem 0 0;
       }
-      form {
-        display: grid;
-        gap: 0.4rem;
-        max-width: 24rem;
-      }
-      input[type="email"],
-      input[type="search"],
-      input[inputmode] {
+      input[type="search"] {
         font: inherit;
         padding: 0.5rem;
         border: 1px solid #10224f;
